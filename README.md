@@ -81,6 +81,27 @@ than depend on their working directory.
   --validate-only
 ```
 
+Physical runs default to `--operation-mode live`. Live mode is unbounded,
+does not accept `--run-seconds`, and does not allocate or publish the test
+latency sampler. Use test mode only for a bounded operational measurement:
+
+```bash
+./build/mdl_ingestd \
+  --mode partial \
+  --operation-mode test \
+  --run-seconds 300 \
+  --trade-date 20260806 \
+  --catalog config/catalog.example.csv \
+  --sdk-library /path/to/libmdl_api.so \
+  --server 127.0.0.1:9112 \
+  --user l2flow-measurement \
+  --allow-discard-after-dispatch
+```
+
+Test mode reports callback, admission, and dispatch throughput plus a 1-in-64
+sample of callback-entry-to-dispatch-drain latency. Production launch units
+must use live mode and external process supervision for lifecycle control.
+
 The catalog uses exact, untrimmed identities:
 
 ```text

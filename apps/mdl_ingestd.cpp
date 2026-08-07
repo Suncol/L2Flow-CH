@@ -2,6 +2,8 @@
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -9,8 +11,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,13 +45,118 @@ extern "C" void HandleSignal(int signal_number) {
     g_stop_requested = 1;
 }
 
+enum class OperationMode : std::uint8_t {
+    kLive,
+    kTest,
+};
+
 struct Options final {
     EngineConfig engine{};
     PhysicalSdkConfig sdk{};
     std::string catalog_path;
     std::string stream_config_path = "config/production.streams.conf";
+    OperationMode operation_mode = OperationMode::kLive;
+    std::uint32_t run_seconds = 0U;
+    bool run_seconds_set = false;
     bool allow_discard_after_dispatch = false;
     bool validate_only = false;
+};
+
+inline constexpr std::uint64_t kLatencySampleEvery = 64U;
+inline constexpr std::size_t kLatencyRingCapacity = 4'096U;
+inline constexpr std::size_t kLatencyHistogramMaximumUs = 100'000U;
+
+struct LatencySampleSlot final {
+    std::atomic<std::uint64_t> sequence{0U};
+    std::atomic<std::uint64_t> latency_ns{0U};
+};
+
+// Each sampler has one drain-thread writer. Sequence tags let the reporting
+// thread detect a ring overwrite without blocking the hot path.
+struct alignas(64) LatencySampler final {
+    std::array<LatencySampleSlot, kLatencyRingCapacity> samples{};
+    std::atomic<std::uint64_t> published{0U};
+    std::atomic<std::uint64_t> clock_errors{0U};
+    std::uint64_t next_sequence = 0U;
+};
+
+struct LatencyWindow final {
+    std::vector<std::uint64_t> samples_ns;
+    std::uint64_t overwritten = 0U;
+    std::uint64_t clock_errors = 0U;
+};
+
+struct LatencySummary final {
+    std::size_t count = 0U;
+    double average_us = 0.0;
+    double p50_us = 0.0;
+    double p95_us = 0.0;
+    double p99_us = 0.0;
+    double maximum_us = 0.0;
+};
+
+class LatencyAggregate final {
+public:
+    LatencyAggregate()
+        : histogram_(kLatencyHistogramMaximumUs + 2U, 0U) {}
+
+    void Add(const LatencyWindow& window) {
+        overwritten_ += window.overwritten;
+        clock_errors_ += window.clock_errors;
+        for (const std::uint64_t latency_ns : window.samples_ns) {
+            ++count_;
+            sum_ns_ += static_cast<long double>(latency_ns);
+            maximum_ns_ = std::max(maximum_ns_, latency_ns);
+            const std::uint64_t latency_us = latency_ns / 1'000U;
+            const std::size_t bucket = latency_us <=
+                    kLatencyHistogramMaximumUs
+                ? static_cast<std::size_t>(latency_us)
+                : kLatencyHistogramMaximumUs + 1U;
+            ++histogram_[bucket];
+        }
+    }
+
+    [[nodiscard]] std::uint64_t count() const noexcept { return count_; }
+    [[nodiscard]] std::uint64_t overwritten() const noexcept {
+        return overwritten_;
+    }
+    [[nodiscard]] std::uint64_t clock_errors() const noexcept {
+        return clock_errors_;
+    }
+    [[nodiscard]] double average_us() const noexcept {
+        if (count_ == 0U) {
+            return 0.0;
+        }
+        return static_cast<double>(
+                   sum_ns_ / static_cast<long double>(count_)) /
+               1'000.0;
+    }
+    [[nodiscard]] double maximum_us() const noexcept {
+        return static_cast<double>(maximum_ns_) / 1'000.0;
+    }
+    [[nodiscard]] double PercentileUs(std::uint64_t percentile) const {
+        if (count_ == 0U) {
+            return 0.0;
+        }
+        const std::uint64_t target =
+            (count_ * percentile + 99U) / 100U;
+        std::uint64_t cumulative = 0U;
+        for (std::size_t bucket = 0U; bucket < histogram_.size(); ++bucket) {
+            cumulative += histogram_[bucket];
+            if (cumulative >= target) {
+                return static_cast<double>(bucket);
+            }
+        }
+        return static_cast<double>(kLatencyHistogramMaximumUs + 1U);
+    }
+
+private:
+    std::vector<std::uint64_t> histogram_;
+    std::uint64_t count_ = 0U;
+    std::uint64_t maximum_ns_ = 0U;
+    std::uint64_t overwritten_ = 0U;
+    std::uint64_t clock_errors_ = 0U;
+    long double sum_ns_ = 0.0L;
 };
 
 void PrintUsage() {
@@ -63,6 +172,7 @@ void PrintUsage() {
         << "  --tick-lanes N             default 12\n"
         << "  --snapshot-lanes N         default 4\n"
         << "  --instrument-workers N     default 16\n"
+        << "  --operation-mode live|test default live\n"
         << "  --stream-config FILE       default "
            "config/production.streams.conf\n"
         << "  --first-decoder-cpu N      default -1 (OS scheduling)\n"
@@ -71,6 +181,8 @@ void PrintUsage() {
         << "  --from-open-gap-wait-ns N  default 500000\n"
         << "  --sdk-work-threads N       default 1\n"
         << "  --sdk-console-log\n"
+        << "  --run-seconds N            test mode only; 0 means until signal, "
+           "max 86400\n"
         << "  --validate-only            do not load or connect the SDK\n";
 }
 
@@ -128,6 +240,16 @@ template <typename Integer>
             }
         } else if (argument == "--catalog") {
             parsed.catalog_path = next(argument);
+        } else if (argument == "--operation-mode") {
+            const std::string_view value = next(argument);
+            if (value == "live") {
+                parsed.operation_mode = OperationMode::kLive;
+            } else if (value == "test") {
+                parsed.operation_mode = OperationMode::kTest;
+            } else {
+                *error = "--operation-mode must be live or test";
+                return false;
+            }
         } else if (argument == "--stream-config") {
             parsed.stream_config_path = next(argument);
         } else if (argument == "--sdk-library") {
@@ -183,6 +305,13 @@ template <typename Integer>
                 *error = "invalid --sdk-work-threads";
                 return false;
             }
+        } else if (argument == "--run-seconds") {
+            if (!ParseInteger(next(argument), &parsed.run_seconds) ||
+                parsed.run_seconds > 86'400U) {
+                *error = "--run-seconds must be from 0 through 86400";
+                return false;
+            }
+            parsed.run_seconds_set = true;
         } else if (argument == "--sdk-console-log") {
             parsed.sdk.sdk_console_log = true;
         } else if (argument == "--allow-discard-after-dispatch") {
@@ -214,6 +343,11 @@ template <typename Integer>
             "durable/Event sink has been connected yet";
         return false;
     }
+    if (parsed.operation_mode == OperationMode::kLive &&
+        parsed.run_seconds_set) {
+        *error = "--run-seconds is available only in test operation mode";
+        return false;
+    }
     *output = std::move(parsed);
     return true;
 }
@@ -232,6 +366,188 @@ void PrintStats(const EngineStats& stats) {
               << " late_recovery_out="
               << stats.late_recovery_dispatched
               << " lane_full=" << stats.lane_full << '\n';
+}
+
+void ObserveLatency(std::uint64_t ingress_sequence,
+                    std::uint64_t receive_monotonic_ns,
+                    LatencySampler* sampler) noexcept {
+    if (sampler == nullptr ||
+        ingress_sequence % kLatencySampleEvery != 0U) {
+        return;
+    }
+    const std::uint64_t now = l2flow::ingest::MonotonicNowNs();
+    if (now < receive_monotonic_ns) {
+        sampler->clock_errors.fetch_add(1U, std::memory_order_relaxed);
+        return;
+    }
+    const std::uint64_t write_sequence = sampler->next_sequence;
+    LatencySampleSlot& slot = sampler->samples[static_cast<std::size_t>(
+        write_sequence % kLatencyRingCapacity)];
+    slot.latency_ns.store(
+        now - receive_monotonic_ns, std::memory_order_relaxed);
+    slot.sequence.store(write_sequence + 1U, std::memory_order_release);
+    sampler->next_sequence = write_sequence + 1U;
+    sampler->published.store(write_sequence + 1U, std::memory_order_release);
+}
+
+LatencyWindow CollectLatency(
+    LatencySampler* samplers,
+    std::size_t sampler_count,
+    std::vector<std::uint64_t>* cursors,
+    std::vector<std::uint64_t>* clock_error_cursors) {
+    LatencyWindow window;
+    if (samplers == nullptr || cursors == nullptr ||
+        clock_error_cursors == nullptr || cursors->size() != sampler_count ||
+        clock_error_cursors->size() != sampler_count) {
+        return window;
+    }
+    for (std::size_t index = 0U; index < sampler_count; ++index) {
+        LatencySampler& sampler = samplers[index];
+        const std::uint64_t end =
+            sampler.published.load(std::memory_order_acquire);
+        std::uint64_t begin = (*cursors)[index];
+        if (end < begin) {
+            begin = end;
+        }
+        if (end - begin > kLatencyRingCapacity) {
+            window.overwritten += end - begin - kLatencyRingCapacity;
+            begin = end - kLatencyRingCapacity;
+        }
+        for (std::uint64_t sequence = begin; sequence < end; ++sequence) {
+            LatencySampleSlot& slot = sampler.samples[
+                static_cast<std::size_t>(
+                    sequence % kLatencyRingCapacity)];
+            const std::uint64_t expected = sequence + 1U;
+            const std::uint64_t first_tag =
+                slot.sequence.load(std::memory_order_acquire);
+            const std::uint64_t latency_ns =
+                slot.latency_ns.load(std::memory_order_relaxed);
+            const std::uint64_t second_tag =
+                slot.sequence.load(std::memory_order_acquire);
+            if (first_tag == expected && second_tag == expected) {
+                window.samples_ns.push_back(latency_ns);
+            } else {
+                ++window.overwritten;
+            }
+        }
+        (*cursors)[index] = end;
+
+        const std::uint64_t clock_errors =
+            sampler.clock_errors.load(std::memory_order_acquire);
+        const std::uint64_t previous_clock_errors =
+            (*clock_error_cursors)[index];
+        if (clock_errors >= previous_clock_errors) {
+            window.clock_errors += clock_errors - previous_clock_errors;
+        }
+        (*clock_error_cursors)[index] = clock_errors;
+    }
+    return window;
+}
+
+LatencySummary SummarizeLatency(
+    std::vector<std::uint64_t>* samples_ns) {
+    LatencySummary summary;
+    if (samples_ns == nullptr || samples_ns->empty()) {
+        return summary;
+    }
+    std::sort(samples_ns->begin(), samples_ns->end());
+    summary.count = samples_ns->size();
+    const long double sum = std::accumulate(
+        samples_ns->begin(), samples_ns->end(), 0.0L);
+    summary.average_us = static_cast<double>(
+        sum / static_cast<long double>(summary.count)) / 1'000.0;
+    const auto percentile = [samples_ns](std::size_t percent) {
+        const std::size_t rank =
+            (samples_ns->size() * percent + 99U) / 100U - 1U;
+        return static_cast<double>((*samples_ns)[rank]) / 1'000.0;
+    };
+    summary.p50_us = percentile(50U);
+    summary.p95_us = percentile(95U);
+    summary.p99_us = percentile(99U);
+    summary.maximum_us =
+        static_cast<double>(samples_ns->back()) / 1'000.0;
+    return summary;
+}
+
+[[nodiscard]] std::uint64_t CounterDelta(std::uint64_t current,
+                                         std::uint64_t previous) noexcept {
+    return current >= previous ? current - previous : 0U;
+}
+
+void PrintMonitor(const EngineStats& current,
+                  const EngineStats& previous,
+                  double interval_seconds,
+                  const LatencySummary& latency,
+                  const LatencyWindow& latency_window,
+                  const LatencyAggregate& latency_aggregate) {
+    const double safe_interval = interval_seconds > 0.0
+        ? interval_seconds
+        : 1.0;
+    const std::uint64_t dispatch_current =
+        current.dispatched_ticks + current.dispatched_snapshots;
+    const std::uint64_t dispatch_previous =
+        previous.dispatched_ticks + previous.dispatched_snapshots;
+    std::cout << std::fixed << std::setprecision(3)
+              << "monitor interval_s=" << safe_interval
+              << " callback_rate_msg_s="
+              << static_cast<double>(CounterDelta(
+                     current.callbacks, previous.callbacks)) /
+                     safe_interval
+              << " admit_rate_msg_s="
+              << static_cast<double>(CounterDelta(
+                     current.admitted, previous.admitted)) /
+                     safe_interval
+              << " dispatch_rate_msg_s="
+              << static_cast<double>(CounterDelta(
+                     dispatch_current, dispatch_previous)) /
+                     safe_interval
+              << " delay_sample_every=" << kLatencySampleEvery
+              << " delay_samples=" << latency.count
+              << " delay_avg_us=" << latency.average_us
+              << " delay_p50_us=" << latency.p50_us
+              << " delay_p95_us=" << latency.p95_us
+              << " delay_p99_us=" << latency.p99_us
+              << " delay_max_us=" << latency.maximum_us
+              << " delay_overwritten=" << latency_window.overwritten
+              << " delay_clock_errors=" << latency_window.clock_errors
+              << " total_delay_samples=" << latency_aggregate.count()
+              << " total_delay_avg_us=" << latency_aggregate.average_us()
+              << " total_delay_p50_us="
+              << latency_aggregate.PercentileUs(50U)
+              << " total_delay_p95_us="
+              << latency_aggregate.PercentileUs(95U)
+              << " total_delay_p99_us="
+              << latency_aggregate.PercentileUs(99U)
+              << " total_delay_max_us="
+              << latency_aggregate.maximum_us()
+              << " total_delay_overwritten="
+              << latency_aggregate.overwritten()
+              << " total_delay_clock_errors="
+              << latency_aggregate.clock_errors()
+              << " admitted=" << current.admitted
+              << " rejected=" << current.rejected
+              << " tick_out=" << current.dispatched_ticks
+              << " snapshot_out=" << current.dispatched_snapshots
+              << " decode_errors=" << current.decode_errors
+              << " catalog_misses=" << current.catalog_misses
+              << " gaps=" << current.gaps_skipped
+              << " lane_full=" << current.lane_full << '\n'
+              << std::flush;
+}
+
+void PrintFinalLatency(const LatencyAggregate& latency) {
+    std::cout << std::fixed << std::setprecision(3)
+              << "final_delay basis=callback_to_dispatch"
+              << " sample_every=" << kLatencySampleEvery
+              << " samples=" << latency.count()
+              << " avg_us=" << latency.average_us()
+              << " p50_us=" << latency.PercentileUs(50U)
+              << " p95_us=" << latency.PercentileUs(95U)
+              << " p99_us=" << latency.PercentileUs(99U)
+              << " max_us=" << latency.maximum_us()
+              << " overwritten=" << latency.overwritten()
+              << " clock_errors=" << latency.clock_errors() << '\n'
+              << std::flush;
 }
 
 }  // namespace
@@ -279,6 +595,18 @@ int main(int argc, char** argv) {
     std::atomic<std::uint64_t> consumed_gaps{0U};
     std::atomic<std::uint64_t> consumed_late_recovery{0U};
     std::atomic<std::uint64_t> consumed_faults{0U};
+    std::unique_ptr<LatencySampler[]> latency_samplers;
+    std::vector<std::uint64_t> latency_cursors;
+    std::vector<std::uint64_t> latency_clock_error_cursors;
+    std::unique_ptr<LatencyAggregate> latency_aggregate;
+    if (options.operation_mode == OperationMode::kTest) {
+        latency_samplers = std::make_unique<LatencySampler[]>(
+            options.engine.instrument_workers);
+        latency_cursors.resize(options.engine.instrument_workers, 0U);
+        latency_clock_error_cursors.resize(
+            options.engine.instrument_workers, 0U);
+        latency_aggregate = std::make_unique<LatencyAggregate>();
+    }
     std::vector<std::thread> drain_threads;
     drain_threads.reserve(options.engine.instrument_workers);
     for (std::size_t owner = 0U;
@@ -292,10 +620,22 @@ int main(int argc, char** argv) {
             while (drain_running.load(std::memory_order_acquire)) {
                 bool progress = false;
                 while (engine->TryPollTick(owner, &tick)) {
+                    if (latency_samplers != nullptr) {
+                        ObserveLatency(
+                            tick.common.ingress_sequence,
+                            tick.common.receive_monotonic_ns,
+                            &latency_samplers[owner]);
+                    }
                     consumed_ticks.fetch_add(1U, std::memory_order_relaxed);
                     progress = true;
                 }
                 while (engine->TryPollSnapshot(owner, &snapshot)) {
+                    if (latency_samplers != nullptr) {
+                        ObserveLatency(
+                            snapshot.common.ingress_sequence,
+                            snapshot.common.receive_monotonic_ns,
+                            &latency_samplers[owner]);
+                    }
                     consumed_snapshots.fetch_add(
                         1U, std::memory_order_relaxed);
                     progress = true;
@@ -339,9 +679,50 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
-    while (g_stop_requested == 0 && engine->healthy() && !handler.failed()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        PrintStats(engine->stats());
+    if (options.operation_mode == OperationMode::kLive) {
+        while (g_stop_requested == 0 && engine->healthy() &&
+               !handler.failed()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            PrintStats(engine->stats());
+        }
+    } else {
+        using SteadyClock = std::chrono::steady_clock;
+        const SteadyClock::time_point monitor_started = SteadyClock::now();
+        SteadyClock::time_point previous_report_time = monitor_started;
+        SteadyClock::time_point next_report_time =
+            monitor_started + std::chrono::seconds(1);
+        const SteadyClock::time_point run_deadline = options.run_seconds == 0U
+            ? SteadyClock::time_point::max()
+            : monitor_started + std::chrono::seconds(options.run_seconds);
+        EngineStats previous_stats = engine->stats();
+        while (g_stop_requested == 0 && engine->healthy() &&
+               !handler.failed()) {
+            std::this_thread::sleep_until(
+                std::min(next_report_time, run_deadline));
+            const SteadyClock::time_point now = SteadyClock::now();
+            if (now >= next_report_time) {
+                const EngineStats current_stats = engine->stats();
+                LatencyWindow latency_window = CollectLatency(
+                    latency_samplers.get(),
+                    options.engine.instrument_workers,
+                    &latency_cursors, &latency_clock_error_cursors);
+                latency_aggregate->Add(latency_window);
+                const LatencySummary latency_summary =
+                    SummarizeLatency(&latency_window.samples_ns);
+                const double interval_seconds =
+                    std::chrono::duration<double>(
+                        now - previous_report_time).count();
+                PrintMonitor(current_stats, previous_stats, interval_seconds,
+                             latency_summary, latency_window,
+                             *latency_aggregate);
+                previous_stats = current_stats;
+                previous_report_time = now;
+                next_report_time = now + std::chrono::seconds(1);
+            }
+            if (now >= run_deadline) {
+                break;
+            }
+        }
     }
 
     // Shutdown order is contractual: quiesce SDK callbacks, drain decoder
@@ -376,6 +757,13 @@ int main(int argc, char** argv) {
     }
     const EngineStats final_stats = engine->stats();
     PrintStats(final_stats);
+    if (options.operation_mode == OperationMode::kTest) {
+        LatencyWindow final_latency_window = CollectLatency(
+            latency_samplers.get(), options.engine.instrument_workers,
+            &latency_cursors, &latency_clock_error_cursors);
+        latency_aggregate->Add(final_latency_window);
+        PrintFinalLatency(*latency_aggregate);
+    }
     if (!engine->healthy()) {
         std::cerr << "fatal ingest error: " << engine->fatal_error() << '\n';
         return 1;

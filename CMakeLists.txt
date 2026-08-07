@@ -84,8 +84,29 @@ if(L2FLOW_CH_BUILD_TESTS)
             --trade-date 20260806
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --validate-only)
-    set_tests_properties(mdl_ingest_default_config PROPERTIES
-        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(
+        NAME mdl_ingest_test_operation_mode
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --operation-mode test
+            --run-seconds 1
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_live_rejects_run_seconds
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --run-seconds 1
+            --validate-only)
+    set_tests_properties(
+        mdl_ingest_live_rejects_run_seconds PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(
+        mdl_ingest_default_config
+        mdl_ingest_test_operation_mode
+        PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 if(L2FLOW_CH_BUILD_BENCHMARKS)
