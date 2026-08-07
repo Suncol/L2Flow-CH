@@ -6,16 +6,20 @@ This repository implements the first realtime market-data process boundary:
 MDL SDK callback
   -> bounded minimal admission
   -> channel/instrument-sharded decoder lanes
+  -> decode-complete raw tap -> preallocated canonical batches
+       -> ClickHouse writer threads -> raw_tick/raw_snapshot MergeTree
   -> exchange-native channel sequence recovery
   -> fixed-width canonical records
   -> instrument-owner dispatch queues + gap/LateRecovery controls
   -> per-owner shared-memory Arrow rings + Python/Polars reader
 ```
 
-The Arrow branch is a bounded volatile hot path, not a WAL or a replacement
-for Kafka/Redpanda. Event/KLine workers, the durable Kafka sink, the ClickHouse
-sink, and server-side resume/intraday replay remain outside this repository.
-The supported startup modes are `from-open` and `partial`.
+`raw_tick` and `raw_snapshot` are the first durable ClickHouse boundary in this
+repository. The raw tap runs after complete decode/normalization and before
+SequenceRecovery, duplicate/conflict handling, and catalog-miss suppression.
+The shared-memory Arrow branch remains an independent bounded volatile hot
+path. Event/KLine workers and historical reconciliation remain outside this
+milestone. The supported startup modes are `from-open` and `partial`.
 
 ## Build and test
 
@@ -53,6 +57,18 @@ The repository-local single-binary ClickHouse test instance is documented in
 [clickhouse-test/README.md](clickhouse-test/README.md). It binds only to
 localhost, keeps all runtime state under `clickhouse-test/`, and includes
 lifecycle, MergeTree smoke-test, restart-persistence, and Python client tools.
+The raw table DDL is in [clickhouse/schema/raw_tables.sql](clickhouse/schema/raw_tables.sql)
+for a local node and
+[clickhouse/schema/raw_tables_replicated.sql](clickhouse/schema/raw_tables_replicated.sql)
+for a Keeper-backed deployment.
+
+Run the C++ raw writer integration test against that local instance with:
+
+```bash
+./clickhouse-test/start.sh
+L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
+  ./build/test_clickhouse_raw
+```
 
 Optional checks:
 
@@ -145,25 +161,46 @@ instrument_id,market,security_id_source,security_id
 2,SZ,102,000001
 ```
 
-The executable can publish the Arrow hot path with `--arrow-ring-dir` and a
-strictly increasing `--arrow-feed-epoch`. A physical SDK run without Arrow
-requires `--allow-discard-after-dispatch`, making temporary drain behavior
-explicit rather than silently discarding data.
+The executable enables durable raw writes with `--clickhouse-url` and a
+nonzero `--clickhouse-feed-epoch`. A stable 128-bit source identity may be
+supplied with `--clickhouse-source-instance-id`; otherwise the process creates
+one and prints it. Passwords are read only through
+`--clickhouse-password-env`. The optional Arrow hot path uses
+`--arrow-ring-dir` and `--arrow-feed-epoch`. A physical SDK run with neither
+output requires `--allow-discard-after-dispatch`, making temporary drain
+behavior explicit rather than silently discarding data.
+
+Example local raw launch arguments are:
+
+```text
+--clickhouse-url http://127.0.0.1:8123
+--clickhouse-database l2flow
+--clickhouse-feed-epoch <durably allocated nonzero run epoch>
+--clickhouse-source-instance-id <stable 32-hex source ID>
+```
+
+For replicated production tables, provision the external DDL, add
+`--clickhouse-no-auto-create`, and set the required quorum, normally
+`--clickhouse-insert-quorum 2`.
+
 An error-free return from the SDK `Connect()` call is not considered ready.
 `mdl_ingestd` waits up to `--sdk-ready-timeout-seconds` (default 30) for a
 successful Logon response and successful status for every configured stream;
-failure seals the current Arrow run and requires a new, larger feed epoch.
+failure creates a continuity boundary and requires a new feed session epoch.
 The core library exposes `TryPollTick`, `TryPollSnapshot`, `TryPollGap`,
 `TryPollLateRecovery`, and `TryPollChannelFault` for the next-stage workers.
 In either startup mode, a native record arriving behind the already-published
 frontier is never inserted backward into the realtime ordered stream; its
 canonical body is sent to `LateRecovery` for later reconciliation. This is
-not a raw durable copy: the Kafka/Redpanda raw path remains outside this
-milestone.
+separate from the raw durable copy, which already captured the decoded
+occurrence before SequenceRecovery changed or diverted it.
 
 The Arrow memory protocol, restart/disconnect contract, sizing formulas,
 deployment rules, and Python API are documented in
 [docs/arrow-hot-path.md](docs/arrow-hot-path.md).
+The ClickHouse ACK, batching, retry, replay-order, schema, and overload
+contracts are documented in
+[docs/clickhouse-raw-path.md](docs/clickhouse-raw-path.md).
 
 `from-open` and `partial` both default to a 500,000 ns gap wait. The two
 settings remain independent (`--from-open-gap-wait-ns` and

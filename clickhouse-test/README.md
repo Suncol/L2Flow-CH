@@ -63,6 +63,11 @@ user_files/      files exposed to the file() table function
 format_schemas/  external format schemas
 ```
 
+ClickHouse 26 records its authoritative process metadata in `data/status`.
+The lifecycle scripts validate that PID against the exact binary and config,
+then mirror it into `run/clickhouse.pid`; a stale status file is never trusted
+without that process-identity check.
+
 These runtime paths and the binary are intentionally ignored by Git.
 
 ## SQL acceptance and persistence

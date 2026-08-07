@@ -7,6 +7,8 @@ option(L2FLOW_CH_BUILD_BENCHMARKS
        "Build the synthetic ingest and optional Arrow end-to-end benchmark" ON)
 option(L2FLOW_CH_ENABLE_ARROW_RING
        "Build the Linux shared-memory Apache Arrow hot path" ON)
+option(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW
+       "Build the batched raw Tick/Snapshot ClickHouse sink" ON)
 option(L2FLOW_CH_ENABLE_ASAN_UBSAN "Enable ASan and UBSan" OFF)
 option(L2FLOW_CH_ENABLE_TSAN "Enable TSan" OFF)
 set(L2FLOW_CH_PYTHON_EXECUTABLE "" CACHE FILEPATH
@@ -26,12 +28,17 @@ if(L2FLOW_CH_ENABLE_ASAN_UBSAN AND L2FLOW_CH_ENABLE_TSAN)
 endif()
 
 find_package(Threads REQUIRED)
+if(L2FLOW_CH_ENABLE_ARROW_RING OR L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+    find_package(Arrow 25.0.0 EXACT CONFIG REQUIRED)
+endif()
 if(L2FLOW_CH_ENABLE_ARROW_RING)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
         message(FATAL_ERROR
             "L2FLOW_CH_ENABLE_ARROW_RING currently requires Linux mmap/process APIs")
     endif()
-    find_package(Arrow 25.0.0 EXACT CONFIG REQUIRED)
+endif()
+if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+    find_package(CURL REQUIRED)
 endif()
 
 set(L2FLOW_CH_WARNINGS)
@@ -82,16 +89,36 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(l2flow_ch_ingest PRIVATE _GNU_SOURCE)
 endif()
 
+if(L2FLOW_CH_ENABLE_ARROW_RING OR L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+    add_library(l2flow_ch_arrow_schemas STATIC
+        src/arrow_schemas.cpp)
+    add_library(L2FlowCH::arrow_schemas ALIAS l2flow_ch_arrow_schemas)
+    l2flow_ch_configure(l2flow_ch_arrow_schemas)
+    set_target_properties(l2flow_ch_arrow_schemas PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(l2flow_ch_arrow_schemas PUBLIC Arrow::arrow_shared)
+endif()
+
 if(L2FLOW_CH_ENABLE_ARROW_RING)
     add_library(l2flow_ch_arrow SHARED
         src/arrow_c_api.cpp
         src/arrow_egress.cpp
-        src/arrow_ring.cpp
-        src/arrow_schemas.cpp)
+        src/arrow_ring.cpp)
     add_library(L2FlowCH::arrow ALIAS l2flow_ch_arrow)
     l2flow_ch_configure(l2flow_ch_arrow)
     target_link_libraries(l2flow_ch_arrow
-        PUBLIC Arrow::arrow_shared Threads::Threads)
+        PUBLIC L2FlowCH::arrow_schemas Arrow::arrow_shared Threads::Threads)
+endif()
+
+if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+    add_library(l2flow_ch_clickhouse STATIC
+        src/blake3.cpp
+        src/clickhouse_raw_sink.cpp)
+    add_library(L2FlowCH::clickhouse ALIAS l2flow_ch_clickhouse)
+    l2flow_ch_configure(l2flow_ch_clickhouse)
+    target_link_libraries(l2flow_ch_clickhouse
+        PUBLIC L2FlowCH::ingest L2FlowCH::arrow_schemas
+               Arrow::arrow_shared CURL::libcurl Threads::Threads)
 endif()
 
 add_executable(mdl_ingestd apps/mdl_ingestd.cpp)
@@ -101,6 +128,11 @@ if(L2FLOW_CH_ENABLE_ARROW_RING)
     target_link_libraries(mdl_ingestd PRIVATE L2FlowCH::arrow)
     target_compile_definitions(mdl_ingestd PRIVATE
         L2FLOW_CH_HAS_ARROW_RING=1)
+endif()
+if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+    target_link_libraries(mdl_ingestd PRIVATE L2FlowCH::clickhouse)
+    target_compile_definitions(mdl_ingestd PRIVATE
+        L2FLOW_CH_HAS_CLICKHOUSE_RAW=1)
 endif()
 
 if(L2FLOW_CH_BUILD_TESTS)
@@ -131,6 +163,39 @@ if(L2FLOW_CH_BUILD_TESTS)
                     $<TARGET_FILE:arrow_ring_fixture>
                     $<TARGET_FILE:l2flow_ch_arrow>)
         endif()
+    endif()
+    if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        add_executable(test_clickhouse_raw tests/test_clickhouse_raw.cpp)
+        l2flow_ch_configure(test_clickhouse_raw)
+        target_link_libraries(test_clickhouse_raw PRIVATE
+            L2FlowCH::clickhouse)
+        add_test(NAME clickhouse_raw COMMAND test_clickhouse_raw)
+        add_test(
+            NAME mdl_ingest_clickhouse_config
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --clickhouse-feed-epoch 42
+                --clickhouse-source-instance-id
+                    000102030405060708090a0b0c0d0e0f
+                --clickhouse-queue-batches-per-lane 2
+                --validate-only)
+        add_test(
+            NAME mdl_ingest_clickhouse_requires_epoch
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --validate-only)
+        set_tests_properties(
+            mdl_ingest_clickhouse_requires_epoch PROPERTIES WILL_FAIL TRUE)
     endif()
     add_test(
         NAME mdl_ingest_default_config
@@ -203,6 +268,12 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
         target_link_libraries(benchmark_mdl_ingest PRIVATE L2FlowCH::arrow)
         target_compile_definitions(benchmark_mdl_ingest PRIVATE
             L2FLOW_CH_HAS_ARROW_RING=1)
+    endif()
+    if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        target_link_libraries(benchmark_mdl_ingest PRIVATE
+            L2FlowCH::clickhouse)
+        target_compile_definitions(benchmark_mdl_ingest PRIVATE
+            L2FLOW_CH_HAS_CLICKHOUSE_RAW=1)
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(benchmark_mdl_ingest PRIVATE _GNU_SOURCE)

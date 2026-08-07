@@ -16,9 +16,12 @@ MDL callback
 The core has no Redis dependency and no disk path. `mdl_ingestd` can attach the
 bounded shared-memory Arrow sink described in
 [`arrow-hot-path.md`](arrow-hot-path.md); that sink is not durable and does not
-change the recovery contract below. The repository does not contain CSV/WAL
-replay, checkpoint restore, reconnect epoch inference, or intraday restart
-recovery. Startup is exactly one of:
+change the recovery contract below. It can also attach the raw ClickHouse sink
+described in [`clickhouse-raw-path.md`](clickhouse-raw-path.md). That sink taps
+decode-complete canonical facts before recovery and persists them in
+`raw_tick`/`raw_snapshot`; its in-memory queues are not a WAL. The repository
+does not contain CSV/WAL replay, checkpoint restore, reconnect epoch inference,
+or intraday restart reconciliation. Startup is exactly one of:
 
 - `from-open`: the process claims coverage beginning at native sequence 1;
 - `partial`: the process claims only a bounded process-start suffix and never
@@ -97,11 +100,13 @@ is likewise not claimed.
   waits both default to 500 microseconds but remain separately configurable.
   These values are tuning defaults, not protocol constants or statements
   about upstream backfill latency.
-- Instrument/fault/LateRecovery dispatch overload and admission-lane
-  exhaustion are fatal because this milestone has no durable catch-up source.
-  No existing record is overwritten. Gap notification is the exception: it
-  uses fixed per-Channel aggregate state plus a dirty bitmap, not a bounded
-  event queue.
+- Instrument/fault/LateRecovery dispatch overload, admission-lane exhaustion,
+  and raw ClickHouse batch-pool exhaustion are fatal continuity boundaries.
+  The process never silently drops a record to remain live. A raw row already
+  acknowledged by ClickHouse can support later reconciliation, but it does not
+  make an overloaded live process safe to continue. Gap notification is the
+  exception: it uses fixed per-Channel aggregate state plus a dirty bitmap,
+  not a bounded event queue.
 - An exception during a vendor callback operation is caught at the ABI
   adapter, recorded as a sticky failure, and causes process shutdown; no C++
   exception is allowed to escape into the SDK.
@@ -157,6 +162,15 @@ objects. They use:
 - up to 10 retained book levels while preserving source depth counts and a
   truncation flag.
 
+After successful normalization, the decoder copies the canonical record into
+its preallocated raw batch before SequenceRecovery or catalog suppression.
+The decoder does not construct Arrow arrays, hash IDs, serialize IPC, call a
+wall clock, or perform network I/O. Dedicated ClickHouse writer threads do all
+columnization, provenance hashing, synchronous INSERT, and exact-batch retry.
+The only per-row receive clock is the callback's existing monotonic timestamp;
+one UTC/monotonic anchor pair is captured at process startup for operational
+correlation and is not replay order.
+
 Shanghai `BidNum`/`SellNum` are retained neither as array bounds nor used to
 walk memory; the two MDL list descriptors are the authoritative dynamic list
 bounds. Nested queue records are validated even though this stage does not
@@ -175,9 +189,11 @@ The decoder keeps action-dependent field meaning. Examples:
 Unknown enum values remain unknown and flagged; they are never guessed.
 
 The immutable daily catalog maps the exact opaque identity to a dense ordinal
-and stable instrument ID. A tick absent from the catalog is still inserted as
+and stable instrument ID. A tick absent from the catalog is still processed as
 an output-free continuity token, so filtering cannot manufacture a native
-gap. An unknown snapshot is counted and not dispatched.
+gap. An unknown snapshot is counted and not dispatched. Both are copied to the
+raw ClickHouse path with `kQualityInstrumentNotInCatalog` and
+`catalog_match=false` before owner suppression.
 
 ## 5. Channel recovery
 
@@ -269,9 +285,10 @@ reclassified as a historical gap and can still fail the process.
 
 `LateRecovery` is deliberately loss-sensitive and bounded. Queue exhaustion
 fails the engine rather than silently discarding the canonical body. If that
-body is nevertheless lost during a crash and no SDK replay or raw durable copy
-exists, later historical repair is impossible; the current repository does
-not yet implement the raw durable publisher.
+body is lost during a crash before its raw batch receives a ClickHouse ACK,
+later historical repair may still be impossible: the raw queue is volatile
+and there is no local WAL. Once the corresponding raw occurrence is ACKed,
+reconciliation can query it from `raw_tick`.
 
 ## 6. Instrument dispatch
 
@@ -300,9 +317,10 @@ The defaults are a starting point, not a measured production guarantee:
 - bounded per-edge dispatch queues and lazily allocated per-observed-channel
   reorder slabs.
 
-On a 64-core host, reserve cores for the OS/IRQs, the vendor SDK, and the future
-Event/KLine/Kafka stages. Pin decoder lanes only after measuring the actual
-NUMA topology; a flat logical CPU number does not identify socket locality.
+On a 64-core host, reserve cores for the OS/IRQs, the vendor SDK, ClickHouse
+writer threads, and future Event/KLine stages. Pin decoder lanes only after
+measuring the actual NUMA topology; a flat logical CPU number does not identify
+socket locality.
 Keep the SDK callback and its hottest decoder lanes in the same NUMA domain
 when possible, or use an explicit interleave/binding policy outside this
 portable core. Do not claim low latency from core count alone.
@@ -314,8 +332,9 @@ default capacities. This improves first-touch placement but does not replace
 an explicit production NUMA policy.
 
 Hot decoder counters are cache-line-isolated per lane and aggregated only when
-`stats()` is sampled. Decoder lanes therefore do not serialize each message on
-a shared global statistics cache line.
+`stats()` is sampled. Raw sink row counters are updated once per batch
+publication, not once per record. Decoder lanes therefore do not serialize
+each message on a shared global statistics cache line.
 
 When `first_decoder_cpu` is configured, every decoder thread is explicitly
 pinned and its idle path remains in pause-spin. This removes scheduler-yield
@@ -341,29 +360,31 @@ TLB, and cache cost. Increase them only from burst and latency measurements.
 
 ## 8. Lifecycle and failure boundaries
 
-Startup order is catalog/stream config -> engine preallocation -> decoder
-threads -> SDK manager/subscriber -> connect. `Connect()` may invoke callbacks
-synchronously, so the engine is running before it is called. The physical
-session is returned only after successful Logon plus confirmation of every
-configured subscription. Market data is admitted only after that readiness
-state. The readiness timeout defaults to 30 seconds and is configurable with
-`--sdk-ready-timeout-seconds`.
+Startup order is catalog/stream config -> raw batch preallocation ->
+ClickHouse schema/health check and writer threads -> engine preallocation ->
+decoder threads -> SDK manager/subscriber -> connect. `Connect()` may invoke
+callbacks synchronously, so both the raw sink and engine are running before it
+is called. The physical session is returned only after successful Logon plus
+confirmation of every configured subscription. Market data is admitted only
+after that readiness state. The readiness timeout defaults to 30 seconds and
+is configurable with `--sdk-ready-timeout-seconds`.
 
 The first connection/discard/readiness boundary is sticky. The handler stops
 admission immediately, so SDK auto-reconnect callbacks cannot enter the old
 feed epoch. Shutdown drains records admitted before the boundary, then the
 Arrow control stream records the boundary and seals. A subsequent process must
 use a strictly larger externally allocated epoch; no MDL resume from a
-Kafka-acknowledged native sequence is assumed.
+ClickHouse-acknowledged native sequence is assumed.
 
 Shutdown order is fixed:
 
 1. stop handler admission;
 2. call `IOManager::Shutdown()` as the callback-quiescence boundary;
 3. release Subscriber, then IOManager;
-4. drain and join decoder lanes;
+4. drain and join decoder lanes, flushing partial raw batches;
 5. drain instrument/fault/LateRecovery queues and final dirty gap state;
-6. destroy the engine and handler.
+6. wait for every ClickHouse raw batch ACK and stop writer threads;
+7. seal the optional Arrow hot path and destroy the engine/handler.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
 to reach zero before releasing Subscriber and IOManager. If vendor shutdown
@@ -383,6 +404,10 @@ tuple handling. Wire-level control tests additionally cover Logon/Subscribe
 readiness accumulation, nonzero return/status rejection, malformed and
 overlapping list rejection, API timeout/discard classification, sticky first
 boundary behavior, pre-ready market rejection, and readiness timeout.
+Raw-path tests additionally prove pre-recovery capture of retransmissions and
+catalog misses, fail-closed tap behavior, fixed BLAKE3 provenance vectors,
+preallocation accounting, ArrowStream-to-ClickHouse mapping, nested Snapshot
+levels, Date partitioning, occurrence uniqueness, and explicit replay order.
 
 The implementation passes the strict warning build and ASan/UBSan tests in the
 available environment. TSan builds successfully, but execution in the current

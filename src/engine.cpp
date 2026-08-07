@@ -1,5 +1,7 @@
 #include "l2flow/ingest/engine.h"
 
+#include "l2flow/ingest/raw_tap.h"
+
 #include "decoder_internal.h"
 
 #include <algorithm>
@@ -1864,10 +1866,21 @@ private:
                             lane_stats.catalog_misses.fetch_add(
                                 1U, std::memory_order_relaxed);
                         }
-                        recovery.Process(decoded,
-                                         message.receive_monotonic_ns,
-                                         emit_tick, emit_gap, emit_fault,
-                                         emit_late, fatal);
+                        const bool raw_accepted =
+                            config_.raw_record_tap == nullptr ||
+                            config_.raw_record_tap->AppendTick(
+                                lane_index, decoded.tick);
+                        if (!raw_accepted) {
+                            SetFatal(
+                                "raw Tick batch queue exhausted or failed; "
+                                "admission stopped at a continuity boundary");
+                        }
+                        if (raw_accepted) {
+                            recovery.Process(decoded,
+                                             message.receive_monotonic_ns,
+                                             emit_tick, emit_gap, emit_fault,
+                                             emit_late, fatal);
+                        }
                     } else {
                         lane_stats.decode_errors.fetch_add(
                             1U, std::memory_order_relaxed);
@@ -1896,6 +1909,12 @@ private:
                     if (message.receive_monotonic_ns >= next_timer) {
                         recovery.Poll(message.receive_monotonic_ns,
                                       emit_tick, emit_gap, fatal);
+                        if (config_.raw_record_tap != nullptr &&
+                            !config_.raw_record_tap->PollTick(
+                                lane_index,
+                                message.receive_monotonic_ns)) {
+                            SetFatal("raw Tick batch flush failed");
+                        }
                         next_timer = message.receive_monotonic_ns +
                                      config_.recovery_timer_scan_ns;
                     }
@@ -1903,12 +1922,21 @@ private:
                     const std::uint64_t now = MonotonicNowNs();
                     if (now >= next_timer) {
                         recovery.Poll(now, emit_tick, emit_gap, fatal);
+                        if (config_.raw_record_tap != nullptr &&
+                            !config_.raw_record_tap->PollTick(
+                                lane_index, now)) {
+                            SetFatal("raw Tick batch flush failed");
+                        }
                         next_timer = now + config_.recovery_timer_scan_ns;
                     }
                     if (!running_.load(std::memory_order_acquire) &&
                         lane.empty()) {
                         recovery.Flush(
                             now, emit_tick, emit_gap, fatal);
+                        if (config_.raw_record_tap != nullptr &&
+                            !config_.raw_record_tap->FlushTick(lane_index)) {
+                            SetFatal("final raw Tick batch flush failed");
+                        }
                         break;
                     }
                     if (config_.first_decoder_cpu >= 0) {
@@ -1938,6 +1966,11 @@ private:
                 config_.maximum_depth_items,
                 config_.maximum_queue_items};
             std::size_t idle_spins = 0U;
+            std::size_t timer_check_spins = 0U;
+            std::uint64_t next_raw_timer =
+                config_.raw_record_tap == nullptr
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : MonotonicNowNs() + config_.recovery_timer_scan_ns;
             for (;;) {
                 std::uint32_t slot = 0U;
                 internal::OwnedMessageView message;
@@ -1951,7 +1984,21 @@ private:
                     if (error == internal::DecodeError::kNone) {
                         lane_stats.decoded_snapshots.fetch_add(
                             1U, std::memory_order_relaxed);
-                        if (decoded.catalog_match) {
+                        if (!decoded.catalog_match) {
+                            lane_stats.catalog_misses.fetch_add(
+                                1U, std::memory_order_relaxed);
+                        }
+                        const bool raw_accepted =
+                            config_.raw_record_tap == nullptr ||
+                            config_.raw_record_tap->AppendSnapshot(
+                                lane_index, decoded.snapshot);
+                        if (!raw_accepted) {
+                            SetFatal(
+                                "raw Snapshot batch queue exhausted or "
+                                "failed; admission stopped at a continuity "
+                                "boundary");
+                        }
+                        if (raw_accepted && decoded.catalog_match) {
                             const std::size_t owner = InstrumentOwner(
                                 decoded.snapshot.common.instrument_ordinal);
                             const bool published = PublishBounded(
@@ -1970,9 +2017,6 @@ private:
                                     "instrument snapshot dispatch queue "
                                     "overflow");
                             }
-                        } else {
-                            lane_stats.catalog_misses.fetch_add(
-                                1U, std::memory_order_relaxed);
                         }
                     } else {
                         lane_stats.decode_errors.fetch_add(
@@ -1982,10 +2026,43 @@ private:
                         SetFatal(
                             "snapshot lane recycle queue invariant failed");
                     }
+                    if (config_.raw_record_tap != nullptr &&
+                        message.receive_monotonic_ns >= next_raw_timer &&
+                        !config_.raw_record_tap->PollSnapshot(
+                            lane_index, message.receive_monotonic_ns)) {
+                        SetFatal("raw Snapshot batch flush failed");
+                    }
+                    if (message.receive_monotonic_ns >= next_raw_timer) {
+                        next_raw_timer = message.receive_monotonic_ns +
+                                         config_.recovery_timer_scan_ns;
+                    }
                 } else {
                     if (!running_.load(std::memory_order_acquire) &&
                         lane.empty()) {
+                        if (config_.raw_record_tap != nullptr &&
+                            !config_.raw_record_tap->FlushSnapshot(
+                                lane_index)) {
+                            SetFatal(
+                                "final raw Snapshot batch flush failed");
+                        }
                         break;
+                    }
+                    if (config_.raw_record_tap != nullptr) {
+                        ++timer_check_spins;
+                    }
+                    if (config_.raw_record_tap != nullptr &&
+                        timer_check_spins >= 1'024U) {
+                        timer_check_spins = 0U;
+                        const std::uint64_t now = MonotonicNowNs();
+                        if (now >= next_raw_timer) {
+                            if (config_.raw_record_tap != nullptr &&
+                                !config_.raw_record_tap->PollSnapshot(
+                                    lane_index, now)) {
+                                SetFatal("raw Snapshot batch flush failed");
+                            }
+                            next_raw_timer = now +
+                                             config_.recovery_timer_scan_ns;
+                        }
                     }
                     if (config_.first_decoder_cpu >= 0) {
                         CpuRelax();

@@ -3,32 +3,33 @@
 ## 1. Contract and non-goals
 
 The Arrow path is a bounded, volatile, same-host transport for the most recent
-batches. It is not a WAL, a Kafka acknowledgement boundary, or a source for
-recovering Kafka-unacknowledged records.
+batches. It is not a WAL, a ClickHouse acknowledgement boundary, or a source
+for recovering ClickHouse-unacknowledged records.
 
 This distinction is required by the MDL source contract. After a disconnect or
 process crash, `mdl_ingestd` cannot ask MDL to resume at the last native
-sequence acknowledged by Kafka. A record that existed only in this Arrow ring
-and was not accepted by the durable branch is irrecoverable from the ring once
-it is overwritten or the host loses the tmpfs contents. Kafka/Redpanda must
-therefore receive the normalized stream through an independent branch with its
-own queueing, retry, acknowledgement, and failure policy.
+sequence acknowledged by ClickHouse. A record that existed only in this Arrow
+ring is irrecoverable from the ring once it is overwritten or the host loses
+the tmpfs contents. The raw ClickHouse sink therefore receives decoded facts
+through an independent pre-recovery branch with its own queueing, retry,
+acknowledgement, and fail-closed policy.
 
 The implemented boundary is:
 
 ```text
-MDL callback -> admission/decode/recovery -> instrument-owner queues
-                                              |
-                                              +-> ArrowHotEgress -> mmap rings
-                                              |
-                                              +-> future Kafka sink queue
+MDL callback -> admission/decode -> RawCanonicalBatch -> ClickHouse writers
+                                |
+                                +-> recovery -> instrument-owner queues
+                                                |
+                                                +-> ArrowHotEgress -> mmap rings
 ```
 
 `ArrowHotEgress` does not depend on `IngestEngine`; the daemon currently calls
-it from the owner drain threads. A Kafka implementation must not put a blocking
-Kafka send in those threads. Fan-out each canonical record into independently
-bounded sink queues so a Kafka retry does not delay Arrow publication and a
-pinned Arrow consumer does not control Kafka acknowledgement.
+it from the owner drain threads. ClickHouse writing does not run in those
+threads: decoder lanes publish preallocated raw batch indices and dedicated
+writer threads perform Arrow columnization, HTTP INSERT, and retry. A pinned
+Arrow consumer therefore cannot control ClickHouse acknowledgement, and a
+ClickHouse retry does not block Arrow owner-drain publication.
 
 ## 2. Ring set and ordering
 
@@ -151,8 +152,8 @@ path state.
 ## 5. Feed epochs and MDL disconnects
 
 Every process attempt uses an explicit positive `feed_session_epoch`. It is a
-local continuity epoch, not an MDL native sequence, Kafka offset, timestamp, or
-ClickHouse revision.
+local continuity epoch, not an MDL native sequence, transport offset,
+timestamp, or ClickHouse revision.
 
 The root directory contains an advisory `.producer.lock`, so only one
 `ArrowHotEgress` can publish there. Startup reads the manifest selected by
@@ -201,8 +202,8 @@ callbacks. The daemon then quiesces the SDK, drains records already admitted to
 the engine and owner queues, publishes the typed boundary to the Control ring,
 publishes `kProducerSealed`, seals every ring, and exits nonzero. An SDK
 auto-reconnect therefore cannot feed data into the old epoch. The supervisor
-must restart the process with a strictly larger epoch; neither Arrow nor Kafka
-can ask MDL to resume at a Kafka-acknowledged native sequence.
+must restart the process with a strictly larger epoch; neither Arrow nor
+ClickHouse can ask MDL to resume at a ClickHouse-acknowledged native sequence.
 
 A process crash cannot publish a disconnect or seal event. Its rings remain in
 `ACTIVE` state with a heartbeat that stops changing. A reader may use the raw
@@ -356,7 +357,7 @@ depth, batch sizes, and reader lease duration. This C++ reader benchmark does
 not establish Python factor throughput; the cross-language tests establish
 ABI and lifetime correctness, and the production Python/Polars workload must
 be measured separately. Neither benchmark includes the network/MDL work before
-callback entry or a Kafka broker acknowledgement.
+callback entry or a ClickHouse acknowledgement.
 
 The 2026-08-07 development run used Arrow 25, a Release build, one NUMA-node
 CPU layout, `/dev/shm`, 16 owners/readers, 256-row limits, and the 1 ms delay.

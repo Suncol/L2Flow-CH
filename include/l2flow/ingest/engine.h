@@ -13,6 +13,8 @@
 
 namespace l2flow::ingest {
 
+class RawRecordTap;
+
 struct EngineConfig final {
     std::uint32_t trade_date = 0U;
     StartMode start_mode = StartMode::kFromOpen;
@@ -46,6 +48,11 @@ struct EngineConfig final {
     std::uint64_t partial_gap_wait_ns = 500'000U;
     std::uint64_t from_open_gap_wait_ns = 500'000U;
     std::uint64_t recovery_timer_scan_ns = 25'000U;
+
+    // Optional decode-complete, pre-SequenceRecovery fact tap. Its lifetime
+    // must cover Start through Stop and it must expose exactly one producer
+    // endpoint for every configured decoder lane.
+    RawRecordTap* raw_record_tap = nullptr;
 
     std::size_t maximum_text_bytes = kMaximumIdentityBytes;
     std::size_t maximum_depth_items = 4'096U;

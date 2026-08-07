@@ -11,6 +11,10 @@ if [[ ! -x "$CLICKHOUSE_BINARY" ]]; then
     exit 1
 fi
 
+if [[ ! -s "$CLICKHOUSE_PID_FILE" ]]; then
+    clickhouse_recover_pid_file || true
+fi
+
 if [[ -s "$CLICKHOUSE_PID_FILE" ]]; then
     existing_pid="$(<"$CLICKHOUSE_PID_FILE")"
 
@@ -28,10 +32,18 @@ if [[ -s "$CLICKHOUSE_PID_FILE" ]]; then
     rm -f -- "$CLICKHOUSE_PID_FILE"
 fi
 
+# A stale mirror can coexist with a valid ClickHouse 26 data/status file.
+# Re-check the authoritative status after removing the stale mirror so a
+# second server is never launched for this data directory.
+if [[ ! -s "$CLICKHOUSE_PID_FILE" ]] && clickhouse_recover_pid_file; then
+    recovered_pid="$(<"$CLICKHOUSE_PID_FILE")"
+    echo "ClickHouse is already running: PID=$recovered_pid"
+    exit 0
+fi
+
 if ! env CLICKHOUSE_WATCHDOG_ENABLE=0 \
     "$CLICKHOUSE_BINARY" server \
     "--config-file=$CLICKHOUSE_CONFIG" \
-    "--pid-file=$CLICKHOUSE_PID_FILE" \
     --daemon \
     >> "$CLICKHOUSE_CONSOLE_LOG" 2>&1; then
 
@@ -43,6 +55,8 @@ fi
 for _ in $(seq 1 100); do
     pid=""
     if [[ -s "$CLICKHOUSE_PID_FILE" ]]; then
+        pid="$(<"$CLICKHOUSE_PID_FILE")"
+    elif clickhouse_recover_pid_file; then
         pid="$(<"$CLICKHOUSE_PID_FILE")"
     fi
 

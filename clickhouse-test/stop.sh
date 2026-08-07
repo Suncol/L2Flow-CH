@@ -4,6 +4,10 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 if [[ ! -s "$CLICKHOUSE_PID_FILE" ]]; then
+    clickhouse_recover_pid_file || true
+fi
+
+if [[ ! -s "$CLICKHOUSE_PID_FILE" ]]; then
     if clickhouse_http_ready; then
         echo "HTTP is available, but this instance has no PID file." >&2
         echo "Refusing to stop an unmanaged process." >&2

@@ -8,6 +8,7 @@ CLICKHOUSE_BASE="$({
 CLICKHOUSE_BINARY="$CLICKHOUSE_BASE/clickhouse"
 CLICKHOUSE_CONFIG="$CLICKHOUSE_BASE/config/config.xml"
 CLICKHOUSE_PID_FILE="$CLICKHOUSE_BASE/run/clickhouse.pid"
+CLICKHOUSE_STATUS_FILE="$CLICKHOUSE_BASE/data/status"
 CLICKHOUSE_CONSOLE_LOG="$CLICKHOUSE_BASE/logs/server-console.log"
 CLICKHOUSE_HTTP_URL="http://127.0.0.1:8123"
 CLICKHOUSE_NATIVE_PORT="19000"
@@ -48,6 +49,27 @@ clickhouse_pid_is_this_instance() {
 
     tr '\0' '\n' < "/proc/$pid/cmdline" \
         | grep -Fqx -- "--config-file=$CLICKHOUSE_CONFIG"
+}
+
+clickhouse_status_pid() {
+    local label value
+
+    [[ -r "$CLICKHOUSE_STATUS_FILE" ]] || return 1
+    while IFS=': ' read -r label value; do
+        if [[ "$label" == "PID" && "$value" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done < "$CLICKHOUSE_STATUS_FILE"
+    return 1
+}
+
+clickhouse_recover_pid_file() {
+    local pid
+
+    pid="$(clickhouse_status_pid)" || return 1
+    clickhouse_pid_is_this_instance "$pid" || return 1
+    printf '%s\n' "$pid" > "$CLICKHOUSE_PID_FILE"
 }
 
 clickhouse_native_query() {

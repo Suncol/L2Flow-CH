@@ -6,6 +6,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 process_ok=0
 http_ok=0
 
+if [[ ! -s "$CLICKHOUSE_PID_FILE" ]]; then
+    clickhouse_recover_pid_file || true
+fi
+
 if [[ -s "$CLICKHOUSE_PID_FILE" ]]; then
     pid="$(<"$CLICKHOUSE_PID_FILE")"
 

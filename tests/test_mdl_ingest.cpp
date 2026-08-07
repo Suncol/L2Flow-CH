@@ -1,6 +1,7 @@
 #include "l2flow/ingest/catalog.h"
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/message.h"
+#include "l2flow/ingest/raw_tap.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
 #include <algorithm>
@@ -44,6 +45,65 @@ using namespace l2flow::ingest;
             std::exit(1);                                                    \
         }                                                                    \
     } while (false)
+
+class RecordingRawTap final : public RawRecordTap {
+public:
+    RecordingRawTap() {
+        ticks.reserve(16U);
+        snapshots.reserve(16U);
+    }
+
+    [[nodiscard]] bool AppendTick(
+        std::size_t decoder_lane,
+        const CanonicalTick& tick) noexcept override {
+        if (decoder_lane != 0U || reject_tick_ ||
+            ticks.size() == ticks.capacity()) {
+            return false;
+        }
+        ticks.push_back(tick);
+        return true;
+    }
+
+    [[nodiscard]] bool AppendSnapshot(
+        std::size_t decoder_lane,
+        const CanonicalSnapshot& snapshot) noexcept override {
+        if (decoder_lane != 0U || reject_snapshot_ ||
+            snapshots.size() == snapshots.capacity()) {
+            return false;
+        }
+        snapshots.push_back(snapshot);
+        return true;
+    }
+
+    [[nodiscard]] bool PollTick(
+        std::size_t decoder_lane,
+        std::uint64_t monotonic_ns) noexcept override {
+        static_cast<void>(monotonic_ns);
+        return decoder_lane == 0U;
+    }
+
+    [[nodiscard]] bool PollSnapshot(
+        std::size_t decoder_lane,
+        std::uint64_t monotonic_ns) noexcept override {
+        static_cast<void>(monotonic_ns);
+        return decoder_lane == 0U;
+    }
+
+    [[nodiscard]] bool FlushTick(
+        std::size_t decoder_lane) noexcept override {
+        return decoder_lane == 0U;
+    }
+
+    [[nodiscard]] bool FlushSnapshot(
+        std::size_t decoder_lane) noexcept override {
+        return decoder_lane == 0U;
+    }
+
+    bool reject_tick_ = false;
+    bool reject_snapshot_ = false;
+    std::vector<CanonicalTick> ticks;
+    std::vector<CanonicalSnapshot> snapshots;
+};
 
 template <typename Unsigned>
 void PutUnsigned(std::span<std::byte> bytes,
@@ -705,6 +765,139 @@ void TestCatalogMissStillAdvancesNativeSequence() {
     engine->Stop();
 }
 
+void TestRawTapRetainsRetransmissionsBeforeRecoveryMutation() {
+    RecordingRawTap raw;
+    EngineConfig config = MakeConfig(StartMode::kPartial);
+    config.raw_record_tap = &raw;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const MessageKey key{4U, 101U, 24U};
+    const std::vector<std::byte> first = MakeShTick(1, "600000");
+    const std::vector<std::byte> after_gap = MakeShTick(3, "600000");
+    const auto first_header = MakeHeader(key, first.size(), 100U);
+    const auto repeated_header = MakeHeader(key, after_gap.size(), 101U);
+    CHECK(engine->AdmitMdlMessage(first_header, first, 1U) ==
+          AdmissionResult::kAccepted);
+    CHECK(engine->AdmitMdlMessage(repeated_header, after_gap, 2U) ==
+          AdmissionResult::kAccepted);
+    CHECK(engine->AdmitMdlMessage(repeated_header, after_gap, 3U) ==
+          AdmissionResult::kAccepted);
+    CHECK(WaitFor([&] { return engine->stats().decoded_ticks == 3U; }));
+    engine->Stop();
+
+    CHECK(raw.ticks.size() == 3U);
+    CHECK(raw.ticks[0U].common.native_sequence == 1U);
+    CHECK(raw.ticks[1U].common.native_sequence == 3U);
+    CHECK(raw.ticks[2U].common.native_sequence == 3U);
+    CHECK(raw.ticks[1U].common.ingress_sequence !=
+          raw.ticks[2U].common.ingress_sequence);
+    CHECK((raw.ticks[1U].common.quality_flags &
+           kQualitySequenceGapBefore) == 0U);
+    CHECK((raw.ticks[2U].common.quality_flags &
+           kQualitySequenceGapBefore) == 0U);
+    CHECK(raw.ticks[1U].common.gap_before_first == 0U);
+    CHECK(raw.ticks[1U].common.gap_before_last == 0U);
+
+    std::vector<CanonicalTick> ordered;
+    CanonicalTick tick{};
+    while (engine->TryPollTick(0U, &tick)) {
+        ordered.push_back(tick);
+    }
+    CHECK(ordered.size() == 2U);
+    CHECK(ordered[0U].common.native_sequence == 1U);
+    CHECK(ordered[1U].common.native_sequence == 3U);
+    CHECK((ordered[1U].common.quality_flags &
+           kQualitySequenceGapBefore) != 0U);
+    CHECK(ordered[1U].common.gap_before_first == 2U);
+    CHECK(ordered[1U].common.gap_before_last == 2U);
+}
+
+void TestRawTapRetainsCatalogMissesBeforeOwnerSuppression() {
+    RecordingRawTap raw;
+    EngineConfig config = MakeConfig(StartMode::kPartial);
+    config.raw_record_tap = &raw;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600001"), 1U);
+    Admit(engine.get(), {4U, 101U, 4U},
+          MakeShSnapshot("600001"), 2U);
+    CHECK(WaitFor([&] {
+        const EngineStats stats = engine->stats();
+        return stats.decoded_ticks == 1U &&
+               stats.decoded_snapshots == 1U;
+    }));
+    engine->Stop();
+
+    CHECK(raw.ticks.size() == 1U);
+    CHECK(raw.snapshots.size() == 1U);
+    CHECK((raw.ticks.front().common.quality_flags &
+           kQualityInstrumentNotInCatalog) != 0U);
+    CHECK((raw.snapshots.front().common.quality_flags &
+           kQualityInstrumentNotInCatalog) != 0U);
+    CanonicalTick tick{};
+    CanonicalSnapshot snapshot{};
+    CHECK(!engine->TryPollTick(0U, &tick));
+    CHECK(!engine->TryPollSnapshot(0U, &snapshot));
+    CHECK(engine->stats().catalog_misses == 2U);
+}
+
+void TestRawTapFailureClosesAdmission() {
+    RecordingRawTap raw;
+    raw.reject_tick_ = true;
+    EngineConfig config = MakeConfig(StartMode::kPartial);
+    config.raw_record_tap = &raw;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const MessageKey key{4U, 101U, 24U};
+    const std::vector<std::byte> body = MakeShTick(1, "600000");
+    const auto header = MakeHeader(key, body.size(), 100U);
+    CHECK(engine->AdmitMdlMessage(header, body, 1U) ==
+          AdmissionResult::kAccepted);
+    CHECK(WaitFor([&] { return !engine->healthy(); }));
+    CHECK(engine->AdmitMdlMessage(header, body, 2U) !=
+          AdmissionResult::kAccepted);
+    engine->Stop();
+    CHECK(engine->fatal_error().find("raw Tick batch queue") !=
+          std::string::npos);
+    CanonicalTick tick{};
+    CHECK(!engine->TryPollTick(0U, &tick));
+
+    RecordingRawTap snapshot_raw;
+    snapshot_raw.reject_snapshot_ = true;
+    config = MakeConfig(StartMode::kPartial);
+    config.raw_record_tap = &snapshot_raw;
+    engine = IngestEngine::Create(config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const MessageKey snapshot_key{4U, 101U, 4U};
+    const std::vector<std::byte> snapshot_body = MakeShSnapshot("600000");
+    const auto snapshot_header =
+        MakeHeader(snapshot_key, snapshot_body.size(), 101U);
+    CHECK(engine->AdmitMdlMessage(
+              snapshot_header, snapshot_body, 3U) ==
+          AdmissionResult::kAccepted);
+    CHECK(WaitFor([&] { return !engine->healthy(); }));
+    engine->Stop();
+    CHECK(engine->fatal_error().find("raw Snapshot batch queue") !=
+          std::string::npos);
+    CanonicalSnapshot snapshot{};
+    CHECK(!engine->TryPollSnapshot(0U, &snapshot));
+}
+
 void TestBothSnapshotLayouts() {
     std::unique_ptr<IngestEngine> engine =
         MakeEngine(StartMode::kFromOpen);
@@ -1139,6 +1332,9 @@ int main() {
     TestPartialReorderCapacityAdvancesWithoutLoss();
     TestPartialGapMailboxCoalescesWithoutOverflow();
     TestCatalogMissStillAdvancesNativeSequence();
+    TestRawTapRetainsRetransmissionsBeforeRecoveryMutation();
+    TestRawTapRetainsCatalogMissesBeforeOwnerSuppression();
+    TestRawTapFailureClosesAdmission();
     TestBothSnapshotLayouts();
     TestMalformedSnapshotListFailsDecode();
     TestDynamicRangesMayNotOverlap();

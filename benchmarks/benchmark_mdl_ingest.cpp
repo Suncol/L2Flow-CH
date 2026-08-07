@@ -2,6 +2,10 @@
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+#include "l2flow/clickhouse/raw_sink.h"
+#endif
+
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
 #include "l2flow/arrow/egress.h"
 #include "l2flow/arrow/ring.h"
@@ -66,6 +70,11 @@ struct Options final {
     int producer_cpu = 0;
     int first_consumer_cpu = 1;
     int first_decoder_cpu = 17;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    l2flow::clickhouse::RawClickHouseConfig clickhouse{};
+    bool clickhouse_enabled = false;
+    bool clickhouse_configuration_set = false;
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::filesystem::path arrow_ring_directory;
     std::uint64_t arrow_feed_session_epoch = 1U;
@@ -297,6 +306,21 @@ void PrintUsage() {
         << "  --producer-cpu N         default 0\n"
         << "  --first-consumer-cpu N   default 1\n"
         << "  --first-decoder-cpu N    default 17\n";
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    std::cout
+        << "  --clickhouse-url URL     enable durable raw writes\n"
+        << "  --clickhouse-database NAME default l2flow\n"
+        << "  --clickhouse-feed-epoch N required nonzero run epoch\n"
+        << "  --clickhouse-writers N   default 2\n"
+        << "  --clickhouse-tick-batch-rows N default 16384\n"
+        << "  --clickhouse-tick-batch-bytes N default 16777216\n"
+        << "  --clickhouse-tick-batch-max-delay-ns N default 5000000\n"
+        << "  --clickhouse-queue-batches-per-lane N default 8\n"
+        << "  --clickhouse-request-timeout-ms N default 10000\n"
+        << "  --clickhouse-maximum-retry-ms N default 5000\n"
+        << "  --clickhouse-shutdown-timeout-ms N default 30000\n"
+        << "  --clickhouse-no-auto-create use pre-created tables\n";
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::cout
         << "  --arrow-ring-dir PATH    enable Arrow publish/read/decode\n"
@@ -398,6 +422,94 @@ void PrintUsage() {
                 *error = "invalid --first-decoder-cpu";
                 return false;
             }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        } else if (argument == "--clickhouse-url") {
+            const std::string_view value = next(argument);
+            if (value.empty()) {
+                if (error->empty()) {
+                    *error = "invalid --clickhouse-url";
+                }
+                return false;
+            }
+            parsed.clickhouse.endpoint = value;
+            parsed.clickhouse_enabled = true;
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-database") {
+            parsed.clickhouse.database = next(argument);
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-feed-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.feed_session_epoch)) {
+                *error = "invalid --clickhouse-feed-epoch";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-writers") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.writer_threads)) {
+                *error = "invalid --clickhouse-writers";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-tick-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.tick_batch_rows)) {
+                *error = "invalid --clickhouse-tick-batch-rows";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-tick-batch-bytes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.tick_batch_bytes)) {
+                *error = "invalid --clickhouse-tick-batch-bytes";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument ==
+                   "--clickhouse-tick-batch-max-delay-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse.tick_batch_max_delay_ns)) {
+                *error = "invalid --clickhouse-tick-batch-max-delay-ns";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument ==
+                   "--clickhouse-queue-batches-per-lane") {
+            std::size_t capacity = 0U;
+            if (!ParseInteger(next(argument), &capacity)) {
+                *error = "invalid --clickhouse-queue-batches-per-lane";
+                return false;
+            }
+            parsed.clickhouse.tick_queue_batches_per_lane = capacity;
+            parsed.clickhouse.snapshot_queue_batches_per_lane = capacity;
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-request-timeout-ms") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.request_timeout_ms)) {
+                *error = "invalid --clickhouse-request-timeout-ms";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-maximum-retry-ms") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse.maximum_retry_elapsed_ms)) {
+                *error = "invalid --clickhouse-maximum-retry-ms";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-shutdown-timeout-ms") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse.shutdown_timeout_ms)) {
+                *error = "invalid --clickhouse-shutdown-timeout-ms";
+                return false;
+            }
+            parsed.clickhouse_configuration_set = true;
+        } else if (argument == "--clickhouse-no-auto-create") {
+            parsed.clickhouse.ensure_local_tables = false;
+            parsed.clickhouse_configuration_set = true;
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         } else if (argument == "--arrow-ring-dir") {
             const std::string_view value = next(argument);
@@ -518,6 +630,26 @@ void PrintUsage() {
         *error = "message-count calculation overflows";
         return false;
     }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (parsed.clickhouse_configuration_set &&
+        !parsed.clickhouse_enabled) {
+        *error = "ClickHouse benchmark options require --clickhouse-url";
+        return false;
+    }
+    if (parsed.clickhouse_enabled) {
+        if (parsed.clickhouse.feed_session_epoch == 0U) {
+            *error = "--clickhouse-url requires a nonzero "
+                     "--clickhouse-feed-epoch";
+            return false;
+        }
+        parsed.clickhouse.tick_decoder_lanes = parsed.tick_lanes;
+        parsed.clickhouse.snapshot_decoder_lanes = 1U;
+        if (!l2flow::clickhouse::ValidateRawClickHouseConfig(
+                parsed.clickhouse, error)) {
+            return false;
+        }
+    }
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     const bool arrow_enabled = !parsed.arrow_ring_directory.empty();
     if (parsed.arrow_configuration_set && !arrow_enabled) {
@@ -806,11 +938,6 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
-    if (!PinCurrentThread(options.producer_cpu, &error)) {
-        std::cerr << error << '\n';
-        return 2;
-    }
-
     const std::uint64_t quantum =
         static_cast<std::uint64_t>(options.channels) *
         static_cast<std::uint64_t>(options.reorder_window);
@@ -892,6 +1019,19 @@ int main(int argc, char** argv) {
     constexpr MessageKey kBenchmarkStream{4U, 101U, 24U};
     config.enabled_streams = StreamBit(kBenchmarkStream);
 
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    std::unique_ptr<l2flow::clickhouse::RawClickHouseSink> clickhouse_raw;
+    if (options.clickhouse_enabled) {
+        clickhouse_raw = l2flow::clickhouse::RawClickHouseSink::Create(
+            options.clickhouse, &error);
+        if (clickhouse_raw == nullptr) {
+            std::cerr << "ClickHouse raw sink creation failed: "
+                      << error << '\n';
+            return 1;
+        }
+        config.raw_record_tap = clickhouse_raw.get();
+    }
+#endif
     std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
         config, std::move(catalog), &error);
     if (engine == nullptr) {
@@ -948,7 +1088,47 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (clickhouse_raw != nullptr) {
+        if (!clickhouse_raw->Start(&error)) {
+            std::cerr << "ClickHouse raw sink start failed: "
+                      << error << '\n';
+            return 1;
+        }
+        std::cout
+            << "clickhouse_raw_writer_instance="
+            << l2flow::clickhouse::IdentifierString(
+                   clickhouse_raw->writer_instance_id())
+            << " source_instance="
+            << l2flow::clickhouse::IdentifierString(
+                   clickhouse_raw->source_instance_id())
+            << " feed_epoch=" << options.clickhouse.feed_session_epoch
+            << " run_started_utc_ns="
+            << clickhouse_raw->run_started_utc_ns()
+            << " run_started_monotonic_ns="
+            << clickhouse_raw->run_started_monotonic_ns() << '\n';
+    }
+#endif
+    // ClickHouse writers inherit the caller affinity. Create them while the
+    // main thread still has the benchmark's broad NUMA CPU mask, then isolate
+    // this thread on the dedicated producer CPU before starting admission.
+    if (!PinCurrentThread(options.producer_cpu, &error)) {
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (clickhouse_raw != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+#endif
+        std::cerr << error << '\n';
+        return 2;
+    }
     if (!engine->Start(&error)) {
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (clickhouse_raw != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+#endif
         std::cerr << error << '\n';
         return 1;
     }
@@ -964,6 +1144,12 @@ int main(int argc, char** argv) {
     if (!handler.feed_ready() ||
         handler.last_result() != AdmissionResult::kAccepted) {
         engine->Stop();
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (clickhouse_raw != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+#endif
         std::cerr << "synthetic MDL LogonResponse did not reach readiness\n";
         return 1;
     }
@@ -972,6 +1158,12 @@ int main(int argc, char** argv) {
         !arrow_egress->MarkFeedConnected(
             handler.feed_ready_monotonic_ns())) {
         engine->Stop();
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (clickhouse_raw != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+#endif
         std::cerr << "Arrow benchmark could not publish feed readiness: "
                   << arrow_egress->fatal_error() << '\n';
         return 1;
@@ -1272,6 +1464,15 @@ int main(int argc, char** argv) {
             }
 #endif
         }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (clickhouse_raw != nullptr) {
+            std::string stop_error;
+            if (!clickhouse_raw->Stop(&stop_error)) {
+                std::cerr << "ClickHouse raw sink stop failed: "
+                          << stop_error << '\n';
+            }
+        }
+#endif
         return 1;
     }
 
@@ -1324,6 +1525,13 @@ int main(int argc, char** argv) {
         ++admitted_count;
     }
     producer_finish_ns = MonotonicNowNs();
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    l2flow::clickhouse::RawClickHouseStats
+        clickhouse_measurement_end_stats{};
+    if (clickhouse_raw != nullptr) {
+        clickhouse_measurement_end_stats = clickhouse_raw->stats();
+    }
+#endif
 
     bool completion_failed = false;
     if (admission_failure != AdmissionResult::kAccepted ||
@@ -1364,6 +1572,20 @@ int main(int argc, char** argv) {
     if (!completion_failed) {
         engine->Stop();
     }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    bool clickhouse_stop_ok = true;
+    std::string clickhouse_stop_error;
+    std::uint64_t clickhouse_stop_start_ns = 0U;
+    std::uint64_t clickhouse_stop_finish_ns = 0U;
+    l2flow::clickhouse::RawClickHouseStats clickhouse_final_stats{};
+    if (clickhouse_raw != nullptr) {
+        clickhouse_stop_start_ns = MonotonicNowNs();
+        clickhouse_stop_ok =
+            clickhouse_raw->Stop(&clickhouse_stop_error);
+        clickhouse_stop_finish_ns = MonotonicNowNs();
+        clickhouse_final_stats = clickhouse_raw->stats();
+    }
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     if (arrow_egress != nullptr) {
         arrow_egress->Seal(MonotonicNowNs());
@@ -1491,6 +1713,64 @@ int main(int argc, char** argv) {
         : static_cast<double>(total_measured) / dispatch_seconds;
     const double minimum_pass_rate =
         static_cast<double>(options.target_rate) * 0.99;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    const double clickhouse_measurement_seconds =
+        !options.clickhouse_enabled || producer_finish_ns <= schedule_origin_ns
+            ? 0.0
+            : static_cast<double>(producer_finish_ns - schedule_origin_ns) /
+                  1'000'000'000.0;
+    const double clickhouse_final_seconds =
+        !options.clickhouse_enabled ||
+                clickhouse_stop_finish_ns <= schedule_origin_ns
+            ? 0.0
+            : static_cast<double>(clickhouse_stop_finish_ns -
+                                  schedule_origin_ns) /
+                  1'000'000'000.0;
+    const double clickhouse_measurement_ack_rate =
+        clickhouse_measurement_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(
+                  clickhouse_measurement_end_stats.rows_acked) /
+                  clickhouse_measurement_seconds;
+    const double clickhouse_final_ack_rate =
+        clickhouse_final_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(clickhouse_final_stats.rows_acked) /
+                  clickhouse_final_seconds;
+    const std::uint64_t clickhouse_measurement_ingress_lag =
+        clickhouse_measurement_end_stats.tick_rows_received >= total_count
+            ? 0U
+            : total_count -
+                  clickhouse_measurement_end_stats.tick_rows_received;
+    const std::uint64_t clickhouse_measurement_ack_lag =
+        clickhouse_measurement_end_stats.rows_acked >= total_count
+            ? 0U
+            : total_count - clickhouse_measurement_end_stats.rows_acked;
+    const std::uint64_t clickhouse_stop_duration_ns =
+        clickhouse_stop_finish_ns >= clickhouse_stop_start_ns
+            ? clickhouse_stop_finish_ns - clickhouse_stop_start_ns
+            : 0U;
+    const std::uint64_t clickhouse_total_ack_tail_ns =
+        clickhouse_stop_finish_ns >= producer_finish_ns
+            ? clickhouse_stop_finish_ns - producer_finish_ns
+            : 0U;
+    bool clickhouse_valid = true;
+    if (options.clickhouse_enabled) {
+        clickhouse_valid = clickhouse_stop_ok &&
+            clickhouse_final_stats.tick_rows_received == total_count &&
+            clickhouse_final_stats.snapshot_rows_received == 0U &&
+            clickhouse_final_stats.rows_acked == total_count &&
+            clickhouse_final_stats.batches_queued ==
+                clickhouse_final_stats.batches_acked &&
+            clickhouse_final_stats.batches_acked ==
+                clickhouse_final_stats.batches_released &&
+            clickhouse_final_stats.retry_attempts == 0U &&
+            clickhouse_final_stats.unknown_outcomes == 0U &&
+            clickhouse_final_stats.unacked_batches == 0U &&
+            clickhouse_raw->healthy() &&
+            clickhouse_final_ack_rate >= minimum_pass_rate;
+    }
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     const double arrow_read_seconds =
         !arrow_enabled || first_measured_callback_ns == 0U ||
@@ -1543,10 +1823,12 @@ int main(int argc, char** argv) {
         engine->healthy() && !handler.failed() && cpu_binding_valid &&
         producer_rate >= minimum_pass_rate &&
         dispatch_rate >= minimum_pass_rate;
+    bool valid = base_valid;
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
-    const bool valid = base_valid && arrow_valid;
-#else
-    const bool valid = base_valid;
+    valid = valid && arrow_valid;
+#endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    valid = valid && clickhouse_valid;
 #endif
 
     const auto to_us = [](std::uint64_t nanoseconds) {
@@ -1657,6 +1939,71 @@ int main(int argc, char** argv) {
             << (arrow_egress->healthy() ? "true" : "false") << '\n';
     }
 #endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (options.clickhouse_enabled) {
+        const std::string writer_instance =
+            l2flow::clickhouse::IdentifierString(
+                clickhouse_raw->writer_instance_id());
+        std::cout
+            << "clickhouse_config endpoint=" << options.clickhouse.endpoint
+            << " database=" << options.clickhouse.database
+            << " feed_epoch=" << options.clickhouse.feed_session_epoch
+            << " writers=" << options.clickhouse.writer_threads
+            << " tick_batch_rows=" << options.clickhouse.tick_batch_rows
+            << " tick_batch_bytes=" << options.clickhouse.tick_batch_bytes
+            << " tick_batch_max_delay_ns="
+            << options.clickhouse.tick_batch_max_delay_ns
+            << " queue_batches_per_lane="
+            << options.clickhouse.tick_queue_batches_per_lane
+            << " writer_instance=" << writer_instance
+            << " query_id_prefix=l2flow/raw_tick/" << writer_instance
+            << "/\n"
+            << "clickhouse_measurement_end tick_in="
+            << clickhouse_measurement_end_stats.tick_rows_received
+            << " rows_acked="
+            << clickhouse_measurement_end_stats.rows_acked
+            << " ingress_lag_rows="
+            << clickhouse_measurement_ingress_lag
+            << " ack_lag_rows=" << clickhouse_measurement_ack_lag
+            << " batches_queued="
+            << clickhouse_measurement_end_stats.batches_queued
+            << " batches_acked="
+            << clickhouse_measurement_end_stats.batches_acked
+            << " unacked_batches="
+            << clickhouse_measurement_end_stats.unacked_batches << '\n'
+            << "clickhouse_throughput measurement_ack_msg_s="
+            << clickhouse_measurement_ack_rate
+            << " effective_final_ack_msg_s="
+            << clickhouse_final_ack_rate
+            << " measurement_seconds=" << clickhouse_measurement_seconds
+            << " final_seconds=" << clickhouse_final_seconds
+            << " stop_drain_ms="
+            << to_us(clickhouse_stop_duration_ns) / 1'000.0
+            << " producer_to_final_ack_tail_ms="
+            << to_us(clickhouse_total_ack_tail_ns) / 1'000.0 << '\n'
+            << "clickhouse_final tick_in="
+            << clickhouse_final_stats.tick_rows_received
+            << " snapshot_in="
+            << clickhouse_final_stats.snapshot_rows_received
+            << " rows_acked=" << clickhouse_final_stats.rows_acked
+            << " batches_queued="
+            << clickhouse_final_stats.batches_queued
+            << " batches_acked="
+            << clickhouse_final_stats.batches_acked
+            << " batches_released="
+            << clickhouse_final_stats.batches_released
+            << " retries=" << clickhouse_final_stats.retry_attempts
+            << " unknown_outcomes="
+            << clickhouse_final_stats.unknown_outcomes
+            << " bytes_sent=" << clickhouse_final_stats.bytes_sent
+            << " unacked_batches="
+            << clickhouse_final_stats.unacked_batches
+            << " preallocated_canonical_bytes="
+            << clickhouse_final_stats.preallocated_canonical_bytes
+            << " healthy="
+            << (clickhouse_raw->healthy() ? "true" : "false") << '\n';
+    }
+#endif
     std::cout << "status=" << (valid ? "PASS" : "FAIL") << '\n';
     if (admission_failure != AdmissionResult::kAccepted) {
         std::cerr << "admission failed: "
@@ -1665,6 +2012,16 @@ int main(int argc, char** argv) {
     if (!engine->healthy()) {
         std::cerr << "engine fatal: " << engine->fatal_error() << '\n';
     }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (options.clickhouse_enabled &&
+        (!clickhouse_stop_ok || !clickhouse_raw->healthy())) {
+        std::cerr << "ClickHouse raw sink fatal: "
+                  << (clickhouse_stop_error.empty()
+                          ? clickhouse_raw->fatal_error()
+                          : clickhouse_stop_error)
+                  << '\n';
+    }
+#endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     if (arrow_enabled) {
         for (std::size_t owner = 0U;
