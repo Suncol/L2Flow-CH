@@ -2,7 +2,7 @@
 
 ## 1. Scope
 
-This implementation ends at instrument dispatch:
+The core ingest library ends at instrument dispatch:
 
 ```text
 MDL callback
@@ -13,7 +13,10 @@ MDL callback
   -> lane x instrument-owner SPSC dispatch matrix
 ```
 
-It has no Redis dependency and no disk path. It does not contain CSV/WAL
+The core has no Redis dependency and no disk path. `mdl_ingestd` can attach the
+bounded shared-memory Arrow sink described in
+[`arrow-hot-path.md`](arrow-hot-path.md); that sink is not durable and does not
+change the recovery contract below. The repository does not contain CSV/WAL
 replay, checkpoint restore, reconnect epoch inference, or intraday restart
 recovery. Startup is exactly one of:
 
@@ -35,6 +38,11 @@ engineering choices, not exchange or MDL facts.
   bytes and decodes fields without dereferencing an unaligned packed object.
 - `MDLAnsiString` stores a 16-bit length and a 32-bit offset relative to the
   descriptor. `MDLList` stores a 32-bit count and relative 32-bit offset.
+- MDL API `1.101` defines `ConnectErrorEvent` as message 2,
+  `DisconnectedEvent` as 3, `MessageServiceTimeOutEvent` as 5, and
+  `MessageDiscardedEvent` as 6. MDL SYS `2.101` defines `LogonResponse` as
+  message 2 and `SubscribeResponse` as 23. `LogonResponse` carries a return
+  code plus per-subscription message statuses.
 - The implemented decoders are exactly:
 
   | Tuple | Vendor type | Fixed bytes |
@@ -97,6 +105,15 @@ is likewise not claimed.
 - An exception during a vendor callback operation is caught at the ABI
   adapter, recorded as a sticky failure, and causes process shutdown; no C++
   exception is allowed to escape into the SDK.
+- The process does not equate an immediate error-free `Connect()` return with
+  feed readiness. It requires a successful Logon response and successful
+  status for every configured tuple. Bounds-invalid control lists, rejected
+  statuses, pre-ready market data, and the local readiness deadline terminate
+  the process/feed epoch.
+- API service-timeout and message-discard events also terminate the current
+  process/feed epoch. Their message names and IDs are SDK facts; choosing a
+  fatal boundary is conservative implementation policy, not a claim that the
+  SDK protocol requires this exact response.
 - For `mdl_ingestd`, the configured stream file is the source of physical
   subscriptions. There is no special-case protection for any unselected
   tuple.
@@ -326,7 +343,18 @@ TLB, and cache cost. Increase them only from burst and latency measurements.
 
 Startup order is catalog/stream config -> engine preallocation -> decoder
 threads -> SDK manager/subscriber -> connect. `Connect()` may invoke callbacks
-synchronously, so the engine is accepting before it is called.
+synchronously, so the engine is running before it is called. The physical
+session is returned only after successful Logon plus confirmation of every
+configured subscription. Market data is admitted only after that readiness
+state. The readiness timeout defaults to 30 seconds and is configurable with
+`--sdk-ready-timeout-seconds`.
+
+The first connection/discard/readiness boundary is sticky. The handler stops
+admission immediately, so SDK auto-reconnect callbacks cannot enter the old
+feed epoch. Shutdown drains records admitted before the boundary, then the
+Arrow control stream records the boundary and seals. A subsequent process must
+use a strictly larger externally allocated epoch; no MDL resume from a
+Kafka-acknowledged native sequence is assumed.
 
 Shutdown order is fixed:
 
@@ -351,7 +379,10 @@ timeout/capacity gap advance and conflict isolation, PARTIAL gap advance,
 reorder-capacity no-loss progression, LateRecovery diversion, coalescing gap
 mailbox behavior, catalog-miss continuity tokens, nested snapshot lists,
 overlapping dynamic range rejection, configured stream exclusion, and runtime
-tuple handling.
+tuple handling. Wire-level control tests additionally cover Logon/Subscribe
+readiness accumulation, nonzero return/status rejection, malformed and
+overlapping list rejection, API timeout/discard classification, sticky first
+boundary behavior, pre-ready market rejection, and readiness timeout.
 
 The implementation passes the strict warning build and ASan/UBSan tests in the
 available environment. TSan builds successfully, but execution in the current

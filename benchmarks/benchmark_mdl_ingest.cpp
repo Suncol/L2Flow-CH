@@ -2,6 +2,14 @@
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+#include "l2flow/arrow/egress.h"
+#include "l2flow/arrow/ring.h"
+
+#include <arrow/array.h>
+#include <arrow/record_batch.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -44,7 +53,7 @@ enum class ArrivalPattern : std::uint8_t {
 };
 
 struct Options final {
-    std::uint64_t target_rate = 800'000U;
+    std::uint64_t target_rate = 1'000'000U;
     std::uint64_t measurement_seconds = 5U;
     std::uint64_t warmup_seconds = 1U;
     std::size_t channels = 16U;
@@ -57,13 +66,49 @@ struct Options final {
     int producer_cpu = 0;
     int first_consumer_cpu = 1;
     int first_decoder_cpu = 17;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    std::filesystem::path arrow_ring_directory;
+    std::uint64_t arrow_feed_session_epoch = 1U;
+    std::size_t arrow_descriptor_capacity = 256U;
+    std::size_t arrow_segment_count = 320U;
+    std::size_t arrow_tick_segment_payload_bytes = 256U * 1'024U;
+    std::size_t arrow_tick_batch_rows = 256U;
+    std::uint64_t arrow_batch_max_delay_ns = 1'000'000U;
+    int first_arrow_reader_cpu = -1;
+    bool arrow_configuration_set = false;
+#endif
 };
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+[[nodiscard]] l2flow::arrow_hot::ArrowHotEgressConfig MakeArrowConfig(
+    const Options& options) {
+    l2flow::arrow_hot::ArrowHotEgressConfig config{};
+    config.root_directory = options.arrow_ring_directory;
+    config.owner_count = options.instrument_owners;
+    config.feed_session_epoch = options.arrow_feed_session_epoch;
+    config.descriptor_capacity = options.arrow_descriptor_capacity;
+    config.segment_count = options.arrow_segment_count;
+    config.tick_segment_payload_bytes =
+        options.arrow_tick_segment_payload_bytes;
+    // The benchmark emits only Tick rows. Keep unused rings small while still
+    // exercising the same production ring-set creation and lifecycle path.
+    config.snapshot_segment_payload_bytes = 1'024U;
+    config.diagnostic_segment_payload_bytes = 16U * 1'024U;
+    config.maximum_consumers = 1U;
+    config.tick_batch_rows = options.arrow_tick_batch_rows;
+    config.snapshot_batch_rows = 1U;
+    config.diagnostic_batch_rows = 1U;
+    config.maximum_batch_delay_ns = options.arrow_batch_max_delay_ns;
+    return config;
+}
+#endif
 
 struct alignas(64) ConsumerState final {
     std::atomic<std::uint64_t> consumed{0U};
     std::uint64_t measured = 0U;
     std::uint64_t latency_samples = 0U;
     std::uint64_t maximum_latency_ns = 0U;
+    std::uint64_t maximum_sink_operation_ns = 0U;
     std::uint64_t ordering_errors = 0U;
     std::uint64_t clock_errors = 0U;
     std::uint64_t finish_ns = 0U;
@@ -71,6 +116,22 @@ struct alignas(64) ConsumerState final {
     std::vector<std::uint64_t> latencies_ns;
     std::string error;
 };
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+struct alignas(64) ArrowReaderState final {
+    std::uint64_t rows = 0U;
+    std::uint64_t batches = 0U;
+    std::uint64_t latency_samples = 0U;
+    std::uint64_t maximum_latency_ns = 0U;
+    std::uint64_t ordering_errors = 0U;
+    std::uint64_t clock_errors = 0U;
+    std::uint64_t protocol_errors = 0U;
+    std::uint64_t finish_ns = 0U;
+    int observed_cpu = -1;
+    std::vector<std::uint64_t> latencies_ns;
+    std::string error;
+};
+#endif
 
 struct NumaPageCounts final {
     std::uint64_t anonymous_node0 = 0U;
@@ -172,17 +233,35 @@ void AppendText(std::vector<std::byte>* body,
 }
 
 [[nodiscard]] std::array<std::byte, kMdlHeaderBytes> MakeHeader(
+    MessageKey key,
     std::size_t body_size) noexcept {
     std::array<std::byte, kMdlHeaderBytes> header{};
     PutUnsigned<std::uint8_t>(header, 0U, 23U);
     PutUnsigned<std::uint32_t>(
         header, 1U, static_cast<std::uint32_t>(23U + body_size));
     PutUnsigned<std::uint8_t>(header, 5U, 1U);
-    PutUnsigned<std::uint8_t>(header, 6U, 4U);
-    PutUnsigned<std::uint16_t>(header, 7U, 101U);
-    PutUnsigned<std::uint16_t>(header, 9U, 24U);
+    PutUnsigned<std::uint8_t>(header, 6U, key.service_id);
+    PutUnsigned<std::uint16_t>(header, 7U, key.service_version);
+    PutUnsigned<std::uint16_t>(header, 9U, key.message_id);
     PutUnsigned<std::uint32_t>(header, 11U, 93'000'000U);
     return header;
+}
+
+[[nodiscard]] std::vector<std::byte> MakeReadyLogonResponse(
+    MessageKey subscribed_key) {
+    std::vector<std::byte> body(48U);
+    // LogonResponse.Services is at 12; its sole item begins at 24.
+    PutUnsigned<std::uint32_t>(body, 12U, 1U);
+    PutUnsigned<std::uint32_t>(body, 16U, 12U);
+    PutUnsigned<std::uint32_t>(body, 20U, 0U);
+    PutUnsigned<std::uint32_t>(body, 24U, subscribed_key.service_id);
+    PutUnsigned<std::uint32_t>(body, 28U, subscribed_key.service_version);
+    // ServicesItem.Messages is at 32; its sole item begins at 40.
+    PutUnsigned<std::uint32_t>(body, 32U, 1U);
+    PutUnsigned<std::uint32_t>(body, 36U, 8U);
+    PutUnsigned<std::uint32_t>(body, 40U, subscribed_key.message_id);
+    PutUnsigned<std::uint32_t>(body, 44U, 0U);
+    return body;
 }
 
 template <typename Integer>
@@ -205,7 +284,7 @@ template <typename Integer>
 void PrintUsage() {
     std::cout
         << "usage: benchmark_mdl_ingest [options]\n"
-        << "  --rate N                 target callbacks/s (default 800000)\n"
+        << "  --rate N                 target callbacks/s (default 1000000)\n"
         << "  --seconds N              measured seconds (default 5)\n"
         << "  --warmup-seconds N       warm-up seconds (default 1)\n"
         << "  --pattern ordered|local-reverse\n"
@@ -218,6 +297,17 @@ void PrintUsage() {
         << "  --producer-cpu N         default 0\n"
         << "  --first-consumer-cpu N   default 1\n"
         << "  --first-decoder-cpu N    default 17\n";
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    std::cout
+        << "  --arrow-ring-dir PATH    enable Arrow publish/read/decode\n"
+        << "  --arrow-feed-epoch N     default 1\n"
+        << "  --arrow-descriptors N    default 256, power of two\n"
+        << "  --arrow-segments N       default 320\n"
+        << "  --arrow-tick-bytes N     segment payload bytes; default 262144\n"
+        << "  --arrow-batch-rows N     default 256\n"
+        << "  --arrow-max-delay-ns N   default 1000000\n"
+        << "  --first-arrow-reader-cpu N  default after decoder CPUs\n";
+#endif
 }
 
 [[nodiscard]] bool ParseOptions(int argc,
@@ -308,6 +398,68 @@ void PrintUsage() {
                 *error = "invalid --first-decoder-cpu";
                 return false;
             }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        } else if (argument == "--arrow-ring-dir") {
+            const std::string_view value = next(argument);
+            if (value.empty()) {
+                if (error->empty()) {
+                    *error = "invalid --arrow-ring-dir";
+                }
+                return false;
+            }
+            parsed.arrow_ring_directory = std::string(value);
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-feed-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow_feed_session_epoch)) {
+                *error = "invalid --arrow-feed-epoch";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-descriptors") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow_descriptor_capacity)) {
+                *error = "invalid --arrow-descriptors";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-segments") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow_segment_count)) {
+                *error = "invalid --arrow-segments";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-tick-bytes") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.arrow_tick_segment_payload_bytes)) {
+                *error = "invalid --arrow-tick-bytes";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow_tick_batch_rows)) {
+                *error = "invalid --arrow-batch-rows";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--arrow-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow_batch_max_delay_ns)) {
+                *error = "invalid --arrow-max-delay-ns";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+        } else if (argument == "--first-arrow-reader-cpu") {
+            if (!ParseInteger(next(argument),
+                              &parsed.first_arrow_reader_cpu)) {
+                *error = "invalid --first-arrow-reader-cpu";
+                return false;
+            }
+            parsed.arrow_configuration_set = true;
+#endif
         } else if (argument == "--pattern") {
             const std::string_view value = next(argument);
             if (value == "ordered") {
@@ -351,6 +503,12 @@ void PrintUsage() {
                  "to avoid percentile sampling bias";
         return false;
     }
+#if defined(__linux__)
+    if (parsed.tick_lanes >= static_cast<std::size_t>(CPU_SETSIZE)) {
+        *error = "tick-lane count exceeds the affinity CPU set";
+        return false;
+    }
+#endif
     if (parsed.channels >
             std::numeric_limits<std::uint64_t>::max() /
                 parsed.reorder_window ||
@@ -360,6 +518,38 @@ void PrintUsage() {
         *error = "message-count calculation overflows";
         return false;
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    const bool arrow_enabled = !parsed.arrow_ring_directory.empty();
+    if (parsed.arrow_configuration_set && !arrow_enabled) {
+        *error = "Arrow benchmark options require --arrow-ring-dir";
+        return false;
+    }
+    if (arrow_enabled) {
+        const std::size_t decoder_threads = parsed.tick_lanes + 1U;
+        if (parsed.first_arrow_reader_cpu == -1) {
+            if (parsed.first_decoder_cpu < 0) {
+                *error = "automatic Arrow reader CPU range is invalid";
+                return false;
+            }
+            const std::size_t automatic_cpu =
+                static_cast<std::size_t>(parsed.first_decoder_cpu) +
+                decoder_threads;
+            if (automatic_cpu > static_cast<std::size_t>(
+                                    std::numeric_limits<int>::max())) {
+                *error = "automatic Arrow reader CPU range overflows";
+                return false;
+            }
+            parsed.first_arrow_reader_cpu =
+                static_cast<int>(automatic_cpu);
+        }
+        const l2flow::arrow_hot::ArrowHotEgressConfig arrow_config =
+            MakeArrowConfig(parsed);
+        if (!l2flow::arrow_hot::ValidateArrowHotEgressConfig(
+                arrow_config, error)) {
+            return false;
+        }
+    }
+#endif
 #if defined(__linux__)
     const std::size_t decoder_threads = parsed.tick_lanes + 1U;
     if (parsed.producer_cpu < 0 || parsed.first_consumer_cpu < 0 ||
@@ -373,6 +563,16 @@ void PrintUsage() {
         *error = "CPU affinity range is invalid";
         return false;
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled &&
+        (parsed.first_arrow_reader_cpu < 0 ||
+         static_cast<std::size_t>(parsed.first_arrow_reader_cpu) +
+                 parsed.instrument_owners >
+             static_cast<std::size_t>(CPU_SETSIZE))) {
+        *error = "Arrow reader CPU affinity range is invalid";
+        return false;
+    }
+#endif
     std::vector<bool> used(static_cast<std::size_t>(CPU_SETSIZE), false);
     const auto claim = [&used](int cpu) {
         const std::size_t index = static_cast<std::size_t>(cpu);
@@ -400,6 +600,18 @@ void PrintUsage() {
             return false;
         }
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled) {
+        for (std::size_t owner = 0U;
+             owner < parsed.instrument_owners; ++owner) {
+            if (!claim(parsed.first_arrow_reader_cpu +
+                       static_cast<int>(owner))) {
+                *error = "CPU affinity assignments overlap";
+                return false;
+            }
+        }
+    }
+#endif
 #else
     *error = "this NUMA affinity benchmark requires Linux";
     return false;
@@ -485,6 +697,16 @@ inline void CpuRelax() noexcept {
         CpuRelax();
     }
 }
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+void RecordMaximumElapsed(std::uint64_t start_ns,
+                          std::uint64_t finish_ns,
+                          std::uint64_t* maximum_ns) noexcept {
+    if (maximum_ns != nullptr && finish_ns >= start_ns) {
+        *maximum_ns = std::max(*maximum_ns, finish_ns - start_ns);
+    }
+}
+#endif
 
 [[nodiscard]] SyntheticArrival MakeArrival(
     std::uint64_t ordinal,
@@ -667,13 +889,94 @@ int main(int argc, char** argv) {
     config.maximum_reorder_span = 255U;
     config.from_open_gap_wait_ns = options.gap_wait_ns;
     config.first_decoder_cpu = options.first_decoder_cpu;
+    constexpr MessageKey kBenchmarkStream{4U, 101U, 24U};
+    config.enabled_streams = StreamBit(kBenchmarkStream);
 
     std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
         config, std::move(catalog), &error);
-    if (engine == nullptr || !engine->Start(&error)) {
+    if (engine == nullptr) {
         std::cerr << error << '\n';
         return 1;
     }
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    const bool arrow_enabled = !options.arrow_ring_directory.empty();
+    std::unique_ptr<l2flow::arrow_hot::ArrowHotEgress> arrow_egress;
+    std::vector<std::unique_ptr<l2flow::arrow_hot::SharedArrowRingReader>>
+        arrow_readers;
+    if (arrow_enabled) {
+        arrow_egress = l2flow::arrow_hot::ArrowHotEgress::Create(
+            MakeArrowConfig(options), &error);
+        if (arrow_egress == nullptr) {
+            std::cerr << "Arrow benchmark egress start failed: "
+                      << error << '\n';
+            return 1;
+        }
+        arrow_readers.reserve(options.instrument_owners);
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            const std::string ring_name =
+                "tick-owner-" + std::to_string(owner);
+            l2flow::arrow_hot::RingLocation location{
+                arrow_egress->run_directory() /
+                    (ring_name + ".arrow"),
+                arrow_egress->run_directory() /
+                    (ring_name + ".ctl")};
+            std::unique_ptr<l2flow::arrow_hot::SharedArrowRingReader> reader =
+                l2flow::arrow_hot::SharedArrowRingReader::Open(
+                    std::move(location),
+                    l2flow::arrow_hot::ReaderStart::kEarliestAvailable,
+                    &error);
+            if (reader == nullptr ||
+                reader->stream_kind() !=
+                    l2flow::arrow_hot::RingStreamKind::kOrderedTick ||
+                reader->shard_id() != static_cast<std::uint32_t>(owner) ||
+                reader->feed_session_epoch() !=
+                    options.arrow_feed_session_epoch ||
+                reader->producer_instance() !=
+                    arrow_egress->producer_instance()) {
+                std::cerr << "Arrow benchmark reader open failed for owner "
+                          << owner;
+                if (!error.empty()) {
+                    std::cerr << ": " << error;
+                }
+                std::cerr << '\n';
+                return 1;
+            }
+            arrow_readers.push_back(std::move(reader));
+        }
+    }
+#endif
+
+    if (!engine->Start(&error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
+
+    MdlMessageHandler handler(engine.get(), config.enabled_streams);
+    SyntheticMdlMessage synthetic_message;
+    std::vector<std::byte> logon_body =
+        MakeReadyLogonResponse(kBenchmarkStream);
+    const auto logon_header =
+        MakeHeader({2U, 101U, 2U}, logon_body.size());
+    synthetic_message.Set(logon_header, logon_body);
+    handler.OnMessage(nullptr, &synthetic_message);
+    if (!handler.feed_ready() ||
+        handler.last_result() != AdmissionResult::kAccepted) {
+        engine->Stop();
+        std::cerr << "synthetic MDL LogonResponse did not reach readiness\n";
+        return 1;
+    }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr &&
+        !arrow_egress->MarkFeedConnected(
+            handler.feed_ready_monotonic_ns())) {
+        engine->Stop();
+        std::cerr << "Arrow benchmark could not publish feed readiness: "
+                  << arrow_egress->fatal_error() << '\n';
+        return 1;
+    }
+#endif
 
     auto consumers = std::make_unique<ConsumerState[]>(
         options.instrument_owners);
@@ -684,6 +987,136 @@ int main(int argc, char** argv) {
     }
     std::atomic<bool> abort{false};
     std::atomic<std::size_t> ready{0U};
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    std::unique_ptr<ArrowReaderState[]> arrow_reader_states;
+    std::vector<std::thread> arrow_reader_threads;
+    if (arrow_enabled) {
+        arrow_reader_states = std::make_unique<ArrowReaderState[]>(
+            options.instrument_owners);
+        arrow_reader_threads.reserve(options.instrument_owners);
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            arrow_reader_states[owner].latencies_ns.resize(
+                static_cast<std::size_t>(latency_samples_per_channel));
+            arrow_reader_threads.emplace_back([&, owner] {
+                ArrowReaderState& state = arrow_reader_states[owner];
+                if (!PinCurrentThread(
+                        options.first_arrow_reader_cpu +
+                            static_cast<int>(owner),
+                        &state.error)) {
+                    abort.store(true, std::memory_order_release);
+                    ready.fetch_add(1U, std::memory_order_release);
+                    return;
+                }
+                state.observed_cpu = CurrentCpu();
+                ready.fetch_add(1U, std::memory_order_release);
+                l2flow::arrow_hot::SharedArrowRingReader* const reader =
+                    arrow_readers[owner].get();
+                while (state.rows < total_per_channel &&
+                       !abort.load(std::memory_order_acquire)) {
+                    l2flow::arrow_hot::ReadResult read = reader->TryRead();
+                    if (read.code == l2flow::arrow_hot::ReadCode::kEmpty ||
+                        read.code == l2flow::arrow_hot::ReadCode::kRetry) {
+                        CpuRelax();
+                        continue;
+                    }
+                    if (read.code !=
+                        l2flow::arrow_hot::ReadCode::kBatch) {
+                        ++state.protocol_errors;
+                        state.error = read.code ==
+                                l2flow::arrow_hot::ReadCode::kOverrun
+                            ? "Arrow benchmark reader overrun"
+                            : read.code ==
+                                      l2flow::arrow_hot::ReadCode::kClosed
+                                  ? "Arrow benchmark ring closed early"
+                                  : "Arrow benchmark reader protocol error: " +
+                                        read.error;
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                    std::string decode_error;
+                    const std::shared_ptr<arrow::RecordBatch> batch =
+                        reader->Decode(read.lease, &decode_error);
+                    const auto native_sequence = batch == nullptr
+                        ? std::shared_ptr<arrow::UInt64Array>{}
+                        : std::dynamic_pointer_cast<arrow::UInt64Array>(
+                              batch->GetColumnByName("native_sequence"));
+                    const auto receive_monotonic_ns = batch == nullptr
+                        ? std::shared_ptr<arrow::UInt64Array>{}
+                        : std::dynamic_pointer_cast<arrow::UInt64Array>(
+                              batch->GetColumnByName(
+                                  "receive_monotonic_ns"));
+                    if (batch == nullptr || batch->num_rows() <= 0 ||
+                        native_sequence == nullptr ||
+                        receive_monotonic_ns == nullptr ||
+                        native_sequence->length() != batch->num_rows() ||
+                        receive_monotonic_ns->length() !=
+                            batch->num_rows() ||
+                        read.metadata.row_count !=
+                            static_cast<std::uint32_t>(batch->num_rows()) ||
+                        read.metadata.feed_session_epoch !=
+                            options.arrow_feed_session_epoch ||
+                        static_cast<std::uint64_t>(batch->num_rows()) >
+                            total_per_channel - state.rows) {
+                        ++state.protocol_errors;
+                        state.error = decode_error.empty()
+                            ? "Arrow benchmark decoded batch is invalid"
+                            : "Arrow benchmark decode failed: " + decode_error;
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                    const std::uint64_t decode_complete_ns =
+                        MonotonicNowNs();
+                    for (std::int64_t row = 0; row < batch->num_rows();
+                         ++row) {
+                        const std::uint64_t expected = state.rows +
+                            static_cast<std::uint64_t>(row) + 1U;
+                        if (native_sequence->IsNull(row) ||
+                            native_sequence->Value(row) != expected) {
+                            ++state.ordering_errors;
+                        }
+                        if (expected > warmup_per_channel) {
+                            const std::uint64_t measured_index =
+                                expected - warmup_per_channel - 1U;
+                            if (receive_monotonic_ns->IsNull(row) ||
+                                decode_complete_ns <
+                                    receive_monotonic_ns->Value(row)) {
+                                ++state.clock_errors;
+                            } else {
+                                const std::uint64_t latency =
+                                    decode_complete_ns -
+                                    receive_monotonic_ns->Value(row);
+                                state.maximum_latency_ns = std::max(
+                                    state.maximum_latency_ns, latency);
+                                if (measured_index %
+                                        options.latency_sample_every ==
+                                    0U) {
+                                    if (state.latency_samples >=
+                                        latency_samples_per_channel) {
+                                        ++state.clock_errors;
+                                    } else {
+                                        state.latencies_ns[
+                                            static_cast<std::size_t>(
+                                                state.latency_samples)] =
+                                            latency;
+                                    }
+                                    ++state.latency_samples;
+                                }
+                            }
+                        }
+                    }
+                    state.rows +=
+                        static_cast<std::uint64_t>(batch->num_rows());
+                    ++state.batches;
+                    if ((state.batches & UINT64_C(4'095)) == 0U) {
+                        reader->TouchHeartbeat(MonotonicNowNs());
+                    }
+                }
+                state.finish_ns = MonotonicNowNs();
+            });
+        }
+    }
+#endif
     std::vector<std::thread> consumer_threads;
     consumer_threads.reserve(options.instrument_owners);
     for (std::size_t owner = 0U; owner < options.instrument_owners;
@@ -706,10 +1139,26 @@ int main(int argc, char** argv) {
             std::uint64_t measured_index = 0U;
             std::uint64_t latency_sample_index = 0U;
             std::size_t idle_spins = 0U;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+            std::size_t drain_burst = 0U;
+#endif
             while (local_consumed < total_per_channel &&
                    !abort.load(std::memory_order_acquire)) {
                 if (!engine->TryPollTick(owner, &tick)) {
                     ++idle_spins;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                    if (arrow_egress != nullptr) {
+                        const std::uint64_t operation_start_ns =
+                            MonotonicNowNs();
+                        arrow_egress->FlushDue(owner, operation_start_ns);
+                        const std::uint64_t operation_finish_ns =
+                            MonotonicNowNs();
+                        RecordMaximumElapsed(
+                            operation_start_ns, operation_finish_ns,
+                            &state.maximum_sink_operation_ns);
+                    }
+                    drain_burst = 0U;
+#endif
                     CpuRelax();
                     continue;
                 }
@@ -718,6 +1167,37 @@ int main(int argc, char** argv) {
                     tick.common.native_sequence != expected_sequence) {
                     ++state.ordering_errors;
                 }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                if (arrow_egress != nullptr) {
+                    const std::uint64_t operation_start_ns =
+                        MonotonicNowNs();
+                    const bool appended =
+                        arrow_egress->AppendTick(owner, tick);
+                    const std::uint64_t operation_finish_ns =
+                        MonotonicNowNs();
+                    RecordMaximumElapsed(
+                        operation_start_ns, operation_finish_ns,
+                        &state.maximum_sink_operation_ns);
+                    if (!appended) {
+                        state.error = "Arrow benchmark append failed: " +
+                            arrow_egress->fatal_error();
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                }
+                ++drain_burst;
+                if (arrow_egress != nullptr && drain_burst == 256U) {
+                    const std::uint64_t operation_start_ns =
+                        MonotonicNowNs();
+                    arrow_egress->FlushDue(owner, operation_start_ns);
+                    const std::uint64_t operation_finish_ns =
+                        MonotonicNowNs();
+                    RecordMaximumElapsed(
+                        operation_start_ns, operation_finish_ns,
+                        &state.maximum_sink_operation_ns);
+                    drain_burst = 0U;
+                }
+#endif
                 if (tick.common.native_sequence > warmup_per_channel) {
                     const std::uint64_t now = MonotonicNowNs();
                     if (now < tick.common.receive_monotonic_ns ||
@@ -757,8 +1237,14 @@ int main(int argc, char** argv) {
                 local_consumed, std::memory_order_release);
         });
     }
+    std::size_t ready_target = options.instrument_owners;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled) {
+        ready_target += options.instrument_owners;
+    }
+#endif
     while (ready.load(std::memory_order_acquire) <
-           options.instrument_owners) {
+           ready_target) {
         std::this_thread::yield();
     }
     if (abort.load(std::memory_order_acquire)) {
@@ -766,19 +1252,31 @@ int main(int argc, char** argv) {
         for (std::thread& thread : consumer_threads) {
             thread.join();
         }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        if (arrow_egress != nullptr) {
+            arrow_egress->Seal(MonotonicNowNs());
+        }
+        for (std::thread& thread : arrow_reader_threads) {
+            thread.join();
+        }
+#endif
         for (std::size_t owner = 0U;
              owner < options.instrument_owners; ++owner) {
             if (!consumers[owner].error.empty()) {
                 std::cerr << consumers[owner].error << '\n';
             }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+            if (arrow_enabled &&
+                !arrow_reader_states[owner].error.empty()) {
+                std::cerr << arrow_reader_states[owner].error << '\n';
+            }
+#endif
         }
         return 1;
     }
 
     std::array<std::byte, kMdlHeaderBytes> header =
-        MakeHeader(bodies.front().size());
-    MdlMessageHandler handler(engine.get());
-    SyntheticMdlMessage synthetic_message;
+        MakeHeader(kBenchmarkStream, bodies.front().size());
     const std::uint64_t schedule_origin_ns =
         MonotonicNowNs() + UINT64_C(100'000'000);
     std::uint64_t first_measured_callback_ns = 0U;
@@ -786,7 +1284,10 @@ int main(int argc, char** argv) {
     std::uint64_t maximum_schedule_lag_ns = 0U;
     AdmissionResult admission_failure = AdmissionResult::kAccepted;
     std::uint64_t admitted_count = 0U;
-    for (std::uint64_t ordinal = 0U; ordinal < total_count; ++ordinal) {
+    for (std::uint64_t ordinal = 0U;
+         ordinal < total_count &&
+         !abort.load(std::memory_order_acquire);
+         ++ordinal) {
         const SyntheticArrival arrival = MakeArrival(ordinal, options);
         const std::size_t channel_index = arrival.channel_index;
         const std::uint64_t native_sequence = arrival.native_sequence;
@@ -844,7 +1345,8 @@ int main(int argc, char** argv) {
                 break;
             }
             const EngineStats progress_stats = engine->stats();
-            if (!engine->healthy() || progress_stats.gaps_skipped != 0U ||
+            if (abort.load(std::memory_order_acquire) ||
+                !engine->healthy() || progress_stats.gaps_skipped != 0U ||
                 progress_stats.late_recovery_dispatched != 0U ||
                 progress_stats.from_open_channels_frozen != 0U ||
                 MonotonicNowNs() >= completion_deadline) {
@@ -862,12 +1364,21 @@ int main(int argc, char** argv) {
     if (!completion_failed) {
         engine->Stop();
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr) {
+        arrow_egress->Seal(MonotonicNowNs());
+    }
+    for (std::thread& thread : arrow_reader_threads) {
+        thread.join();
+    }
+#endif
 
     std::uint64_t total_consumed = 0U;
     std::uint64_t total_measured = 0U;
     std::uint64_t ordering_errors = 0U;
     std::uint64_t clock_errors = 0U;
     std::uint64_t maximum_latency_ns = 0U;
+    std::uint64_t maximum_sink_operation_ns = 0U;
     std::uint64_t dispatch_finish_ns = 0U;
     bool cpu_binding_valid = true;
     std::vector<std::uint64_t> latencies;
@@ -880,6 +1391,9 @@ int main(int argc, char** argv) {
         total_measured += state.measured;
         maximum_latency_ns = std::max(
             maximum_latency_ns, state.maximum_latency_ns);
+        maximum_sink_operation_ns = std::max(
+            maximum_sink_operation_ns,
+            state.maximum_sink_operation_ns);
         ordering_errors += state.ordering_errors;
         clock_errors += state.clock_errors;
         dispatch_finish_ns = std::max(
@@ -894,6 +1408,47 @@ int main(int argc, char** argv) {
                                           latency_samples_per_channel)));
     }
     std::sort(latencies.begin(), latencies.end());
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    l2flow::arrow_hot::ArrowHotEgressStats arrow_stats{};
+    std::uint64_t arrow_rows_read = 0U;
+    std::uint64_t arrow_batches_read = 0U;
+    std::uint64_t arrow_clock_errors = 0U;
+    std::uint64_t arrow_maximum_latency_ns = 0U;
+    std::uint64_t arrow_ordering_errors = 0U;
+    std::uint64_t arrow_protocol_errors = 0U;
+    std::uint64_t arrow_finish_ns = 0U;
+    bool arrow_reader_bindings_valid = true;
+    std::vector<std::uint64_t> arrow_latencies;
+    arrow_latencies.reserve(
+        static_cast<std::size_t>(expected_latency_samples));
+    if (arrow_egress != nullptr) {
+        arrow_stats = arrow_egress->stats();
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            const ArrowReaderState& state = arrow_reader_states[owner];
+            arrow_rows_read += state.rows;
+            arrow_batches_read += state.batches;
+            arrow_clock_errors += state.clock_errors;
+            arrow_maximum_latency_ns = std::max(
+                arrow_maximum_latency_ns, state.maximum_latency_ns);
+            arrow_ordering_errors += state.ordering_errors;
+            arrow_protocol_errors += state.protocol_errors;
+            arrow_finish_ns = std::max(arrow_finish_ns, state.finish_ns);
+            arrow_reader_bindings_valid = arrow_reader_bindings_valid &&
+                state.observed_cpu ==
+                    options.first_arrow_reader_cpu +
+                        static_cast<int>(owner);
+            arrow_latencies.insert(
+                arrow_latencies.end(), state.latencies_ns.begin(),
+                state.latencies_ns.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        std::min(state.latency_samples,
+                                 latency_samples_per_channel)));
+        }
+        std::sort(arrow_latencies.begin(), arrow_latencies.end());
+    }
+#endif
 
     std::uint64_t gap_controls = 0U;
     std::uint64_t late_controls = 0U;
@@ -936,7 +1491,44 @@ int main(int argc, char** argv) {
         : static_cast<double>(total_measured) / dispatch_seconds;
     const double minimum_pass_rate =
         static_cast<double>(options.target_rate) * 0.99;
-    const bool valid =
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    const double arrow_read_seconds =
+        !arrow_enabled || first_measured_callback_ns == 0U ||
+                arrow_finish_ns <= first_measured_callback_ns
+            ? 0.0
+            : static_cast<double>(arrow_finish_ns -
+                                  first_measured_callback_ns) /
+                  1'000'000'000.0;
+    const double arrow_read_rate = arrow_read_seconds == 0.0
+        ? 0.0
+        : static_cast<double>(measured_count) / arrow_read_seconds;
+    bool arrow_valid = true;
+    if (arrow_enabled) {
+        const std::uint64_t expected_published_rows =
+            arrow_stats.tick_rows_received +
+            arrow_stats.snapshot_rows_received +
+            arrow_stats.late_recovery_rows_received +
+            arrow_stats.control_rows_received;
+        arrow_valid =
+            arrow_stats.tick_rows_received == total_count &&
+            arrow_stats.snapshot_rows_received == 0U &&
+            arrow_stats.late_recovery_rows_received == 0U &&
+            arrow_stats.published_rows == expected_published_rows &&
+            arrow_stats.no_segment_dropped_rows == 0U &&
+            arrow_stats.oversized_dropped_rows == 0U &&
+            arrow_stats.control_publish_dropped_rows == 0U &&
+            arrow_stats.internal_errors == 0U &&
+            arrow_rows_read == total_count &&
+            arrow_latencies.size() ==
+                static_cast<std::size_t>(expected_latency_samples) &&
+            arrow_clock_errors == 0U &&
+            arrow_ordering_errors == 0U &&
+            arrow_protocol_errors == 0U &&
+            arrow_reader_bindings_valid && arrow_egress->healthy() &&
+            arrow_read_rate >= minimum_pass_rate;
+    }
+#endif
+    const bool base_valid =
         admission_failure == AdmissionResult::kAccepted &&
         admitted_count == total_count && total_consumed == total_count &&
         total_measured == measured_count &&
@@ -951,10 +1543,21 @@ int main(int argc, char** argv) {
         engine->healthy() && !handler.failed() && cpu_binding_valid &&
         producer_rate >= minimum_pass_rate &&
         dispatch_rate >= minimum_pass_rate;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    const bool valid = base_valid && arrow_valid;
+#else
+    const bool valid = base_valid;
+#endif
 
     const auto to_us = [](std::uint64_t nanoseconds) {
         return static_cast<double>(nanoseconds) / 1'000.0;
     };
+    std::string_view latency_name = "callback_entry_to_dispatch_us";
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled) {
+        latency_name = "callback_entry_to_arrow_append_us";
+    }
+#endif
     std::cout << std::fixed << std::setprecision(3)
               << "config target_msg_s=" << options.target_rate
               << " measured_messages=" << measured_count
@@ -987,7 +1590,7 @@ int main(int argc, char** argv) {
               << " dispatch_seconds=" << dispatch_seconds
               << " max_schedule_lag_us="
               << to_us(maximum_schedule_lag_ns) << '\n'
-              << "callback_entry_to_dispatch_us samples="
+              << latency_name << " samples="
               << latencies.size()
               << " p50=" << to_us(Percentile(latencies, 0.50L))
               << " p90=" << to_us(Percentile(latencies, 0.90L))
@@ -1005,8 +1608,56 @@ int main(int argc, char** argv) {
               << " late_recovery=" << stats.late_recovery_dispatched
               << " channel_faults=" << stats.from_open_channels_frozen
               << " healthy=" << (engine->healthy() ? "true" : "false")
-              << '\n'
-              << "status=" << (valid ? "PASS" : "FAIL") << '\n';
+              << '\n';
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled) {
+        std::cout
+            << "arrow_config root="
+            << options.arrow_ring_directory.string()
+            << " epoch=" << options.arrow_feed_session_epoch
+            << " descriptors=" << options.arrow_descriptor_capacity
+            << " segments=" << options.arrow_segment_count
+            << " tick_segment_bytes="
+            << options.arrow_tick_segment_payload_bytes
+            << " tick_batch_rows=" << options.arrow_tick_batch_rows
+            << " max_delay_ns=" << options.arrow_batch_max_delay_ns
+            << " reader_cpus=" << options.first_arrow_reader_cpu << '-'
+            << options.first_arrow_reader_cpu +
+                   static_cast<int>(options.instrument_owners) - 1
+            << " observed_bindings_valid="
+            << (arrow_reader_bindings_valid ? "true" : "false") << '\n'
+            << "arrow_throughput read_msg_s=" << arrow_read_rate
+            << " read_seconds=" << arrow_read_seconds
+            << " published_batches=" << arrow_stats.published_batches
+            << " reader_batches=" << arrow_batches_read
+            << " max_sink_operation_us="
+            << to_us(maximum_sink_operation_ns) << '\n'
+            << "callback_entry_to_arrow_reader_us samples="
+            << arrow_latencies.size()
+            << " p50=" << to_us(Percentile(arrow_latencies, 0.50L))
+            << " p90=" << to_us(Percentile(arrow_latencies, 0.90L))
+            << " p99=" << to_us(Percentile(arrow_latencies, 0.99L))
+            << " p999=" << to_us(Percentile(arrow_latencies, 0.999L))
+            << " max_all=" << to_us(arrow_maximum_latency_ns) << '\n'
+            << "arrow_quality tick_in=" << arrow_stats.tick_rows_received
+            << " published_rows=" << arrow_stats.published_rows
+            << " control_rows=" << arrow_stats.control_rows_received
+            << " rows_read=" << arrow_rows_read
+            << " ordering_errors=" << arrow_ordering_errors
+            << " clock_errors=" << arrow_clock_errors
+            << " protocol_errors=" << arrow_protocol_errors
+            << " no_segment_dropped_rows="
+            << arrow_stats.no_segment_dropped_rows
+            << " oversized_dropped_rows="
+            << arrow_stats.oversized_dropped_rows
+            << " control_dropped_rows="
+            << arrow_stats.control_publish_dropped_rows
+            << " internal_errors=" << arrow_stats.internal_errors
+            << " healthy="
+            << (arrow_egress->healthy() ? "true" : "false") << '\n';
+    }
+#endif
+    std::cout << "status=" << (valid ? "PASS" : "FAIL") << '\n';
     if (admission_failure != AdmissionResult::kAccepted) {
         std::cerr << "admission failed: "
                   << AdmissionResultName(admission_failure) << '\n';
@@ -1014,5 +1665,36 @@ int main(int argc, char** argv) {
     if (!engine->healthy()) {
         std::cerr << "engine fatal: " << engine->fatal_error() << '\n';
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_enabled) {
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            if (!valid) {
+                std::cerr << "owner " << owner << " consumed="
+                          << consumers[owner].consumed.load(
+                                 std::memory_order_acquire)
+                          << " max_sink_operation_us="
+                          << to_us(
+                                 consumers[owner].maximum_sink_operation_ns)
+                          << " arrow_rows="
+                          << arrow_reader_states[owner].rows
+                          << " arrow_batches="
+                          << arrow_reader_states[owner].batches << '\n';
+            }
+            if (!consumers[owner].error.empty()) {
+                std::cerr << "owner " << owner << ": "
+                          << consumers[owner].error << '\n';
+            }
+            if (!arrow_reader_states[owner].error.empty()) {
+                std::cerr << "Arrow reader " << owner << ": "
+                          << arrow_reader_states[owner].error << '\n';
+            }
+        }
+        if (!arrow_egress->healthy()) {
+            std::cerr << "Arrow egress fatal: "
+                      << arrow_egress->fatal_error() << '\n';
+        }
+    }
+#endif
     return valid ? 0 : 1;
 }

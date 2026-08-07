@@ -1,12 +1,15 @@
 #include "l2flow/ingest/catalog.h"
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/message.h"
+#include "l2flow/ingest/sdk_runtime.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -16,6 +19,18 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+namespace l2flow::ingest {
+
+struct MdlMessageHandlerTestAccess final {
+    [[nodiscard]] static bool WaitUntilReady(
+        MdlMessageHandler* handler,
+        std::chrono::milliseconds timeout) noexcept {
+        return handler != nullptr && handler->WaitUntilReady(timeout);
+    }
+};
+
+}  // namespace l2flow::ingest
 
 namespace {
 
@@ -94,6 +109,129 @@ void AppendText(std::vector<std::byte>* body,
     PutUnsigned<std::uint32_t>(header, 11U, 93'000'000U);
     PutUnsigned<std::uint64_t>(header, 15U, vendor_sequence);
     return header;
+}
+
+class TestMdlMessage final : public datayes::mdl::MDLMessage {
+public:
+    TestMdlMessage(std::array<std::byte, kMdlHeaderBytes> header,
+                   std::vector<std::byte> body)
+        : body_(std::move(body)) {
+        static_assert(sizeof(head_) == kMdlHeaderBytes);
+        std::memcpy(&head_, header.data(), header.size());
+    }
+
+    void AddRef() override {}
+    int ReleaseRef() override { return 1; }
+
+    datayes::mdl::MDLMessageHead* GetHead() const override {
+        return const_cast<datayes::mdl::MDLMessageHead*>(&head_);
+    }
+
+    char* GetBody() const override {
+        return body_.empty()
+            ? nullptr
+            : reinterpret_cast<char*>(
+                  const_cast<std::byte*>(body_.data()));
+    }
+
+protected:
+    datayes::mdl::MDLMessage* _Copy() const override { return nullptr; }
+
+private:
+    datayes::mdl::MDLMessageHead head_{};
+    std::vector<std::byte> body_;
+};
+
+struct TestSubscriptionStatus final {
+    MessageKey key{};
+    std::uint32_t status = 0U;
+};
+
+[[nodiscard]] std::vector<std::byte> MakeSystemResponse(
+    MessageKey response_key,
+    std::span<const TestSubscriptionStatus> statuses,
+    std::uint32_t return_code = 0U) {
+    const bool logon = response_key == MessageKey{2U, 101U, 2U};
+    CHECK((logon || response_key == MessageKey{2U, 101U, 23U}));
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> services;
+    for (const TestSubscriptionStatus& status : statuses) {
+        const auto key = std::pair{
+            static_cast<std::uint32_t>(status.key.service_id),
+            static_cast<std::uint32_t>(status.key.service_version)};
+        if (std::find(services.begin(), services.end(), key) ==
+            services.end()) {
+            services.push_back(key);
+        }
+    }
+
+    const std::size_t fixed_bytes = logon ? 24U : 8U;
+    const std::size_t services_descriptor = logon ? 12U : 0U;
+    const std::size_t services_start = fixed_bytes;
+    std::vector<std::byte> body(
+        fixed_bytes + services.size() * 16U);
+    PutUnsigned<std::uint32_t>(
+        body, services_descriptor,
+        static_cast<std::uint32_t>(services.size()));
+    PutUnsigned<std::uint32_t>(
+        body, services_descriptor + 4U,
+        services.empty()
+            ? 0U
+            : static_cast<std::uint32_t>(
+                  services_start - services_descriptor));
+    if (logon) {
+        PutUnsigned<std::uint32_t>(body, 20U, return_code);
+    }
+
+    for (std::size_t service_index = 0U;
+         service_index < services.size(); ++service_index) {
+        const std::size_t service_offset =
+            services_start + service_index * 16U;
+        PutUnsigned<std::uint32_t>(
+            body, service_offset, services[service_index].first);
+        PutUnsigned<std::uint32_t>(
+            body, service_offset + 4U, services[service_index].second);
+        std::vector<TestSubscriptionStatus> service_statuses;
+        for (const TestSubscriptionStatus& status : statuses) {
+            if (status.key.service_id == services[service_index].first &&
+                status.key.service_version ==
+                    services[service_index].second) {
+                service_statuses.push_back(status);
+            }
+        }
+        const std::size_t descriptor_offset = service_offset + 8U;
+        const std::size_t messages_start = body.size();
+        body.resize(body.size() + service_statuses.size() * 8U);
+        PutUnsigned<std::uint32_t>(
+            body, descriptor_offset,
+            static_cast<std::uint32_t>(service_statuses.size()));
+        PutUnsigned<std::uint32_t>(
+            body, descriptor_offset + 4U,
+            service_statuses.empty()
+                ? 0U
+                : static_cast<std::uint32_t>(
+                      messages_start - descriptor_offset));
+        for (std::size_t message_index = 0U;
+             message_index < service_statuses.size(); ++message_index) {
+            const std::size_t message_offset =
+                messages_start + message_index * 8U;
+            PutUnsigned<std::uint32_t>(
+                body, message_offset,
+                service_statuses[message_index].key.message_id);
+            PutUnsigned<std::uint32_t>(
+                body, message_offset + 4U,
+                service_statuses[message_index].status);
+        }
+    }
+    return body;
+}
+
+void DeliverToHandler(MdlMessageHandler* handler,
+                      MessageKey key,
+                      std::vector<std::byte> body) {
+    CHECK(handler != nullptr);
+    const std::size_t body_size = body.size();
+    TestMdlMessage message(MakeHeader(key, body_size), std::move(body));
+    handler->OnMessage(nullptr, &message);
 }
 
 [[nodiscard]] std::vector<std::byte> MakeShTick(
@@ -534,7 +672,9 @@ void TestPartialGapMailboxCoalescesWithoutOverflow() {
               MakeShTick(static_cast<std::int64_t>(sequence), "600001"),
               base_time + index);
         CHECK(WaitFor([&] {
-            return engine->stats().decoded_ticks == index + 1U;
+            const EngineStats stats = engine->stats();
+            return stats.decoded_ticks == index + 1U &&
+                   stats.gaps_skipped == index;
         }));
     }
 
@@ -712,6 +852,279 @@ void TestPartialConflictKeepsFirstWithoutFreezing() {
     engine->Stop();
 }
 
+void TestMdlConnectionBoundaryClassification() {
+    CHECK(ClassifyMdlConnectionBoundary({1U, 101U, 2U}) ==
+          MdlConnectionBoundaryReason::kConnectError);
+    CHECK(ClassifyMdlConnectionBoundary({1U, 101U, 3U}) ==
+          MdlConnectionBoundaryReason::kDisconnected);
+    CHECK(ClassifyMdlConnectionBoundary({1U, 101U, 5U}) ==
+          MdlConnectionBoundaryReason::kServiceTimeout);
+    CHECK(ClassifyMdlConnectionBoundary({1U, 101U, 6U}) ==
+          MdlConnectionBoundaryReason::kMessageDiscarded);
+    CHECK(ClassifyMdlConnectionBoundary({1U, 101U, 1U}) ==
+          MdlConnectionBoundaryReason::kNone);
+    CHECK(ClassifyMdlConnectionBoundary({4U, 101U, 24U}) ==
+          MdlConnectionBoundaryReason::kNone);
+}
+
+void TestMdlConnectionBoundaryStopsAdmission() {
+    std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kPartial);
+    MdlMessageHandler handler(engine.get());
+
+    TestMdlMessage disconnected(
+        MakeHeader({1U, 101U, 3U}, 12U),
+        std::vector<std::byte>(12U));
+    handler.OnMessage(nullptr, &disconnected);
+    CHECK(handler.last_result() == AdmissionResult::kAccepted);
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kDisconnected);
+    const std::uint64_t boundary_time =
+        handler.connection_boundary_monotonic_ns();
+    CHECK(boundary_time != 0U);
+
+    const std::vector<std::byte> tick_body = MakeShTick(1, "600000");
+    TestMdlMessage tick(
+        MakeHeader({4U, 101U, 24U}, tick_body.size()), tick_body);
+    handler.OnMessage(nullptr, &tick);
+    CHECK(handler.last_result() == AdmissionResult::kNotRunning);
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kDisconnected);
+    CHECK(handler.connection_boundary_monotonic_ns() == boundary_time);
+    CHECK(engine->stats().admitted == 0U);
+    engine->Stop();
+}
+
+void TestMdlReadinessRequiresLogonAndConfiguredStatuses() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    constexpr MessageKey kShenzhenOrder{6U, 101U, 33U};
+    const StreamMask expected =
+        StreamBit(kShanghaiTick) | StreamBit(kShenzhenOrder);
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        CHECK(handler.expected_streams() == expected);
+        const std::array statuses{
+            TestSubscriptionStatus{kShanghaiTick, 0U},
+            TestSubscriptionStatus{kShenzhenOrder, 0U},
+        };
+        DeliverToHandler(
+            &handler, {2U, 101U, 23U},
+            MakeSystemResponse({2U, 101U, 23U}, statuses));
+        CHECK(!handler.feed_ready());
+        CHECK(handler.feed_ready_monotonic_ns() == 0U);
+
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U},
+            MakeSystemResponse(
+                {2U, 101U, 2U},
+                std::span<const TestSubscriptionStatus>{}));
+        CHECK(handler.feed_ready());
+        const std::uint64_t ready_time =
+            handler.feed_ready_monotonic_ns();
+        CHECK(ready_time != 0U);
+
+        DeliverToHandler(
+            &handler, {2U, 101U, 23U},
+            MakeSystemResponse({2U, 101U, 23U}, statuses));
+        CHECK(handler.feed_ready_monotonic_ns() == ready_time);
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kNone);
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        const std::array first_status{
+            TestSubscriptionStatus{kShanghaiTick, 0U}};
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U},
+            MakeSystemResponse({2U, 101U, 2U}, first_status));
+        CHECK(!handler.feed_ready());
+
+        const std::array second_status{
+            TestSubscriptionStatus{kShenzhenOrder, 0U}};
+        DeliverToHandler(
+            &handler, {2U, 101U, 23U},
+            MakeSystemResponse({2U, 101U, 23U}, second_status));
+        CHECK(handler.feed_ready());
+        CHECK(handler.feed_ready_monotonic_ns() != 0U);
+        engine->Stop();
+    }
+}
+
+void TestMdlReadinessRejectsFailedAndMalformedResponses() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    const StreamMask expected = StreamBit(kShanghaiTick);
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U},
+            MakeSystemResponse(
+                {2U, 101U, 2U},
+                std::span<const TestSubscriptionStatus>{},
+                static_cast<std::uint32_t>(
+                    datayes::mdl::MDLEC_UNAUTHORIZED)));
+        CHECK(!handler.feed_ready());
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kSubscriptionRejected);
+        CHECK(handler.connection_boundary_detail().find("code 5") !=
+              std::string::npos);
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        const std::array failed_status{
+            TestSubscriptionStatus{
+                kShanghaiTick,
+                static_cast<std::uint32_t>(datayes::mdl::MDLEC_TIMEOUT)}};
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U},
+            MakeSystemResponse({2U, 101U, 2U}, failed_status));
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kSubscriptionRejected);
+        CHECK(handler.connection_boundary_detail().find("4.101.24") !=
+              std::string::npos);
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        std::vector<std::byte> malformed = MakeSystemResponse(
+            {2U, 101U, 2U},
+            std::span<const TestSubscriptionStatus>{});
+        PutUnsigned<std::uint16_t>(malformed, 0U, 1U);
+        PutUnsigned<std::uint32_t>(malformed, 2U, UINT32_MAX);
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U}, std::move(malformed));
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kControlProtocolError);
+        CHECK(handler.connection_boundary_detail().find("string field") !=
+              std::string::npos);
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        std::vector<std::byte> malformed = MakeSystemResponse(
+            {2U, 101U, 2U},
+            std::span<const TestSubscriptionStatus>{});
+        PutUnsigned<std::uint32_t>(malformed, 12U, 1U);
+        PutUnsigned<std::uint32_t>(malformed, 16U, UINT32_MAX);
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U}, std::move(malformed));
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kControlProtocolError);
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get(), expected);
+        const std::array duplicate_statuses{
+            TestSubscriptionStatus{kShanghaiTick, 0U},
+            TestSubscriptionStatus{kShanghaiTick, 0U},
+        };
+        DeliverToHandler(
+            &handler, {2U, 101U, 2U},
+            MakeSystemResponse({2U, 101U, 2U}, duplicate_statuses));
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kControlProtocolError);
+        engine->Stop();
+    }
+}
+
+void TestMdlApiFaultEventsAndFirstBoundaryAreSticky() {
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get());
+        DeliverToHandler(&handler, {1U, 101U, 5U}, {});
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kServiceTimeout);
+        CHECK(handler.connection_boundary_detail() ==
+              "MDL MessageServiceTimeOutEvent");
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get());
+        DeliverToHandler(&handler, {1U, 101U, 6U}, {});
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kMessageDiscarded);
+        CHECK(handler.connection_boundary_detail() ==
+              "MDL MessageDiscardedEvent");
+        engine->Stop();
+    }
+
+    {
+        std::unique_ptr<IngestEngine> engine =
+            MakeEngine(StartMode::kPartial);
+        MdlMessageHandler handler(engine.get());
+        DeliverToHandler(&handler, {1U, 101U, 3U}, {});
+        const std::uint64_t first_time =
+            handler.connection_boundary_monotonic_ns();
+        const std::string first_detail =
+            handler.connection_boundary_detail();
+        DeliverToHandler(&handler, {1U, 101U, 2U}, {});
+        CHECK(handler.connection_boundary_reason() ==
+              MdlConnectionBoundaryReason::kDisconnected);
+        CHECK(handler.connection_boundary_monotonic_ns() == first_time);
+        CHECK(handler.connection_boundary_detail() == first_detail);
+        engine->Stop();
+    }
+}
+
+void TestMdlReadinessWaitTimeoutIsAnEpochBoundary() {
+    std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kPartial);
+    MdlMessageHandler handler(
+        engine.get(), StreamBit({4U, 101U, 24U}));
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(!MdlMessageHandlerTestAccess::WaitUntilReady(
+        &handler, std::chrono::milliseconds(1)));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(elapsed < std::chrono::seconds(1));
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kReadyTimeout);
+    CHECK(handler.connection_boundary_monotonic_ns() != 0U);
+    CHECK(handler.connection_boundary_detail().find("timed out") !=
+          std::string::npos);
+    engine->Stop();
+}
+
+void TestMdlMarketDataBeforeReadinessStopsAdmission() {
+    std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kPartial);
+    MdlMessageHandler handler(
+        engine.get(), StreamBit({4U, 101U, 24U}));
+    const std::vector<std::byte> body = MakeShTick(1, "600000");
+    TestMdlMessage message(
+        MakeHeader({4U, 101U, 24U}, body.size()), body);
+    handler.OnMessage(nullptr, &message);
+    CHECK(handler.last_result() == AdmissionResult::kFeedNotReady);
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kControlProtocolError);
+    CHECK(handler.connection_boundary_detail().find("before MDL feed") !=
+          std::string::npos);
+    CHECK(engine->stats().admitted == 0U);
+    engine->Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -732,6 +1145,13 @@ int main() {
     TestShanghaiDepthAndNestedQueue();
     TestFromOpenConflictFreezesOnlyThatChannel();
     TestPartialConflictKeepsFirstWithoutFreezing();
+    TestMdlConnectionBoundaryClassification();
+    TestMdlConnectionBoundaryStopsAdmission();
+    TestMdlReadinessRequiresLogonAndConfiguredStatuses();
+    TestMdlReadinessRejectsFailedAndMalformedResponses();
+    TestMdlApiFaultEventsAndFirstBoundaryAreSticky();
+    TestMdlReadinessWaitTimeoutIsAnEpochBoundary();
+    TestMdlMarketDataBeforeReadinessStopsAdmission();
     std::cout << "all mdl_ingest tests passed\n";
     return 0;
 }

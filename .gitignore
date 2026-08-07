@@ -1,3 +1,7 @@
 /build*/
 /artifacts/
 *.log
+/python/.venv/
+__pycache__/
+*.py[cod]
+/python/__pycache__/

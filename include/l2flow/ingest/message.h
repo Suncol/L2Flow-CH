@@ -119,6 +119,7 @@ enum class AdmissionResult : std::uint8_t {
     kBodyTooLarge,
     kRouteInvalid,
     kLaneFull,
+    kFeedNotReady,
     kInternalFailure,
 };
 

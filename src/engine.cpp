@@ -2057,6 +2057,8 @@ std::string_view AdmissionResultName(AdmissionResult value) noexcept {
             return "route_invalid";
         case AdmissionResult::kLaneFull:
             return "lane_full";
+        case AdmissionResult::kFeedNotReady:
+            return "feed_not_ready";
         case AdmissionResult::kInternalFailure:
             return "internal_failure";
     }

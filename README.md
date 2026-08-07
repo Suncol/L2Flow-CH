@@ -9,11 +9,13 @@ MDL SDK callback
   -> exchange-native channel sequence recovery
   -> fixed-width canonical records
   -> instrument-owner dispatch queues + gap/LateRecovery controls
+  -> per-owner shared-memory Arrow rings + Python/Polars reader
 ```
 
-It deliberately does **not** implement Event/KLine workers, shared-memory
-Arrow rings, Kafka/Redpanda, ClickHouse, or intraday restart recovery yet.
-The supported startup modes are only `from-open` and `partial`.
+The Arrow branch is a bounded volatile hot path, not a WAL or a replacement
+for Kafka/Redpanda. Event/KLine workers, the durable Kafka sink, the ClickHouse
+sink, and server-side resume/intraday replay remain outside this repository.
+The supported startup modes are `from-open` and `partial`.
 
 ## Build and test
 
@@ -110,9 +112,14 @@ instrument_id,market,security_id_source,security_id
 2,SZ,102,000001
 ```
 
-The current executable has no production sink after instrument dispatch. A
-physical SDK run therefore requires `--allow-discard-after-dispatch`, making
-the temporary drain behavior explicit rather than silently discarding data.
+The executable can publish the Arrow hot path with `--arrow-ring-dir` and a
+strictly increasing `--arrow-feed-epoch`. A physical SDK run without Arrow
+requires `--allow-discard-after-dispatch`, making temporary drain behavior
+explicit rather than silently discarding data.
+An error-free return from the SDK `Connect()` call is not considered ready.
+`mdl_ingestd` waits up to `--sdk-ready-timeout-seconds` (default 30) for a
+successful Logon response and successful status for every configured stream;
+failure seals the current Arrow run and requires a new, larger feed epoch.
 The core library exposes `TryPollTick`, `TryPollSnapshot`, `TryPollGap`,
 `TryPollLateRecovery`, and `TryPollChannelFault` for the next-stage workers.
 In either startup mode, a native record arriving behind the already-published
@@ -120,6 +127,10 @@ frontier is never inserted backward into the realtime ordered stream; its
 canonical body is sent to `LateRecovery` for later reconciliation. This is
 not a raw durable copy: the Kafka/Redpanda raw path remains outside this
 milestone.
+
+The Arrow memory protocol, restart/disconnect contract, sizing formulas,
+deployment rules, and Python API are documented in
+[docs/arrow-hot-path.md](docs/arrow-hot-path.md).
 
 `from-open` and `partial` both default to a 500,000 ns gap wait. The two
 settings remain independent (`--from-open-gap-wait-ns` and
@@ -138,12 +149,14 @@ message access, header admission, body copy, full decode/normalization,
 Channel recovery, and the lane-by-owner dispatch matrix. It does not include
 the physical MDL network/SDK path before callback entry.
 
-Example for the tested NUMA node 1 layout on a 64-physical-core host:
+The current acceptance envelope is 500k, 750k, and 1M messages/s; the default
+target is 1M messages/s. Example for the tested NUMA node 1 layout on a
+64-physical-core host:
 
 ```bash
 numactl --physcpubind=32-63 --membind=1 \
   ./build/benchmark_mdl_ingest \
-  --rate 1200000 --seconds 300 --warmup-seconds 5 \
+  --rate 1000000 --seconds 300 --warmup-seconds 5 \
   --pattern ordered --sample-every 67 \
   --channels 16 --tick-lanes 12 --owners 16 \
   --producer-cpu 63 --first-consumer-cpu 32 \
@@ -158,7 +171,26 @@ decoder idle loops use pause-spin instead of yielding, so each configured
 decoder, including an idle snapshot decoder in this benchmark, consumes a
 dedicated logical CPU by design.
 
-The complete five-minute 800k/1.0M/1.2M msg/s results, measurement contract,
-quality counters, NUMA placement, default-gap boundary test, and production
-caveats are in
+When Arrow is enabled at build time, `--arrow-ring-dir` extends the same run
+through the production `ArrowHotEgress` and one concurrently pinned C++
+reader/decode worker per owner. It verifies exact row counts, native sequence
+continuity, CRC/protocol validity, lifecycle Control publication, and zero hot
+loss. It reports both callback-to-Arrow-append and callback-to-reader-decode
+latency. The required sweep is:
+
+```text
+500000 messages/s
+750000 messages/s
+1000000 messages/s
+```
+
+Use five-second measurement windows only as development checks. Production
+qualification uses 300-second windows on the deployment NUMA/tmpfs layout and
+must pass every rate without lane overflow, reader overrun, segment drop,
+decode/protocol error, or ordering error. Reproducible commands and the exact
+measurement boundary are in [docs/arrow-hot-path.md](docs/arrow-hot-path.md).
+
+The earlier ingestion-only five-minute 800k/1.0M/1.2M msg/s results,
+measurement contract, NUMA placement, default-gap boundary test, and
+production caveats remain in
 [docs/numa-stress-report.md](docs/numa-stress-report.md).

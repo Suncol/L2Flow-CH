@@ -2,6 +2,10 @@
 #include "l2flow/ingest/engine.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+#include "l2flow/arrow/egress.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -33,6 +37,7 @@ using l2flow::ingest::InstrumentCatalog;
 using l2flow::ingest::LateRecoveryTick;
 using l2flow::ingest::LoadStreamConfig;
 using l2flow::ingest::MdlMessageHandler;
+using l2flow::ingest::MdlConnectionBoundaryReason;
 using l2flow::ingest::PhysicalSdkConfig;
 using l2flow::ingest::PhysicalSdkSession;
 using l2flow::ingest::StartMode;
@@ -60,11 +65,16 @@ struct Options final {
     bool run_seconds_set = false;
     bool allow_discard_after_dispatch = false;
     bool validate_only = false;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    l2flow::arrow_hot::ArrowHotEgressConfig arrow{};
+    bool arrow_enabled = false;
+#endif
 };
 
 inline constexpr std::uint64_t kLatencySampleEvery = 64U;
 inline constexpr std::size_t kLatencyRingCapacity = 4'096U;
 inline constexpr std::size_t kLatencyHistogramMaximumUs = 100'000U;
+inline constexpr std::size_t kDrainBurstMessages = 256U;
 
 struct LatencySampleSlot final {
     std::atomic<std::uint64_t> sequence{0U};
@@ -164,10 +174,11 @@ void PrintUsage() {
         << "usage: mdl_ingestd --mode from-open|partial --trade-date YYYYMMDD "
            "--catalog FILE --sdk-library FILE "
            "--server ADDRESS --user USER "
-           "--allow-discard-after-dispatch [options]\n"
-        << "\nThis milestone stops at instrument dispatch. The explicit discard "
-           "flag installs bounded drain workers so the physical process can "
-           "be exercised without silently claiming durable output.\n"
+           "[--arrow-ring-dir DIR --arrow-feed-epoch N | "
+           "--allow-discard-after-dispatch] [options]\n"
+        << "\nArrow output is a volatile recent-data transport, not a WAL or "
+           "Kafka acknowledgement/recovery source. The explicit discard "
+           "flag remains available for physical-path testing without output.\n"
         << "\noptions:\n"
         << "  --tick-lanes N             default 12\n"
         << "  --snapshot-lanes N         default 4\n"
@@ -180,7 +191,23 @@ void PrintUsage() {
         << "  --partial-gap-wait-ns N    default 500000\n"
         << "  --from-open-gap-wait-ns N  default 500000\n"
         << "  --sdk-work-threads N       default 1\n"
+        << "  --sdk-ready-timeout-seconds N default 30; range 1..3600\n"
         << "  --sdk-console-log\n"
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        << "  --arrow-ring-dir DIR       publish per-owner Arrow rings\n"
+        << "  --arrow-feed-epoch N       required nonzero connection epoch\n"
+        << "  --arrow-descriptors N      power of two; default 1024\n"
+        << "  --arrow-segments N         default 1088\n"
+        << "  --arrow-tick-segment-bytes N      default 262144\n"
+        << "  --arrow-snapshot-segment-bytes N  default 262144\n"
+        << "  --arrow-diagnostic-segment-bytes N default 131072\n"
+        << "  --arrow-max-consumers N    default 16; maximum 64\n"
+        << "  --arrow-tick-batch-rows N  default 256\n"
+        << "  --arrow-snapshot-batch-rows N default 16\n"
+        << "  --arrow-diagnostic-batch-rows N default 64\n"
+        << "  --arrow-batch-max-delay-ns N default 1000000\n"
+        << "  --arrow-heartbeat-interval-ns N default 1000000000\n"
+#endif
         << "  --run-seconds N            test mode only; 0 means until signal, "
            "max 86400\n"
         << "  --validate-only            do not load or connect the SDK\n";
@@ -209,6 +236,9 @@ template <typename Integer>
                                 std::string* error) {
     Options parsed{};
     bool mode_set = false;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    bool arrow_feed_epoch_set = false;
+#endif
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
         const auto next = [&](std::string_view name) -> std::string_view {
@@ -305,6 +335,15 @@ template <typename Integer>
                 *error = "invalid --sdk-work-threads";
                 return false;
             }
+        } else if (argument == "--sdk-ready-timeout-seconds") {
+            if (!ParseInteger(next(argument),
+                              &parsed.sdk.ready_timeout_seconds) ||
+                parsed.sdk.ready_timeout_seconds == 0U ||
+                parsed.sdk.ready_timeout_seconds > 3'600U) {
+                *error =
+                    "--sdk-ready-timeout-seconds must be from 1 through 3600";
+                return false;
+            }
         } else if (argument == "--run-seconds") {
             if (!ParseInteger(next(argument), &parsed.run_seconds) ||
                 parsed.run_seconds > 86'400U) {
@@ -314,6 +353,85 @@ template <typename Integer>
             parsed.run_seconds_set = true;
         } else if (argument == "--sdk-console-log") {
             parsed.sdk.sdk_console_log = true;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        } else if (argument == "--arrow-ring-dir") {
+            parsed.arrow.root_directory = next(argument);
+            parsed.arrow_enabled = true;
+        } else if (argument == "--arrow-feed-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.feed_session_epoch)) {
+                *error = "invalid --arrow-feed-epoch";
+                return false;
+            }
+            arrow_feed_epoch_set = true;
+        } else if (argument == "--arrow-descriptors") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.descriptor_capacity)) {
+                *error = "invalid --arrow-descriptors";
+                return false;
+            }
+        } else if (argument == "--arrow-segments") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.segment_count)) {
+                *error = "invalid --arrow-segments";
+                return false;
+            }
+        } else if (argument == "--arrow-tick-segment-bytes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.tick_segment_payload_bytes)) {
+                *error = "invalid --arrow-tick-segment-bytes";
+                return false;
+            }
+        } else if (argument == "--arrow-snapshot-segment-bytes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.snapshot_segment_payload_bytes)) {
+                *error = "invalid --arrow-snapshot-segment-bytes";
+                return false;
+            }
+        } else if (argument == "--arrow-diagnostic-segment-bytes") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.arrow.diagnostic_segment_payload_bytes)) {
+                *error = "invalid --arrow-diagnostic-segment-bytes";
+                return false;
+            }
+        } else if (argument == "--arrow-max-consumers") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.maximum_consumers)) {
+                *error = "invalid --arrow-max-consumers";
+                return false;
+            }
+        } else if (argument == "--arrow-tick-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.tick_batch_rows)) {
+                *error = "invalid --arrow-tick-batch-rows";
+                return false;
+            }
+        } else if (argument == "--arrow-snapshot-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.snapshot_batch_rows)) {
+                *error = "invalid --arrow-snapshot-batch-rows";
+                return false;
+            }
+        } else if (argument == "--arrow-diagnostic-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.diagnostic_batch_rows)) {
+                *error = "invalid --arrow-diagnostic-batch-rows";
+                return false;
+            }
+        } else if (argument == "--arrow-batch-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.maximum_batch_delay_ns)) {
+                *error = "invalid --arrow-batch-max-delay-ns";
+                return false;
+            }
+        } else if (argument == "--arrow-heartbeat-interval-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.arrow.heartbeat_interval_ns)) {
+                *error = "invalid --arrow-heartbeat-interval-ns";
+                return false;
+            }
+#endif
         } else if (argument == "--allow-discard-after-dispatch") {
             parsed.allow_discard_after_dispatch = true;
         } else if (argument == "--validate-only") {
@@ -337,10 +455,24 @@ template <typename Integer>
         *error = "physical mode requires --sdk-library, --server, and --user";
         return false;
     }
-    if (!parsed.validate_only && !parsed.allow_discard_after_dispatch) {
+    bool output_configured = parsed.allow_discard_after_dispatch;
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    parsed.arrow.owner_count = parsed.engine.instrument_workers;
+    if (parsed.arrow_enabled) {
+        if (!l2flow::arrow_hot::ValidateArrowHotEgressConfig(
+                parsed.arrow, error)) {
+            return false;
+        }
+        output_configured = true;
+    } else if (arrow_feed_epoch_set) {
+        *error = "--arrow-feed-epoch requires --arrow-ring-dir";
+        return false;
+    }
+#endif
+    if (!parsed.validate_only && !output_configured) {
         *error =
-            "this milestone requires --allow-discard-after-dispatch; no "
-            "durable/Event sink has been connected yet";
+            "physical mode requires --arrow-ring-dir or "
+            "--allow-discard-after-dispatch";
         return false;
     }
     if (parsed.operation_mode == OperationMode::kLive &&
@@ -367,6 +499,62 @@ void PrintStats(const EngineStats& stats) {
               << stats.late_recovery_dispatched
               << " lane_full=" << stats.lane_full << '\n';
 }
+
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+void PrintArrowStats(
+    const l2flow::arrow_hot::ArrowHotEgressStats& stats) {
+    std::cout << "arrow_tick_in=" << stats.tick_rows_received
+              << " arrow_snapshot_in=" << stats.snapshot_rows_received
+              << " arrow_late_in=" << stats.late_recovery_rows_received
+              << " arrow_control_in=" << stats.control_rows_received
+              << " arrow_batches=" << stats.published_batches
+              << " arrow_rows=" << stats.published_rows
+              << " arrow_no_segment_dropped_rows="
+              << stats.no_segment_dropped_rows
+              << " arrow_oversized_dropped_rows="
+              << stats.oversized_dropped_rows
+              << " arrow_control_dropped_rows="
+              << stats.control_publish_dropped_rows
+              << " arrow_internal_errors=" << stats.internal_errors << '\n';
+}
+
+void PublishMdlConnectionBoundary(
+    l2flow::arrow_hot::ArrowHotEgress* egress,
+    const MdlMessageHandler& handler) noexcept {
+    if (egress == nullptr) {
+        return;
+    }
+    const std::uint64_t observed =
+        handler.connection_boundary_monotonic_ns();
+    switch (handler.connection_boundary_reason()) {
+        case MdlConnectionBoundaryReason::kNone:
+            return;
+        case MdlConnectionBoundaryReason::kConnectError:
+            static_cast<void>(egress->MarkFeedConnectError(observed));
+            return;
+        case MdlConnectionBoundaryReason::kDisconnected:
+            static_cast<void>(egress->MarkFeedDisconnected(observed));
+            return;
+        case MdlConnectionBoundaryReason::kServiceTimeout:
+            static_cast<void>(egress->MarkFeedServiceTimeout(observed));
+            return;
+        case MdlConnectionBoundaryReason::kMessageDiscarded:
+            static_cast<void>(egress->MarkFeedMessageDiscarded(observed));
+            return;
+        case MdlConnectionBoundaryReason::kSubscriptionRejected:
+            static_cast<void>(
+                egress->MarkFeedSubscriptionRejected(observed));
+            return;
+        case MdlConnectionBoundaryReason::kControlProtocolError:
+            static_cast<void>(
+                egress->MarkFeedControlProtocolError(observed));
+            return;
+        case MdlConnectionBoundaryReason::kReadyTimeout:
+            static_cast<void>(egress->MarkFeedReadyTimeout(observed));
+            return;
+    }
+}
+#endif
 
 void ObserveLatency(std::uint64_t ingress_sequence,
                     std::uint64_t receive_monotonic_ns,
@@ -584,6 +772,29 @@ int main(int argc, char** argv) {
         std::cout << "configuration valid\n";
         return 0;
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    std::unique_ptr<l2flow::arrow_hot::ArrowHotEgress> arrow_egress;
+    if (options.arrow_enabled) {
+        arrow_egress = l2flow::arrow_hot::ArrowHotEgress::Create(
+            options.arrow, &error);
+        if (arrow_egress == nullptr) {
+            std::cerr << "Arrow hot-egress start failed: " << error << '\n';
+            return 1;
+        }
+        std::cout << "arrow_hot_run="
+                  << arrow_egress->run_directory().string()
+                  << " feed_epoch=" << options.arrow.feed_session_epoch
+                  << " producer_instance="
+                  << l2flow::arrow_hot::ProducerInstanceIdString(
+                         arrow_egress->producer_instance())
+                  << '\n';
+    }
+    const auto arrow_healthy = [&arrow_egress] {
+        return arrow_egress == nullptr || arrow_egress->healthy();
+    };
+#else
+    const auto arrow_healthy = [] { return true; };
+#endif
     if (!engine->Start(&error)) {
         std::cerr << "engine start failed: " << error << '\n';
         return 1;
@@ -619,44 +830,95 @@ int main(int argc, char** argv) {
             ChannelFault fault{};
             while (drain_running.load(std::memory_order_acquire)) {
                 bool progress = false;
-                while (engine->TryPollTick(owner, &tick)) {
+                for (std::size_t drained = 0U;
+                     drained < kDrainBurstMessages &&
+                     engine->TryPollTick(owner, &tick);
+                     ++drained) {
                     if (latency_samplers != nullptr) {
                         ObserveLatency(
                             tick.common.ingress_sequence,
                             tick.common.receive_monotonic_ns,
                             &latency_samplers[owner]);
                     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                    if (arrow_egress != nullptr) {
+                        static_cast<void>(
+                            arrow_egress->AppendTick(owner, tick));
+                    }
+#endif
                     consumed_ticks.fetch_add(1U, std::memory_order_relaxed);
                     progress = true;
                 }
-                while (engine->TryPollSnapshot(owner, &snapshot)) {
+                for (std::size_t drained = 0U;
+                     drained < kDrainBurstMessages &&
+                     engine->TryPollSnapshot(owner, &snapshot);
+                     ++drained) {
                     if (latency_samplers != nullptr) {
                         ObserveLatency(
                             snapshot.common.ingress_sequence,
                             snapshot.common.receive_monotonic_ns,
                             &latency_samplers[owner]);
                     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                    if (arrow_egress != nullptr) {
+                        static_cast<void>(
+                            arrow_egress->AppendSnapshot(owner, snapshot));
+                    }
+#endif
                     consumed_snapshots.fetch_add(
                         1U, std::memory_order_relaxed);
                     progress = true;
                 }
                 if (owner == 0U) {
-                    while (engine->TryPollGap(&gap)) {
+                    for (std::size_t drained = 0U;
+                         drained < kDrainBurstMessages &&
+                         engine->TryPollGap(&gap);
+                         ++drained) {
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                        if (arrow_egress != nullptr) {
+                            static_cast<void>(arrow_egress->AppendGap(gap));
+                        }
+#endif
                         consumed_gaps.fetch_add(
                             1U, std::memory_order_relaxed);
                         progress = true;
                     }
-                    while (engine->TryPollLateRecovery(&late_recovery)) {
+                    for (std::size_t drained = 0U;
+                         drained < kDrainBurstMessages &&
+                         engine->TryPollLateRecovery(&late_recovery);
+                         ++drained) {
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                        if (arrow_egress != nullptr) {
+                            static_cast<void>(
+                                arrow_egress->AppendLateRecovery(
+                                    late_recovery));
+                        }
+#endif
                         consumed_late_recovery.fetch_add(
                             1U, std::memory_order_relaxed);
                         progress = true;
                     }
-                    while (engine->TryPollChannelFault(&fault)) {
+                    for (std::size_t drained = 0U;
+                         drained < kDrainBurstMessages &&
+                         engine->TryPollChannelFault(&fault);
+                         ++drained) {
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                        if (arrow_egress != nullptr) {
+                            static_cast<void>(
+                                arrow_egress->AppendFault(fault));
+                        }
+#endif
                         consumed_faults.fetch_add(
                             1U, std::memory_order_relaxed);
                         progress = true;
                     }
                 }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                if (arrow_egress != nullptr) {
+                    arrow_egress->FlushDue(
+                        owner, l2flow::ingest::MonotonicNowNs());
+                }
+#endif
                 if (!progress) {
                     std::this_thread::yield();
                 }
@@ -664,26 +926,77 @@ int main(int argc, char** argv) {
         });
     }
 
-    MdlMessageHandler handler(engine.get());
-    std::unique_ptr<PhysicalSdkSession> sdk = PhysicalSdkSession::Connect(
-        options.sdk, &handler, &error);
-    if (sdk == nullptr) {
+    const auto stop_engine_and_drain = [&] {
+        engine->Stop();
+        for (;;) {
+            const EngineStats final_stats = engine->stats();
+            if (consumed_ticks.load(std::memory_order_acquire) >=
+                    final_stats.dispatched_ticks &&
+                consumed_snapshots.load(std::memory_order_acquire) >=
+                    final_stats.dispatched_snapshots &&
+                consumed_late_recovery.load(std::memory_order_acquire) >=
+                    final_stats.late_recovery_dispatched &&
+                consumed_faults.load(std::memory_order_acquire) >=
+                    final_stats.channel_faults_dispatched) {
+                break;
+            }
+            std::this_thread::yield();
+        }
         drain_running.store(false, std::memory_order_release);
         for (std::thread& thread : drain_threads) {
             thread.join();
         }
-        engine->Stop();
+        // Gap delivery is a coalescing state mailbox, so event-count equality
+        // is not meaningful. Once its producers and normal consumer stop,
+        // collect the last dirty snapshots explicitly.
+        ChannelGap final_gap{};
+        while (engine->TryPollGap(&final_gap)) {
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+            if (arrow_egress != nullptr) {
+                static_cast<void>(arrow_egress->AppendGap(final_gap));
+            }
+#endif
+            consumed_gaps.fetch_add(1U, std::memory_order_relaxed);
+        }
+    };
+
+    MdlMessageHandler handler(engine.get(), stream_mask);
+    std::unique_ptr<PhysicalSdkSession> sdk = PhysicalSdkSession::Connect(
+        options.sdk, &handler, &error);
+    if (sdk == nullptr) {
+        stop_engine_and_drain();
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        if (arrow_egress != nullptr) {
+            PublishMdlConnectionBoundary(arrow_egress.get(), handler);
+            arrow_egress->FlushAll();
+            arrow_egress->Seal(l2flow::ingest::MonotonicNowNs());
+        }
+#endif
         std::cerr << "SDK connect failed: " << error << '\n';
         return 1;
     }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr && handler.feed_ready()) {
+        static_cast<void>(arrow_egress->MarkFeedConnected(
+            handler.feed_ready_monotonic_ns()));
+    }
+#endif
 
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
     if (options.operation_mode == OperationMode::kLive) {
         while (g_stop_requested == 0 && engine->healthy() &&
-               !handler.failed()) {
+               !handler.failed() &&
+               handler.connection_boundary_reason() ==
+                   l2flow::ingest::MdlConnectionBoundaryReason::kNone &&
+               arrow_healthy()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             PrintStats(engine->stats());
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+            if (arrow_egress != nullptr) {
+                PrintArrowStats(arrow_egress->stats());
+            }
+#endif
         }
     } else {
         using SteadyClock = std::chrono::steady_clock;
@@ -696,7 +1009,10 @@ int main(int argc, char** argv) {
             : monitor_started + std::chrono::seconds(options.run_seconds);
         EngineStats previous_stats = engine->stats();
         while (g_stop_requested == 0 && engine->healthy() &&
-               !handler.failed()) {
+               !handler.failed() &&
+               handler.connection_boundary_reason() ==
+                   l2flow::ingest::MdlConnectionBoundaryReason::kNone &&
+               arrow_healthy()) {
             std::this_thread::sleep_until(
                 std::min(next_report_time, run_deadline));
             const SteadyClock::time_point now = SteadyClock::now();
@@ -728,33 +1044,15 @@ int main(int argc, char** argv) {
     // Shutdown order is contractual: quiesce SDK callbacks, drain decoder
     // lanes, then drain the instrument-dispatch queues.
     sdk->Shutdown();
-    engine->Stop();
-    for (;;) {
-        const EngineStats final_stats = engine->stats();
-        if (consumed_ticks.load(std::memory_order_acquire) >=
-                final_stats.dispatched_ticks &&
-            consumed_snapshots.load(std::memory_order_acquire) >=
-                final_stats.dispatched_snapshots &&
-            consumed_late_recovery.load(std::memory_order_acquire) >=
-                final_stats.late_recovery_dispatched &&
-            consumed_faults.load(std::memory_order_acquire) >=
-                final_stats.channel_faults_dispatched) {
-            break;
-        }
-        std::this_thread::yield();
+    stop_engine_and_drain();
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr) {
+        PublishMdlConnectionBoundary(arrow_egress.get(), handler);
+        arrow_egress->FlushAll();
+        arrow_egress->Seal(l2flow::ingest::MonotonicNowNs());
+        PrintArrowStats(arrow_egress->stats());
     }
-    drain_running.store(false, std::memory_order_release);
-    for (std::thread& thread : drain_threads) {
-        thread.join();
-    }
-    // Gap delivery is a coalescing per-Channel state mailbox, so the number
-    // of snapshots consumed need not equal the number of gap ranges. Once
-    // producers and the normal consumer are stopped, drain any final dirty
-    // state here without relying on an event-count equality.
-    ChannelGap final_gap{};
-    while (engine->TryPollGap(&final_gap)) {
-        consumed_gaps.fetch_add(1U, std::memory_order_relaxed);
-    }
+#endif
     const EngineStats final_stats = engine->stats();
     PrintStats(final_stats);
     if (options.operation_mode == OperationMode::kTest) {
@@ -772,5 +1070,25 @@ int main(int argc, char** argv) {
         std::cerr << "fatal SDK callback adapter error\n";
         return 1;
     }
+    if (handler.connection_boundary_reason() !=
+        l2flow::ingest::MdlConnectionBoundaryReason::kNone) {
+        const std::string boundary_detail =
+            handler.connection_boundary_detail();
+        std::cerr
+            << "MDL connection boundary observed; post-reconnect data was "
+               "rejected. Restart mdl_ingestd with a new Arrow feed epoch";
+        if (!boundary_detail.empty()) {
+            std::cerr << ": " << boundary_detail;
+        }
+        std::cerr << '\n';
+        return 1;
+    }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr && !arrow_egress->healthy()) {
+        std::cerr << "fatal Arrow hot-egress error: "
+                  << arrow_egress->fatal_error() << '\n';
+        return 1;
+    }
+#endif
     return 0;
 }
