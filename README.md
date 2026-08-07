@@ -28,6 +28,32 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+## Python environment
+
+The shared-memory reader and local ClickHouse/Redis clients use one uv-managed
+Python 3.13 environment under `python/.venv`. Its Arrow major is pinned to the
+C++ build:
+
+```bash
+uv sync --project python --locked
+uv run --project python --locked python -c \
+  'import pyarrow, clickhouse_connect, redis, polars; print(pyarrow.__version__)'
+```
+
+Use `python/uv.lock` as the dependency source of truth; do not maintain a
+second `requirements.txt` or install packages into the environment with `pip`.
+
+The read-only MDL feeder Redis latest-value API, its Polars parsing and strict
+optional numeric view, and runnable query examples are documented in
+[python/README.md](python/README.md).
+
+## Local ClickHouse
+
+The repository-local single-binary ClickHouse test instance is documented in
+[clickhouse-test/README.md](clickhouse-test/README.md). It binds only to
+localhost, keeps all runtime state under `clickhouse-test/`, and includes
+lifecycle, MergeTree smoke-test, restart-persistence, and Python client tools.
+
 Optional checks:
 
 ```bash
@@ -64,6 +90,13 @@ Only tuples with a decoder in this build are accepted. The example is
 tuple-specific hard-fail branch: an unconfigured tuple is not subscribed, a
 configured-but-unimplemented tuple is rejected during configuration, and an
 unexpected runtime tuple is reported as `unsupported_message`.
+
+For live Arrow-ring tests that must exclude snapshots, use
+[`config/live-ticks.streams.conf`](config/live-ticks.streams.conf). It subscribes
+only to Shanghai Tick plus Shenzhen Order and Transaction. The Arrow manifest
+still contains empty Snapshot rings as part of protocol v2's fixed ring set;
+`python/live_ring_probe.py` drains every Tick owner concurrently and fails if
+any Snapshot row is published.
 
 This tuple selection controls message families, not the security universe
 inside a vendor stream. The exact A-share universe is the supplied daily

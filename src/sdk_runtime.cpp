@@ -769,8 +769,17 @@ std::unique_ptr<PhysicalSdkSession> PhysicalSdkSession::Connect(
     }
     try {
         ::dlerror();
+#if defined(RTLD_DEEPBIND)
+        // The vendor SDK statically embeds protobuf 2.5, while Arrow may load
+        // a newer system protobuf into the process. Prefer the SDK's own
+        // definitions so ELF symbol interposition cannot mix the two ABIs.
+        constexpr int kSdkDlopenFlags =
+            RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
+#else
+        constexpr int kSdkDlopenFlags = RTLD_NOW | RTLD_LOCAL;
+#endif
         void* const raw_library =
-            ::dlopen(library_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+            ::dlopen(library_path.c_str(), kSdkDlopenFlags);
         if (raw_library == nullptr) {
             const char* const detail = ::dlerror();
             SetError(error, std::string("dlopen SDK failed: ") +

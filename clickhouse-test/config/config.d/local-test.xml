@@ -1,0 +1,49 @@
+<clickhouse>
+    <!-- All relative paths are resolved from clickhouse-test/ by start.sh. -->
+    <path>data/</path>
+    <tmp_path>tmp/</tmp_path>
+    <user_files_path>user_files/</user_files_path>
+    <format_schema_path>format_schemas/</format_schema_path>
+    <custom_cached_disks_base_directory>data/caches/</custom_cached_disks_base_directory>
+
+    <user_directories replace="replace">
+        <users_xml>
+            <path>users.xml</path>
+        </users_xml>
+        <local_directory>
+            <path>data/access/</path>
+        </local_directory>
+    </user_directories>
+
+    <logger>
+        <level>information</level>
+        <log>logs/clickhouse-server.log</log>
+        <errorlog>logs/clickhouse-server.err.log</errorlog>
+        <size>100M</size>
+        <count>5</count>
+        <console>1</console>
+    </logger>
+
+    <listen_host>127.0.0.1</listen_host>
+    <interserver_listen_host>127.0.0.1</interserver_listen_host>
+
+    <!-- Port 9000 is already owned by another local service on this host. -->
+    <tcp_port>19000</tcp_port>
+
+    <remote_servers>
+        <default>
+            <shard>
+                <replica>
+                    <port>19000</port>
+                </replica>
+            </shard>
+        </default>
+    </remote_servers>
+
+    <!-- The prototype only needs HTTP and Native TCP. -->
+    <mysql_port remove="remove"/>
+    <postgresql_port remove="remove"/>
+    <interserver_http_port remove="remove"/>
+
+    <timezone>Asia/Shanghai</timezone>
+</clickhouse>

@@ -1,0 +1,11 @@
+<clickhouse>
+    <users>
+        <default>
+            <!-- Empty-password access is intentionally limited to loopback. -->
+            <networks replace="replace">
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>

@@ -1,0 +1,6 @@
+redis_version=8.10.0
+source_url=https://download.redis.io/redis-stable.tar.gz
+source_sha256=8c316ad670a4dfc3df855b62381db2a94256ff0c0b2edcc919452b8ce1fc1605
+build_date=2026-08-07
+build_os=Ubuntu_24.04_x86_64
+allocator=jemalloc-5.3.0

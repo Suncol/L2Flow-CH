@@ -1,9 +1,10 @@
 [project]
 name = "l2flow-arrow-hot-reader"
 version = "0.1.0"
-description = "Python Arrow and Redis latest-value readers for L2Flow-CH"
+description = "Python Arrow reader and local service clients for L2Flow-CH"
 requires-python = ">=3.11,<3.15"
 dependencies = [
+    "clickhouse-connect[arrow]>=0.8,<1",
     "polars>=1.30,<2",
     "pyarrow==25.0.0",
     "redis[hiredis]>=6,<8",

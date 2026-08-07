@@ -5,3 +5,23 @@
 __pycache__/
 *.py[cod]
 /python/__pycache__/
+
+# Local single-binary ClickHouse runtime.
+/clickhouse-test/clickhouse
+/clickhouse-test/CLICKHOUSE_VERSION.txt
+/clickhouse-test/clickhouse.sha256.local
+/clickhouse-test/.venv/
+/clickhouse-test/data/
+/clickhouse-test/format_schemas/
+/clickhouse-test/logs/
+/clickhouse-test/run/
+/clickhouse-test/tmp/
+/clickhouse-test/user_files/
+
+# Local Kafka distribution and runtime state.
+/kafka-test/downloads/
+/kafka-test/dist/
+/kafka-test/kafka
+/kafka-test/data/
+/kafka-test/logs/
+/kafka-test/run/
