@@ -46,9 +46,9 @@ forced, so these numbers are host observations rather than a portable limit.
 
 | mode | requested callback rate | duration | actors | micro-batch rows | facts journaled | revisions | in-memory rows ACKed | effective state rate | result |
 |:---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| scheduled | 800,000 msg/s | 5 s | 16 | 768 | 4,000,000 | 4,000,000 | 4,000,000 | 799,037.658 fact/s | PASS |
-| scheduled | 1,000,000 msg/s | 5 s | 16 | 768 | 5,000,000 | 5,000,000 | 5,000,000 | 993,802.130 fact/s | PASS |
-| unpaced (capacity ceiling) | 1,000,000 msg/s target | 5 s / 5,000,000 facts | 16 | 768 | 5,000,000 | 5,000,000 | 5,000,000 | 1,546,986.564 fact/s | PASS |
+| scheduled | 800,000 msg/s | 5 s | 16 | 768 | 4,000,000 | 4,000,000 | 4,000,000 | 798,987.194 fact/s | PASS |
+| scheduled | 1,000,000 msg/s | 5 s | 16 | 768 | 5,000,000 | 5,000,000 | 5,000,000 | 991,119.988 fact/s | PASS |
+| unpaced (capacity ceiling) | 1,000,000 msg/s target | 5 s / 5,000,000 facts | 16 | 768 | 5,000,000 | 5,000,000 | 5,000,000 | 1,487,635.746 fact/s | PASS |
 
 The scheduled runs reported `ordered_batch_fast_path == source_only_fast_path`
 and `unordered_batch_sorts == 0`.  These counters verify that the measured
