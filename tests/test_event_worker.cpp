@@ -467,6 +467,58 @@ void TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment() {
                       }));
 }
 
+void TestShanghaiEndSourceOnlyCutRetainsBarrierForLateOrder() {
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<EventWorker> worker =
+        EventWorker::Create(Config(), &sink, &error);
+    CHECK(worker != nullptr);
+
+    // There are no order histories when END is projected, so this exercises
+    // the source-only status fast path.  The later Add is a late recovery
+    // fact whose native position is before END and must be finalized by the
+    // retained barrier.
+    const std::array<CanonicalTick, 2U> statuses{
+        ShanghaiStatus(1U, 40U, TradingPhase::kContinuous),
+        ShanghaiStatus(3U, 42U, TradingPhase::kEnded)};
+    std::array<EventInput, 2U> status_inputs{
+        EventInput{statuses[0U]}, EventInput{statuses[1U]}};
+    CHECK(worker->ApplyBatch(status_inputs).code ==
+          EventApplyCode::kApplied);
+    std::array<RawTickDependency, 2U> status_dependencies{
+        RawTickDependency{statuses[0U].common.ingress_sequence,
+                          statuses[0U].common.kind},
+        RawTickDependency{statuses[1U].common.ingress_sequence,
+                          statuses[1U].common.kind}};
+    worker->AcknowledgeRawTicks(status_dependencies);
+    CHECK(worker->DrainDurableCommits());
+
+    const CanonicalTick late_add = ShanghaiAdd(2U, 41U, 300);
+    EventInput late_input{late_add};
+    late_input.late_recovery = true;
+    CHECK(worker->ApplyBatch(
+              std::span<const EventInput>(&late_input, 1U)).code ==
+          EventApplyCode::kApplied);
+    Ack(worker.get(), late_add);
+
+    OrderSnapshot snapshot{};
+    CHECK(worker->CopyOrder(
+        OrderKey{20260807U, Market::kShanghai, 1U, 7U, 300},
+        &snapshot));
+    CHECK((snapshot.quality_flags &
+           ShanghaiOrderQualityBit(
+               ShanghaiOrderQualityFlag::kEndedWithObservedBalance)) != 0U);
+    CHECK(std::any_of(
+        sink.batches.back()->revisions.begin(),
+        sink.batches.back()->revisions.end(),
+        [](const EventRevision& revision) {
+            return revision.payload.order_snapshot_valid &&
+                   revision.payload.order.key.order_id == 300 &&
+                   revision.payload.order_delta_operation ==
+                       OrderDeltaOperation::kFinalize;
+        }));
+}
+
 void TestShanghaiTerminalBeforeEndTombstonesOldFinalize() {
     RecordingSink sink;
     std::string error;
@@ -1131,6 +1183,7 @@ int main() {
     TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo();
     TestUnresolvedLateCancelConvergesBeforeLaterTrade();
     TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment();
+    TestShanghaiEndSourceOnlyCutRetainsBarrierForLateOrder();
     TestShanghaiTerminalBeforeEndTombstonesOldFinalize();
     TestLateShanghaiStatusRepairsOnlyUntilNextStatus();
     TestSlicedRepairIsPrivateAndMatchesUnslicedProjection();

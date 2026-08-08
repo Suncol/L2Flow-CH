@@ -1916,6 +1916,14 @@ public:
                             &result,
                             "Event OrderUseIndex capacity exhausted");
                     }
+                } else if (record.barrier) {
+                    // A source-only cut has no existing orders to walk, but
+                    // END must still be retained for an order that arrives
+                    // later through late recovery.  RegisterFactUses also
+                    // applies the barrier to existing orders; this branch
+                    // only needs the persistent in-memory barrier index.
+                    barriers_[InstrumentChannel(record.source_tick)]
+                        [key.native_sequence] = key;
                 }
             }
             for (const FactKey& key : phase_changed) {
