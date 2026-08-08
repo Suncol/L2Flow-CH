@@ -151,6 +151,110 @@ than depend on their working directory.
   --validate-only
 ```
 
+The executable also accepts a strict response file through `--config FILE`.
+Each nonempty line is one `--long-option` followed by its complete value;
+comments must occupy a complete line. Each `${NAME}` reference expands one
+nonempty environment variable. There is no shell evaluation, recursive expansion,
+inline comment, or quote processing. A missing/malformed environment reference
+and a nested `--config` fail with a `file:line` diagnostic.
+
+Configuration-file arguments are parsed before ordinary command-line
+arguments, regardless of where `--config` appears. A scalar CLI option
+therefore overrides the file. Repeatable options append instead; in particular,
+an additional CLI `--kline-interval-seconds` adds an interval before startup
+sorts and deduplicates the list.
+
+## Current-server production profile
+
+[`config/current-server.production.conf`](config/current-server.production.conf)
+is the checked-in production profile for this host's two-socket AMD EPYC 9534
+topology. It configures the SDK, decoder/owner parallelism, Arrow rings, raw
+ClickHouse sink, Event projection, KLine projection, and all exposed batching,
+queue, timeout, and state-capacity limits for those paths. Dynamic run identity
+and credentials are intentionally supplied through environment variables;
+[`config/current-server.production.env.example`](config/current-server.production.env.example)
+lists every required variable without committing a credential or reusable
+identity.
+
+Run validation from the repository working directory before starting the SDK:
+
+```bash
+set -a
+. /etc/l2flow/mdl_ingestd.env
+set +a
+
+./build-release/mdl_ingestd \
+  --config config/current-server.production.conf \
+  --validate-only
+```
+
+The live supervisor uses the same environment and command without
+`--validate-only`. Set its working directory to
+`/home/sunc/code/L2Flow-CH-shared-memory-arrow-ring`, or replace relative paths
+in the profile with absolute paths. `L2FLOW_START_MODE=from-open` is valid only
+when the subscribed sequence domains genuinely start with complete coverage
+from sequence 1. A mid-session start or restart must use `partial`.
+
+Run identity is an external durable-allocation responsibility:
+
+- `L2FLOW_SOURCE_INSTANCE_HEX32` is a stable 32-hex (128-bit) identity for the
+  logical raw source, not a new value on every restart.
+- `L2FLOW_RAW_FEED_EPOCH` must not be reused with that source identity.
+- `L2FLOW_ARROW_FEED_EPOCH` must be greater than the epoch already recorded at
+  the configured Arrow root.
+- Event and KLine revision epochs are separate nonzero 32-bit domains. Each
+  must be strictly greater than every epoch previously used for the same
+  derived logical key space.
+- Event and KLine calculation run IDs are new, nonzero 32-hex identifiers for
+  every calculation run. They are not interchangeable with revision epochs.
+
+On Linux, `--process-cpus` applies the inherited thread-affinity mask before
+any sink, engine, SDK, decoder, owner, or writer thread is created. Startup
+reads the mask back and fails if a cpuset/cgroup silently removed a requested
+CPU. `--memory-node` applies `MPOL_BIND` to future allocations and is inherited
+by subsequently created threads. `--validate-only` checks syntax, NUMA sysfs
+presence, and decoder containment without changing affinity or memory policy;
+the real startup syscall additionally enforces the current cpuset/memory-node
+permissions.
+
+The current host allocation is:
+
+| CPUs | Role |
+|---|---|
+| `0-3,128-131` | NIC IRQ budget, configured outside this executable |
+| `4-7,132-135` | external `feeder_client` budget |
+| `8-23` | 16 individually pinned Tick decoders |
+| `24-27` | 4 individually pinned Snapshot decoders |
+| `28-59` | nominal owner/SDK/raw/Event/KLine writer budget inside the `8-59` process mask |
+| `60-63,188-191` | external Arrow consumers |
+| `64-119,192-247` | separately supervised ClickHouse server |
+| `120-127,248-255` | OS/storage IRQ/housekeeping budget |
+| `136-187` | initially idle SMT siblings of ingest physical cores `8-59` |
+
+The 32 owner drain threads are the parallel Event and KLine calculation actors;
+there is no additional background calculation pool. Four Event and four KLine
+writer lanes independently parallelize ClickHouse INSERTs while retaining FIFO
+for each owner. The configured process mask permits all non-decoder ingest
+threads on `8-59`; `28-59` is a scheduling budget, not a per-thread hard pin.
+
+The ClickHouse server is outside `mdl_ingestd`, so the profile configures its
+HTTP client and writer lanes but cannot bind or supervise the server process.
+For the local separately supervised instance, start it on NUMA 1 before ingest:
+
+```bash
+numactl --physcpubind=64-119,192-247 --membind=1 \
+  ./clickhouse-test/start.sh
+```
+
+The profile disables table auto-creation; provision the selected single-node
+or replicated production schema first. Its 32-owner Arrow layout preallocates
+approximately 17.3 GiB of ring payload capacity in `/dev/shm`, plus metadata
+and alignment overhead. Event and KLine state limits are per
+owner and fail closed on exhaustion. These settings are a topology-derived
+starting profile, not proof of 1M messages/s end-to-end capacity; qualify the
+actual catalog, interval set, replay distribution, ClickHouse schema/storage,
+and Arrow consumers under a sustained production-like run before rollout.
+
 Physical runs default to `--operation-mode live`. Live mode is unbounded,
 does not accept `--run-seconds`, and does not allocate or publish the test
 latency sampler. Use test mode only for a bounded operational measurement:

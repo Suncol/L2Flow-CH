@@ -17,22 +17,36 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <charconv>
 #include <chrono>
+#include <climits>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -75,6 +89,8 @@ struct Options final {
     bool run_seconds_set = false;
     bool allow_discard_after_dispatch = false;
     bool validate_only = false;
+    std::string process_cpu_list;
+    std::optional<std::size_t> memory_node;
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     l2flow::arrow_hot::ArrowHotEgressConfig arrow{};
     bool arrow_enabled = false;
@@ -220,7 +236,8 @@ private:
 
 void PrintUsage() {
     std::cout
-        << "usage: mdl_ingestd --mode from-open|partial --trade-date YYYYMMDD "
+        << "usage: mdl_ingestd [--config FILE] "
+           "--mode from-open|partial --trade-date YYYYMMDD "
            "--catalog FILE --sdk-library FILE "
            "--server ADDRESS --user USER "
            "[output options] [options]\n"
@@ -230,6 +247,8 @@ void PrintUsage() {
            "mode requires at least one output, or the explicit discard flag "
            "for testing without output.\n"
         << "\noptions:\n"
+        << "  --config FILE             load one option per line; CLI scalar "
+           "options override files\n"
         << "  --tick-lanes N             default 12\n"
         << "  --snapshot-lanes N         default 4\n"
         << "  --instrument-workers N     default 16\n"
@@ -237,6 +256,10 @@ void PrintUsage() {
         << "  --stream-config FILE       default "
            "config/production.streams.conf\n"
         << "  --first-decoder-cpu N      default -1 (OS scheduling)\n"
+        << "  --process-cpus LIST        Linux inherited affinity, e.g. "
+           "8-59,156-187\n"
+        << "  --memory-node N            Linux MPOL_BIND for future "
+           "allocations\n"
         << "  --partial-initial-hold-ns N\n"
         << "  --partial-gap-wait-ns N    default 500000\n"
         << "  --from-open-gap-wait-ns N  default 500000\n"
@@ -339,6 +362,448 @@ template <typename Integer>
     return true;
 }
 
+[[nodiscard]] std::string_view TrimWhitespace(std::string_view text) noexcept {
+    const auto is_space = [](char value) noexcept {
+        return std::isspace(static_cast<unsigned char>(value)) != 0;
+    };
+    while (!text.empty() && is_space(text.front())) {
+        text.remove_prefix(1U);
+    }
+    while (!text.empty() && is_space(text.back())) {
+        text.remove_suffix(1U);
+    }
+    return text;
+}
+
+[[nodiscard]] bool IsEnvironmentName(std::string_view name) noexcept {
+    if (name.empty()) {
+        return false;
+    }
+    const auto is_alpha = [](char value) noexcept {
+        const unsigned char byte = static_cast<unsigned char>(value);
+        return std::isalpha(byte) != 0 || value == '_';
+    };
+    const auto is_alnum = [](char value) noexcept {
+        const unsigned char byte = static_cast<unsigned char>(value);
+        return std::isalnum(byte) != 0 || value == '_';
+    };
+    return is_alpha(name.front()) &&
+           std::all_of(name.begin() + 1, name.end(), is_alnum);
+}
+
+[[nodiscard]] std::string ConfigLocation(std::string_view path,
+                                         std::size_t line_number) {
+    return std::string(path) + ':' + std::to_string(line_number);
+}
+
+[[nodiscard]] bool ExpandEnvironmentReferences(
+    std::string_view input,
+    std::string_view path,
+    std::size_t line_number,
+    std::string* output,
+    std::string* error) {
+    output->clear();
+    output->reserve(input.size());
+    for (std::size_t index = 0U; index < input.size();) {
+        if (input[index] != '$' || index + 1U >= input.size() ||
+            input[index + 1U] != '{') {
+            output->push_back(input[index]);
+            ++index;
+            continue;
+        }
+        const std::size_t closing = input.find('}', index + 2U);
+        if (closing == std::string_view::npos) {
+            *error = ConfigLocation(path, line_number) +
+                     ": unterminated environment reference";
+            return false;
+        }
+        const std::string_view name =
+            input.substr(index + 2U, closing - index - 2U);
+        if (!IsEnvironmentName(name)) {
+            *error = ConfigLocation(path, line_number) +
+                     ": invalid environment variable name in ${" +
+                     std::string(name) + '}';
+            return false;
+        }
+        const std::string environment_name(name);
+        const char* const value = std::getenv(environment_name.c_str());
+        if (value == nullptr) {
+            *error = ConfigLocation(path, line_number) +
+                     ": environment variable " + environment_name +
+                     " is unset";
+            return false;
+        }
+        const std::string_view expanded(value);
+        if (expanded.empty()) {
+            *error = ConfigLocation(path, line_number) +
+                     ": environment variable " + environment_name +
+                     " is empty";
+            return false;
+        }
+        if (expanded.find_first_of("\r\n") != std::string_view::npos) {
+            *error = ConfigLocation(path, line_number) +
+                     ": environment variable " + environment_name +
+                     " contains a line break";
+            return false;
+        }
+        output->append(expanded);
+        index = closing + 1U;
+    }
+    return true;
+}
+
+[[nodiscard]] bool LoadConfigurationArguments(
+    std::string_view path,
+    std::vector<std::string>* arguments,
+    std::string* error) {
+    std::ifstream input{std::string(path)};
+    if (!input) {
+        *error = "cannot open configuration file: " + std::string(path);
+        return false;
+    }
+    std::string line;
+    std::size_t line_number = 0U;
+    while (std::getline(input, line)) {
+        ++line_number;
+        if (line.size() > 65'536U) {
+            *error = ConfigLocation(path, line_number) +
+                     ": configuration line exceeds 65536 bytes";
+            return false;
+        }
+        if (line.find('\0') != std::string::npos) {
+            *error = ConfigLocation(path, line_number) +
+                     ": configuration line contains a NUL byte";
+            return false;
+        }
+        const std::string_view trimmed = TrimWhitespace(line);
+        if (trimmed.empty() || trimmed.front() == '#') {
+            continue;
+        }
+        if (!trimmed.starts_with("--") || trimmed.size() == 2U) {
+            *error = ConfigLocation(path, line_number) +
+                     ": every non-comment line must start with a long option";
+            return false;
+        }
+        const std::size_t separator = trimmed.find_first_of(" \t\r\n\f\v");
+        const std::string_view option = trimmed.substr(0U, separator);
+        if (option == "--config" || option.starts_with("--config=")) {
+            *error = ConfigLocation(path, line_number) +
+                     ": nested --config is not allowed";
+            return false;
+        }
+        arguments->emplace_back(option);
+        if (separator == std::string_view::npos) {
+            continue;
+        }
+        const std::string_view value =
+            TrimWhitespace(trimmed.substr(separator + 1U));
+        if (value.empty()) {
+            continue;
+        }
+        std::string expanded;
+        if (!ExpandEnvironmentReferences(
+                value, path, line_number, &expanded, error)) {
+            return false;
+        }
+        arguments->push_back(std::move(expanded));
+    }
+    if (!input.eof()) {
+        *error = "failed while reading configuration file: " +
+                 std::string(path);
+        return false;
+    }
+    return true;
+}
+
+struct ExpandedArguments final {
+    std::vector<std::string> storage;
+    std::vector<char*> pointers;
+};
+
+[[nodiscard]] bool ExpandConfigurationArguments(
+    int argc,
+    char** argv,
+    ExpandedArguments* output,
+    std::string* error) {
+    std::vector<std::string> configuration_arguments;
+    std::vector<std::string> command_line_arguments;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument != "--config") {
+            command_line_arguments.emplace_back(argument);
+            continue;
+        }
+        if (index + 1 >= argc) {
+            *error = "--config requires a value";
+            return false;
+        }
+        ++index;
+        const std::string_view path(argv[index]);
+        if (path.empty()) {
+            *error = "--config path may not be empty";
+            return false;
+        }
+        if (!LoadConfigurationArguments(
+                path, &configuration_arguments, error)) {
+            return false;
+        }
+    }
+
+    const std::size_t total_arguments =
+        1U + configuration_arguments.size() +
+        command_line_arguments.size();
+    if (total_arguments >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        *error = "expanded argument count exceeds INT_MAX";
+        return false;
+    }
+    output->storage.clear();
+    output->storage.reserve(total_arguments);
+    output->storage.emplace_back(
+        argc > 0 && argv[0] != nullptr ? argv[0] : "mdl_ingestd");
+    for (std::string& argument : configuration_arguments) {
+        output->storage.push_back(std::move(argument));
+    }
+    for (std::string& argument : command_line_arguments) {
+        output->storage.push_back(std::move(argument));
+    }
+    output->pointers.clear();
+    output->pointers.reserve(output->storage.size());
+    for (std::string& argument : output->storage) {
+        output->pointers.push_back(argument.data());
+    }
+    return true;
+}
+
+#if defined(__linux__)
+struct CpuSelection final {
+    cpu_set_t mask{};
+    std::vector<std::size_t> cpus;
+};
+
+[[nodiscard]] bool ParseCpuSelection(std::string_view text,
+                                     CpuSelection* output,
+                                     std::string* error) {
+    if (text.empty()) {
+        *error = "--process-cpus may not be empty";
+        return false;
+    }
+    CpuSelection parsed{};
+    CPU_ZERO(&parsed.mask);
+    std::size_t offset = 0U;
+    while (offset < text.size()) {
+        const std::size_t comma = text.find(',', offset);
+        const std::size_t end = comma == std::string_view::npos
+                                    ? text.size()
+                                    : comma;
+        const std::string_view component = text.substr(offset, end - offset);
+        if (component.empty()) {
+            *error = "--process-cpus contains an empty component";
+            return false;
+        }
+        const std::size_t dash = component.find('-');
+        if (dash != std::string_view::npos &&
+            component.find('-', dash + 1U) != std::string_view::npos) {
+            *error = "--process-cpus contains a malformed range";
+            return false;
+        }
+        std::size_t first = 0U;
+        std::size_t last = 0U;
+        if (dash == std::string_view::npos) {
+            if (!ParseInteger(component, &first)) {
+                *error = "--process-cpus contains a nonnumeric CPU";
+                return false;
+            }
+            last = first;
+        } else if (!ParseInteger(component.substr(0U, dash), &first) ||
+                   !ParseInteger(component.substr(dash + 1U), &last)) {
+            *error = "--process-cpus contains a malformed range";
+            return false;
+        }
+        if (last < first) {
+            *error = "--process-cpus ranges must be ascending";
+            return false;
+        }
+        if (last >= static_cast<std::size_t>(CPU_SETSIZE)) {
+            *error = "--process-cpus contains a CPU outside CPU_SETSIZE";
+            return false;
+        }
+        for (std::size_t cpu = first;; ++cpu) {
+            const int cpu_index = static_cast<int>(cpu);
+            if (CPU_ISSET(cpu_index, &parsed.mask) != 0) {
+                *error = "--process-cpus contains CPU " +
+                         std::to_string(cpu) + " more than once";
+                return false;
+            }
+            CPU_SET(cpu_index, &parsed.mask);
+            parsed.cpus.push_back(cpu);
+            if (cpu == last) {
+                break;
+            }
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        offset = comma + 1U;
+        if (offset == text.size()) {
+            *error = "--process-cpus may not end with a comma";
+            return false;
+        }
+    }
+    *output = std::move(parsed);
+    return true;
+}
+#endif
+
+[[nodiscard]] bool ValidateProcessPlacement(const Options& options,
+                                            std::string* error) {
+#if defined(__linux__)
+    CpuSelection process_cpus{};
+    const bool has_process_cpus = !options.process_cpu_list.empty();
+    if (has_process_cpus &&
+        !ParseCpuSelection(options.process_cpu_list, &process_cpus, error)) {
+        return false;
+    }
+    if (options.engine.first_decoder_cpu >= 0) {
+        const std::size_t first = static_cast<std::size_t>(
+            options.engine.first_decoder_cpu);
+        if (options.engine.tick_decoder_lanes >
+            std::numeric_limits<std::size_t>::max() -
+                options.engine.snapshot_decoder_lanes) {
+            *error = "configured decoder count overflows size_t";
+            return false;
+        }
+        const std::size_t decoder_count =
+            options.engine.tick_decoder_lanes +
+            options.engine.snapshot_decoder_lanes;
+        if (decoder_count == 0U || first >=
+                static_cast<std::size_t>(CPU_SETSIZE) ||
+            decoder_count > static_cast<std::size_t>(CPU_SETSIZE) - first) {
+            *error = "configured decoder CPU range exceeds CPU_SETSIZE";
+            return false;
+        }
+        if (has_process_cpus) {
+            for (std::size_t offset = 0U; offset < decoder_count; ++offset) {
+                const std::size_t cpu = first + offset;
+                if (CPU_ISSET(static_cast<int>(cpu), &process_cpus.mask) == 0) {
+                    *error = "decoder CPU " + std::to_string(cpu) +
+                             " is outside --process-cpus";
+                    return false;
+                }
+            }
+        }
+    }
+    if (options.memory_node.has_value()) {
+        const std::string node_path = "/sys/devices/system/node/node" +
+                                      std::to_string(*options.memory_node);
+        std::error_code status_error;
+        if (!std::filesystem::is_directory(node_path, status_error)) {
+            *error = "--memory-node " +
+                     std::to_string(*options.memory_node) +
+                     " is not present in Linux NUMA sysfs";
+            return false;
+        }
+    }
+    return true;
+#else
+    if (!options.process_cpu_list.empty() || options.memory_node.has_value()) {
+        *error = "--process-cpus and --memory-node are supported only on Linux";
+        return false;
+    }
+    return true;
+#endif
+}
+
+[[nodiscard]] bool ApplyProcessPlacement(const Options& options,
+                                         std::string* error) {
+#if defined(__linux__)
+    if (!options.process_cpu_list.empty()) {
+        CpuSelection requested{};
+        if (!ParseCpuSelection(
+                options.process_cpu_list, &requested, error)) {
+            return false;
+        }
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+            *error = "sched_getaffinity failed: " +
+                     std::string(std::strerror(errno));
+            return false;
+        }
+        for (const std::size_t cpu : requested.cpus) {
+            if (CPU_ISSET(static_cast<int>(cpu), &allowed) == 0) {
+                *error = "requested CPU " + std::to_string(cpu) +
+                         " is offline or excluded by the current cpuset";
+                return false;
+            }
+        }
+        if (::sched_setaffinity(0, sizeof(requested.mask),
+                                &requested.mask) != 0) {
+            *error = "sched_setaffinity failed: " +
+                     std::string(std::strerror(errno));
+            return false;
+        }
+        cpu_set_t effective;
+        CPU_ZERO(&effective);
+        if (::sched_getaffinity(0, sizeof(effective), &effective) != 0) {
+            *error = "affinity readback failed: " +
+                     std::string(std::strerror(errno));
+            return false;
+        }
+        if (CPU_EQUAL(&requested.mask, &effective) == 0) {
+            *error = "effective CPU affinity differs from --process-cpus";
+            return false;
+        }
+    }
+    if (options.memory_node.has_value()) {
+#if defined(SYS_set_mempolicy)
+        const std::size_t node = *options.memory_node;
+        constexpr std::size_t kBitsPerWord =
+            sizeof(unsigned long) * static_cast<std::size_t>(CHAR_BIT);
+        if (node == std::numeric_limits<unsigned long>::max()) {
+            *error = "--memory-node is too large for set_mempolicy";
+            return false;
+        }
+        std::vector<unsigned long> mask(node / kBitsPerWord + 1U, 0UL);
+        mask[node / kBitsPerWord] |=
+            1UL << static_cast<unsigned int>(node % kBitsPerWord);
+        if (mask.size() >
+            std::numeric_limits<std::size_t>::max() / kBitsPerWord) {
+            *error = "NUMA nodemask bit count overflows size_t";
+            return false;
+        }
+        // set_mempolicy consumes a nodemask bit width. Pass the complete
+        // allocated words so the selected bit cannot be truncated by the ABI.
+        const std::size_t mask_bits = mask.size() * kBitsPerWord;
+        if (mask_bits >
+            static_cast<std::size_t>(
+                std::numeric_limits<unsigned long>::max())) {
+            *error = "NUMA nodemask is too large for set_mempolicy";
+            return false;
+        }
+        const unsigned long maximum_node =
+            static_cast<unsigned long>(mask_bits);
+        if (::syscall(SYS_set_mempolicy, MPOL_BIND, mask.data(),
+                      maximum_node) != 0) {
+            *error = "set_mempolicy(MPOL_BIND) failed: " +
+                     std::string(std::strerror(errno));
+            return false;
+        }
+#else
+        *error = "set_mempolicy is unavailable on this Linux architecture";
+        return false;
+#endif
+    }
+    return true;
+#else
+    if (!options.process_cpu_list.empty() || options.memory_node.has_value()) {
+        *error = "process placement is supported only on Linux";
+        return false;
+    }
+    return true;
+#endif
+}
+
 [[nodiscard]] bool ParseOptions(int argc,
                                 char** argv,
                                 Options* output,
@@ -433,6 +898,15 @@ template <typename Integer>
                 *error = "invalid --first-decoder-cpu";
                 return false;
             }
+        } else if (argument == "--process-cpus") {
+            parsed.process_cpu_list = next(argument);
+        } else if (argument == "--memory-node") {
+            std::size_t node = 0U;
+            if (!ParseInteger(next(argument), &node)) {
+                *error = "invalid --memory-node";
+                return false;
+            }
+            parsed.memory_node = node;
         } else if (argument == "--partial-initial-hold-ns") {
             if (!ParseInteger(next(argument),
                               &parsed.engine.partial_initial_hold_ns)) {
@@ -1175,6 +1649,9 @@ template <typename Integer>
         *error = "--run-seconds is available only in test operation mode";
         return false;
     }
+    if (!ValidateProcessPlacement(parsed, error)) {
+        return false;
+    }
     *output = std::move(parsed);
     return true;
 }
@@ -1532,11 +2009,30 @@ void PrintFinalLatency(const LatencyAggregate& latency) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    for (int index = 1; index < argc; ++index) {
+        if (std::string_view(argv[index]) == "--help") {
+            PrintUsage();
+            return 0;
+        }
+    }
+    ExpandedArguments expanded_arguments;
     Options options{};
     std::string error;
-    if (!ParseOptions(argc, argv, &options, &error)) {
+    if (!ExpandConfigurationArguments(
+            argc, argv, &expanded_arguments, &error)) {
+        std::cerr << "configuration error: " << error << '\n';
+        return 2;
+    }
+    if (!ParseOptions(
+            static_cast<int>(expanded_arguments.pointers.size()),
+            expanded_arguments.pointers.data(), &options, &error)) {
         std::cerr << "configuration error: " << error << '\n';
         PrintUsage();
+        return 2;
+    }
+    if (!options.validate_only &&
+        !ApplyProcessPlacement(options, &error)) {
+        std::cerr << "process placement error: " << error << '\n';
         return 2;
     }
     InstrumentCatalog catalog;

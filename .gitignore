@@ -1,6 +1,7 @@
 /build*/
 /artifacts/
 *.log
+/config/current-server.production.env
 /python/.venv/
 __pycache__/
 *.py[cod]

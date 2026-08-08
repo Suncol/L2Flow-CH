@@ -130,6 +130,9 @@ endif()
 add_executable(mdl_ingestd apps/mdl_ingestd.cpp)
 l2flow_ch_configure(mdl_ingestd)
 target_link_libraries(mdl_ingestd PRIVATE L2FlowCH::ingest)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_compile_definitions(mdl_ingestd PRIVATE _GNU_SOURCE)
+endif()
 if(L2FLOW_CH_ENABLE_ARROW_RING)
     target_link_libraries(mdl_ingestd PRIVATE L2FlowCH::arrow)
     target_compile_definitions(mdl_ingestd PRIVATE
@@ -350,14 +353,114 @@ if(L2FLOW_CH_BUILD_TESTS)
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --run-seconds 1
             --validate-only)
+    add_test(
+        NAME mdl_ingest_config_file
+        COMMAND ${CMAKE_COMMAND} -E env
+            L2FLOW_CONFIG_TEST_TRADE_DATE=20260808
+            L2FLOW_CONFIG_TEST_CATALOG=${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            $<TARGET_FILE:mdl_ingestd>
+            --operation-mode test
+            --config
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/mdl_ingestd-valid.conf
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_config_missing_environment
+        COMMAND ${CMAKE_COMMAND} -E env
+            --unset=L2FLOW_CONFIG_TEST_REQUIRED_UNSET
+            $<TARGET_FILE:mdl_ingestd>
+            --config
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/mdl_ingestd-missing-env.conf
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_config_rejects_malformed_line
+        COMMAND mdl_ingestd
+            --config
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/mdl_ingestd-malformed.conf
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_config_rejects_malformed_environment
+        COMMAND mdl_ingestd
+            --config
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/mdl_ingestd-malformed-env.conf
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_config_rejects_nested_config
+        COMMAND mdl_ingestd
+            --config
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/mdl_ingestd-nested.conf
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_process_cpu_list
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260808
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --process-cpus 0-1,3
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_rejects_malformed_cpu_list
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260808
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --process-cpus 3-1
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_rejects_decoder_outside_process_cpus
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260808
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --tick-lanes 2
+            --snapshot-lanes 1
+            --first-decoder-cpu 0
+            --process-cpus 0-1
+            --validate-only)
+    if(L2FLOW_CH_ENABLE_ARROW_RING AND L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        add_test(
+            NAME mdl_ingest_current_server_production_config
+            COMMAND ${CMAKE_COMMAND} -E env
+                L2FLOW_START_MODE=partial
+                L2FLOW_TRADE_DATE=20260808
+                L2FLOW_CATALOG=${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                L2FLOW_MDL_USER=config-test
+                L2FLOW_CLICKHOUSE_USER=default
+                L2FLOW_CLICKHOUSE_PASSWORD=
+                L2FLOW_SOURCE_INSTANCE_HEX32=000102030405060708090a0b0c0d0e0f
+                L2FLOW_RAW_FEED_EPOCH=42
+                L2FLOW_ARROW_FEED_EPOCH=43
+                L2FLOW_EVENT_REVISION_EPOCH=9
+                L2FLOW_EVENT_RUN_HEX32=101112131415161718191a1b1c1d1e1f
+                L2FLOW_KLINE_INTERVAL_SECONDS=5
+                L2FLOW_KLINE_REVISION_EPOCH=10
+                L2FLOW_KLINE_RUN_HEX32=202122232425262728292a2b2c2d2e2f
+                $<TARGET_FILE:mdl_ingestd>
+                --config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/current-server.production.conf
+                --validate-only)
+    endif()
     set_tests_properties(
         mdl_ingest_live_rejects_run_seconds
-        mdl_ingest_rejects_zero_ready_timeout PROPERTIES WILL_FAIL TRUE)
+        mdl_ingest_rejects_zero_ready_timeout
+        mdl_ingest_config_missing_environment
+        mdl_ingest_config_rejects_malformed_line
+        mdl_ingest_config_rejects_malformed_environment
+        mdl_ingest_config_rejects_nested_config
+        mdl_ingest_rejects_malformed_cpu_list
+        mdl_ingest_rejects_decoder_outside_process_cpus
+        PROPERTIES WILL_FAIL TRUE)
     set_tests_properties(
         mdl_ingest_default_config
         mdl_ingest_test_operation_mode
         mdl_ingest_custom_ready_timeout
+        mdl_ingest_config_file
+        mdl_ingest_process_cpu_list
         PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    if(L2FLOW_CH_ENABLE_ARROW_RING AND L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        set_tests_properties(
+            mdl_ingest_current_server_production_config
+            PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
 endif()
 
 if(L2FLOW_CH_BUILD_BENCHMARKS)
