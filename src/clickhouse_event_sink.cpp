@@ -16,6 +16,7 @@
 #include <limits>
 #include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1045,7 +1046,8 @@ public:
     }
 
     [[nodiscard]] bool Stop(std::string* error) noexcept {
-        std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(
+            lifecycle_mutex_);
         if (!started_.load(std::memory_order_acquire)) {
             if (error != nullptr) {
                 error->clear();
@@ -1097,7 +1099,8 @@ public:
 
     [[nodiscard]] bool AppendRevisionBatch(
         std::shared_ptr<const EventRevisionBatch> batch) noexcept {
-        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        std::shared_lock<std::shared_mutex> lifecycle_lock(
+            lifecycle_mutex_);
         if (!accepting_.load(std::memory_order_acquire) || !healthy() ||
             batch == nullptr || !ValidRevisionBatch(*batch)) {
             return false;
@@ -1425,7 +1428,7 @@ private:
     AtomicStats stats_{};
     std::vector<std::unique_ptr<Lane>> lanes_;
     mutable std::mutex queue_budget_mutex_;
-    mutable std::mutex lifecycle_mutex_;
+    mutable std::shared_mutex lifecycle_mutex_;
     std::size_t queued_batches_ = 0U;
     std::size_t queued_rows_ = 0U;
     std::atomic<std::uint64_t> next_sink_batch_sequence_{1U};
