@@ -7,7 +7,9 @@
 #endif
 
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+#include "l2flow/clickhouse/event_sink.h"
 #include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/event/runtime.h"
 #endif
 
 #include <algorithm>
@@ -21,6 +23,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -75,8 +78,11 @@ struct Options final {
 #endif
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     l2flow::clickhouse::RawClickHouseConfig clickhouse{};
+    l2flow::clickhouse::EventClickHouseConfig clickhouse_event{};
+    l2flow::event::EventRuntimeConfig event{};
     std::string clickhouse_password_environment;
     bool clickhouse_enabled = false;
+    bool event_enabled = false;
 #endif
 };
 
@@ -242,6 +248,23 @@ void PrintUsage() {
         << "  --clickhouse-insert-quorum N default 0 (local/no quorum)\n"
         << "  --clickhouse-no-auto-create use externally managed tables\n"
         << "  --clickhouse-no-tls-verify disable HTTPS peer verification\n"
+        << "  --event-enable             enable Event projection; publish after raw ACK\n"
+        << "  --event-revision-epoch N   required nonzero monotone writer epoch\n"
+        << "  --event-calculation-run-id HEX32 required calculation identity\n"
+        << "  --event-logic-version N    default 1\n"
+        << "  --event-micro-batch-rows N default 256\n"
+        << "  --event-micro-batch-max-delay-ns N default 1000000\n"
+        << "  --event-insert-chunk-rows N default 16384\n"
+        << "  --event-queue-revision-batches N default 1024\n"
+        << "  --event-queue-revision-rows N default 1048576\n"
+        << "  --event-maximum-facts N    default 4194304 per owner\n"
+        << "  --event-maximum-orders N   default 2097152 per owner\n"
+        << "  --event-maximum-cached-events N default 16777216 per owner\n"
+        << "  --event-maximum-pending-commits N default 1024 per owner\n"
+        << "  --event-repair-slice-max-order-uses N default 4096\n"
+        << "  --event-repair-slice-max-cpu-ns N default 500000\n"
+        << "  --event-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
+        << "  --event-maximum-late-backlog N default 4096 per owner\n"
 #endif
         << "  --run-seconds N            test mode only; 0 means until signal, "
            "max 86400\n"
@@ -278,6 +301,9 @@ template <typename Integer>
     bool clickhouse_option_seen = false;
     bool clickhouse_feed_epoch_set = false;
     bool clickhouse_source_instance_set = false;
+    bool event_option_seen = false;
+    bool event_revision_epoch_set = false;
+    bool event_calculation_run_id_set = false;
 #endif
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -532,6 +558,135 @@ template <typename Integer>
         } else if (argument == "--clickhouse-no-tls-verify") {
             parsed.clickhouse.tls_verify_peer = false;
             clickhouse_option_seen = true;
+        } else if (argument == "--event-enable") {
+            parsed.event_enabled = true;
+            event_option_seen = true;
+        } else if (argument == "--event-revision-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.worker.revision_epoch)) {
+                *error = "invalid --event-revision-epoch";
+                return false;
+            }
+            event_revision_epoch_set = true;
+            event_option_seen = true;
+        } else if (argument == "--event-calculation-run-id") {
+            if (!l2flow::clickhouse::ParseIdentifier(
+                    next(argument),
+                    &parsed.event.worker.calculation_run_id)) {
+                *error =
+                    "--event-calculation-run-id must be 32 hex digits";
+                return false;
+            }
+            event_calculation_run_id_set = true;
+            event_option_seen = true;
+        } else if (argument == "--event-logic-version") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.worker.logic_version)) {
+                *error = "invalid --event-logic-version";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-micro-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.micro_batch_rows)) {
+                *error = "invalid --event-micro-batch-rows";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-micro-batch-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.micro_batch_max_delay_ns)) {
+                *error = "invalid --event-micro-batch-max-delay-ns";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-insert-chunk-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event.insert_chunk_rows)) {
+                *error = "invalid --event-insert-chunk-rows";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-queue-revision-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_event.queue_revision_batches)) {
+                *error = "invalid --event-queue-revision-batches";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-queue-revision-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_event.queue_revision_rows)) {
+                *error = "invalid --event-queue-revision-rows";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-facts") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.worker.maximum_facts)) {
+                *error = "invalid --event-maximum-facts";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-orders") {
+            if (!ParseInteger(next(argument),
+                              &parsed.event.worker.maximum_orders)) {
+                *error = "invalid --event-maximum-orders";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-cached-events") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.maximum_cached_events)) {
+                *error = "invalid --event-maximum-cached-events";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-pending-commits") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.maximum_pending_commits)) {
+                *error = "invalid --event-maximum-pending-commits";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument ==
+                   "--event-repair-slice-max-order-uses") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.repair_slice_max_order_uses)) {
+                *error =
+                    "invalid --event-repair-slice-max-order-uses";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-repair-slice-max-cpu-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.repair_slice_max_cpu_ns)) {
+                *error = "invalid --event-repair-slice-max-cpu-ns";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-raw-ack-backlog") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.maximum_raw_ack_backlog_per_owner)) {
+                *error = "invalid --event-maximum-raw-ack-backlog";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-maximum-late-backlog") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.maximum_late_backlog_per_owner)) {
+                *error = "invalid --event-maximum-late-backlog";
+                return false;
+            }
+            event_option_seen = true;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         } else if (argument == "--arrow-ring-dir") {
@@ -637,6 +792,10 @@ template <typename Integer>
     }
     bool output_configured = parsed.allow_discard_after_dispatch;
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (event_option_seen && !parsed.event_enabled) {
+        *error = "Event options require --event-enable";
+        return false;
+    }
     if (clickhouse_option_seen && !parsed.clickhouse_enabled) {
         *error = "ClickHouse options require --clickhouse-url";
         return false;
@@ -672,6 +831,67 @@ template <typename Integer>
             return false;
         }
         output_configured = true;
+    }
+    if (parsed.event_enabled) {
+        if (!parsed.clickhouse_enabled) {
+            *error = "--event-enable requires durable --clickhouse-url raw "
+                     "output";
+            return false;
+        }
+        if (!event_revision_epoch_set ||
+            parsed.event.worker.revision_epoch == 0U) {
+            *error = "--event-enable requires a nonzero "
+                     "--event-revision-epoch";
+            return false;
+        }
+        if (!event_calculation_run_id_set ||
+            parsed.event.worker.calculation_run_id ==
+                l2flow::common::Identifier128{}) {
+            *error = "--event-enable requires a nonzero "
+                     "--event-calculation-run-id";
+            return false;
+        }
+        parsed.event.worker.trade_date = parsed.engine.trade_date;
+        parsed.event.worker.owner = 0U;
+        if (parsed.engine.instrument_workers >
+            std::numeric_limits<std::uint32_t>::max()) {
+            *error = "--instrument-workers exceeds the Event owner range";
+            return false;
+        }
+        parsed.event.worker.owner_count = static_cast<std::uint32_t>(
+            parsed.engine.instrument_workers);
+
+        parsed.clickhouse_event.endpoint = parsed.clickhouse.endpoint;
+        parsed.clickhouse_event.database = parsed.clickhouse.database;
+        parsed.clickhouse_event.username = parsed.clickhouse.username;
+        parsed.clickhouse_event.password = parsed.clickhouse.password;
+        parsed.clickhouse_event.no_proxy = parsed.clickhouse.no_proxy;
+        parsed.clickhouse_event.connect_timeout_ms =
+            parsed.clickhouse.connect_timeout_ms;
+        parsed.clickhouse_event.request_timeout_ms =
+            parsed.clickhouse.request_timeout_ms;
+        parsed.clickhouse_event.retry_initial_backoff_ms =
+            parsed.clickhouse.retry_initial_backoff_ms;
+        parsed.clickhouse_event.retry_max_backoff_ms =
+            parsed.clickhouse.retry_max_backoff_ms;
+        parsed.clickhouse_event.maximum_retry_elapsed_ms =
+            parsed.clickhouse.maximum_retry_elapsed_ms;
+        parsed.clickhouse_event.shutdown_timeout_ms =
+            parsed.clickhouse.shutdown_timeout_ms;
+        parsed.clickhouse_event.insert_quorum =
+            parsed.clickhouse.insert_quorum;
+        parsed.clickhouse_event.insert_quorum_parallel =
+            parsed.clickhouse.insert_quorum_parallel;
+        parsed.clickhouse_event.ensure_local_tables =
+            parsed.clickhouse.ensure_local_tables;
+        parsed.clickhouse_event.tls_verify_peer =
+            parsed.clickhouse.tls_verify_peer;
+        if (!l2flow::event::ValidateEventRuntimeConfig(
+                parsed.event, error) ||
+            !l2flow::clickhouse::ValidateEventClickHouseConfig(
+                parsed.clickhouse_event, error)) {
+            return false;
+        }
     }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -734,6 +954,44 @@ void PrintClickHouseStats(
               << " clickhouse_unacked_batches=" << stats.unacked_batches
               << " clickhouse_preallocated_canonical_bytes="
               << stats.preallocated_canonical_bytes << '\n';
+}
+
+void PrintEventStats(
+    const l2flow::event::EventRuntimeStats& runtime,
+    const l2flow::clickhouse::EventClickHouseStats& sink) {
+    std::cout << "event_normal_in=" << runtime.normal_ticks_received
+              << " event_late_in=" << runtime.late_ticks_received
+              << " event_raw_acks=" << runtime.raw_tick_acks_received
+              << " event_micro_batches=" << runtime.micro_batches_applied
+              << " event_facts=" << runtime.workers.facts_journaled
+              << " event_repaired_uses="
+              << runtime.workers.repaired_order_uses
+              << " event_convergence_stops="
+              << runtime.workers.repair_convergence_stops
+              << " event_repair_slices="
+              << runtime.workers.repair_slices
+              << " event_repair_commits="
+              << runtime.workers.repair_commits
+              << " event_repair_restarts="
+              << runtime.workers.repair_order_restarts
+              << " event_active_repair_orders="
+              << runtime.workers.active_repair_orders
+              << " event_revisions=" << runtime.workers.revisions_created
+              << " event_pending_raw="
+              << runtime.workers.pending_raw_commits
+              << " event_ack_index="
+              << runtime.workers.acknowledged_raw_dependencies
+              << " event_sink_batches_queued="
+              << sink.revision_batches_queued
+              << " event_sink_batches_acked="
+              << sink.revision_batches_acked
+              << " event_sink_rows_acked=" << sink.revision_rows_acked
+              << " event_recovery_runs_committed="
+              << sink.recovery_runs_committed
+              << " event_sink_retry_attempts=" << sink.retry_attempts
+              << " event_sink_unknown_outcomes=" << sink.unknown_outcomes
+              << " event_sink_queued_rows=" << sink.queued_revision_rows
+              << '\n';
 }
 #endif
 
@@ -1000,7 +1258,26 @@ int main(int argc, char** argv) {
         return 2;
     }
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    std::unique_ptr<l2flow::clickhouse::EventClickHouseSink> clickhouse_event;
+    std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
     std::unique_ptr<l2flow::clickhouse::RawClickHouseSink> clickhouse_raw;
+    if (options.event_enabled && !options.validate_only) {
+        clickhouse_event =
+            l2flow::clickhouse::EventClickHouseSink::Create(
+                options.clickhouse_event, &error);
+        if (clickhouse_event == nullptr) {
+            std::cerr << "ClickHouse Event sink creation failed: "
+                      << error << '\n';
+            return 1;
+        }
+        event_runtime = l2flow::event::EventRuntime::Create(
+            options.event, clickhouse_event.get(), &error);
+        if (event_runtime == nullptr) {
+            std::cerr << "Event runtime creation failed: " << error << '\n';
+            return 1;
+        }
+        options.clickhouse.tick_ack_listener = event_runtime.get();
+    }
     if (options.clickhouse_enabled && !options.validate_only) {
         clickhouse_raw = l2flow::clickhouse::RawClickHouseSink::Create(
             options.clickhouse, &error);
@@ -1046,8 +1323,30 @@ int main(int argc, char** argv) {
     const auto arrow_healthy = [] { return true; };
 #endif
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (clickhouse_event != nullptr) {
+        if (!clickhouse_event->Start(&error)) {
+            std::cerr << "ClickHouse Event sink start failed: " << error
+                      << '\n';
+            return 1;
+        }
+        std::cout << "clickhouse_event_writer_instance="
+                  << l2flow::clickhouse::IdentifierString(
+                         clickhouse_event->writer_instance_id())
+                  << " calculation_run_id="
+                  << l2flow::clickhouse::IdentifierString(
+                         options.event.worker.calculation_run_id)
+                  << " revision_epoch="
+                  << options.event.worker.revision_epoch
+                  << " logic_version="
+                  << options.event.worker.logic_version << '\n';
+    }
     if (clickhouse_raw != nullptr) {
         if (!clickhouse_raw->Start(&error)) {
+            if (clickhouse_event != nullptr) {
+                std::string event_stop_error;
+                static_cast<void>(
+                    clickhouse_event->Stop(&event_stop_error));
+            }
             std::cerr << "ClickHouse raw sink start failed: " << error
                       << '\n';
             return 1;
@@ -1066,8 +1365,14 @@ int main(int argc, char** argv) {
             << clickhouse_raw->run_started_monotonic_ns() << '\n';
         PrintClickHouseStats(clickhouse_raw->stats());
     }
-    const auto clickhouse_healthy = [&clickhouse_raw] {
-        return clickhouse_raw == nullptr || clickhouse_raw->healthy();
+    if (event_runtime != nullptr && clickhouse_event != nullptr) {
+        PrintEventStats(event_runtime->stats(), clickhouse_event->stats());
+    }
+    const auto clickhouse_healthy = [
+        &clickhouse_raw, &clickhouse_event, &event_runtime] {
+        return (clickhouse_raw == nullptr || clickhouse_raw->healthy()) &&
+               (clickhouse_event == nullptr || clickhouse_event->healthy()) &&
+               (event_runtime == nullptr || event_runtime->healthy());
     };
 #else
     const auto clickhouse_healthy = [] { return true; };
@@ -1077,6 +1382,13 @@ int main(int argc, char** argv) {
         if (clickhouse_raw != nullptr) {
             std::string stop_error;
             static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+        if (event_runtime != nullptr) {
+            static_cast<void>(event_runtime->DrainAll());
+        }
+        if (clickhouse_event != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_event->Stop(&stop_error));
         }
 #endif
         std::cerr << "engine start failed: " << error << '\n';
@@ -1129,6 +1441,12 @@ int main(int argc, char** argv) {
                             arrow_egress->AppendTick(owner, tick));
                     }
 #endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                    if (event_runtime != nullptr) {
+                        static_cast<void>(
+                            event_runtime->AppendTick(owner, tick));
+                    }
+#endif
                     consumed_ticks.fetch_add(1U, std::memory_order_relaxed);
                     progress = true;
                 }
@@ -1177,6 +1495,13 @@ int main(int argc, char** argv) {
                                     late_recovery));
                         }
 #endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                        if (event_runtime != nullptr) {
+                            static_cast<void>(
+                                event_runtime->AppendLateRecovery(
+                                    late_recovery));
+                        }
+#endif
                         consumed_late_recovery.fetch_add(
                             1U, std::memory_order_relaxed);
                         progress = true;
@@ -1200,6 +1525,12 @@ int main(int argc, char** argv) {
                 if (arrow_egress != nullptr) {
                     arrow_egress->FlushDue(
                         owner, l2flow::ingest::MonotonicNowNs());
+                }
+#endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                if (event_runtime != nullptr) {
+                    static_cast<void>(event_runtime->FlushDue(
+                        owner, l2flow::ingest::MonotonicNowNs()));
                 }
 #endif
                 if (!progress) {
@@ -1245,11 +1576,33 @@ int main(int argc, char** argv) {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     bool clickhouse_stop_ok = true;
     std::string clickhouse_stop_error;
+    bool event_flush_ok = true;
+    bool event_drain_ok = true;
+    bool event_stop_ok = true;
+    std::string event_stop_error;
+    const auto flush_event_runtime = [&] {
+        if (event_runtime != nullptr) {
+            event_flush_ok = event_runtime->FlushAll();
+        }
+    };
     const auto stop_clickhouse_raw = [&] {
         if (clickhouse_raw != nullptr) {
             clickhouse_stop_ok =
                 clickhouse_raw->Stop(&clickhouse_stop_error);
             PrintClickHouseStats(clickhouse_raw->stats());
+        }
+    };
+    const auto stop_clickhouse_event = [&] {
+        if (event_runtime != nullptr) {
+            event_drain_ok = event_runtime->DrainAll();
+        }
+        if (clickhouse_event != nullptr) {
+            event_stop_ok =
+                clickhouse_event->Stop(&event_stop_error);
+        }
+        if (event_runtime != nullptr && clickhouse_event != nullptr) {
+            PrintEventStats(
+                event_runtime->stats(), clickhouse_event->stats());
         }
     };
 #endif
@@ -1260,7 +1613,9 @@ int main(int argc, char** argv) {
     if (sdk == nullptr) {
         stop_engine_and_drain();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        flush_event_runtime();
         stop_clickhouse_raw();
+        stop_clickhouse_event();
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         if (arrow_egress != nullptr) {
@@ -1292,6 +1647,10 @@ int main(int argc, char** argv) {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
             if (clickhouse_raw != nullptr) {
                 PrintClickHouseStats(clickhouse_raw->stats());
+            }
+            if (event_runtime != nullptr && clickhouse_event != nullptr) {
+                PrintEventStats(
+                    event_runtime->stats(), clickhouse_event->stats());
             }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -1337,6 +1696,10 @@ int main(int argc, char** argv) {
                 if (clickhouse_raw != nullptr) {
                     PrintClickHouseStats(clickhouse_raw->stats());
                 }
+                if (event_runtime != nullptr && clickhouse_event != nullptr) {
+                    PrintEventStats(
+                        event_runtime->stats(), clickhouse_event->stats());
+                }
 #endif
                 previous_stats = current_stats;
                 previous_report_time = now;
@@ -1353,7 +1716,9 @@ int main(int argc, char** argv) {
     sdk->Shutdown();
     stop_engine_and_drain();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    flush_event_runtime();
     stop_clickhouse_raw();
+    stop_clickhouse_event();
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     if (arrow_egress != nullptr) {
@@ -1373,6 +1738,21 @@ int main(int argc, char** argv) {
         PrintFinalLatency(*latency_aggregate);
     }
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (event_runtime != nullptr &&
+        (!event_flush_ok || !event_drain_ok || !event_runtime->healthy())) {
+        std::cerr << "fatal Event runtime error: "
+                  << event_runtime->fatal_error() << '\n';
+        return 1;
+    }
+    if (clickhouse_event != nullptr &&
+        (!event_stop_ok || !clickhouse_event->healthy())) {
+        std::cerr << "fatal ClickHouse Event sink error: "
+                  << (event_stop_error.empty()
+                          ? clickhouse_event->fatal_error()
+                          : event_stop_error)
+                  << '\n';
+        return 1;
+    }
     if (clickhouse_raw != nullptr &&
         (!clickhouse_stop_ok || !clickhouse_raw->healthy())) {
         std::cerr << "fatal ClickHouse raw sink error: "

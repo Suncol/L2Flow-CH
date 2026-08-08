@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l2flow/common/identifier.h"
 #include "l2flow/ingest/raw_tap.h"
 
 #include <array>
@@ -12,15 +13,10 @@
 
 namespace l2flow::clickhouse {
 
+using Identifier128 = common::Identifier128;
+
 inline constexpr std::uint32_t kRawTickSchemaVersion = 1U;
 inline constexpr std::uint32_t kRawSnapshotSchemaVersion = 1U;
-
-struct Identifier128 final {
-    std::array<std::byte, 16U> bytes{};
-
-    friend constexpr bool operator==(const Identifier128&,
-                                     const Identifier128&) = default;
-};
 
 [[nodiscard]] std::string IdentifierString(Identifier128 identifier);
 [[nodiscard]] bool ParseIdentifier(std::string_view text,
@@ -71,6 +67,10 @@ struct RawClickHouseConfig final {
     std::size_t snapshot_batch_bytes = 16U * 1'024U * 1'024U;
     std::uint64_t snapshot_batch_max_delay_ns = 20'000'000U;
     std::size_t snapshot_queue_batches_per_lane = 8U;
+
+    // Optional per-occurrence durability bridge for derived Event workers.
+    // Its lifetime must cover this sink's Start through Stop interval.
+    ingest::RawTickBatchAckListener* tick_ack_listener = nullptr;
 
     std::uint32_t connect_timeout_ms = 2'000U;
     std::uint32_t request_timeout_ms = 10'000U;

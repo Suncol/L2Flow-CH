@@ -11,6 +11,8 @@ MDL SDK callback
   -> exchange-native channel sequence recovery
   -> fixed-width canonical records
   -> instrument-owner dispatch queues + gap/LateRecovery controls
+       -> owner-local Event journal and minimal-closure projection
+       -> raw ACK gate -> Event revision log/current ClickHouse tables
   -> per-owner shared-memory Arrow rings + Python/Polars reader
 ```
 
@@ -18,8 +20,12 @@ MDL SDK callback
 repository. The raw tap runs after complete decode/normalization and before
 SequenceRecovery, duplicate/conflict handling, and catalog-miss suppression.
 The shared-memory Arrow branch remains an independent bounded volatile hot
-path. Event/KLine workers and historical reconciliation remain outside this
-milestone. The supported startup modes are `from-open` and `partial`.
+path. The optional Event runtime consumes the ordered and `LateRecovery`
+branches, journals each micro-batch before projection, and publishes immutable
+revision batches only after the corresponding `raw_tick` occurrences are
+acknowledged. KLine workers, cold Event-state bootstrap, and historical
+reconciliation remain outside this milestone. The supported startup modes are
+`from-open` and `partial`.
 
 ## Build and test
 
@@ -60,7 +66,9 @@ lifecycle, MergeTree smoke-test, restart-persistence, and Python client tools.
 The raw table DDL is in [clickhouse/schema/raw_tables.sql](clickhouse/schema/raw_tables.sql)
 for a local node and
 [clickhouse/schema/raw_tables_replicated.sql](clickhouse/schema/raw_tables_replicated.sql)
-for a Keeper-backed deployment.
+for a Keeper-backed deployment. Event revision/current DDL is in
+[clickhouse/schema/event_tables.sql](clickhouse/schema/event_tables.sql) and
+[clickhouse/schema/event_tables_replicated.sql](clickhouse/schema/event_tables_replicated.sql).
 
 Run the C++ raw writer integration test against that local instance with:
 
@@ -68,6 +76,8 @@ Run the C++ raw writer integration test against that local instance with:
 ./clickhouse-test/start.sh
 L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
   ./build/test_clickhouse_raw
+L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
+  ./build/test_clickhouse_event
 ```
 
 Optional checks:
@@ -179,6 +189,22 @@ Example local raw launch arguments are:
 --clickhouse-source-instance-id <stable 32-hex source ID>
 ```
 
+Enable the Event projection on top of that durable raw path with:
+
+```text
+--event-enable
+--event-revision-epoch <durably allocated nonzero monotone epoch>
+--event-calculation-run-id <unique 32-hex calculation run ID>
+--event-logic-version 1
+```
+
+The revision epoch occupies the high 32 bits of each Event version and must be
+strictly larger than every epoch previously used for the same logical Event
+key space. `mdl_ingestd` validates that it is nonzero but does not allocate or
+persist it. The detailed ordering, repair, raw-ACK, ClickHouse current-table,
+and restart boundaries are documented in
+[docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
+
 For replicated production tables, provision the external DDL, add
 `--clickhouse-no-auto-create`, and set the required quorum, normally
 `--clickhouse-insert-quorum 2`.
@@ -201,6 +227,13 @@ deployment rules, and Python API are documented in
 The ClickHouse ACK, batching, retry, replay-order, schema, and overload
 contracts are documented in
 [docs/clickhouse-raw-path.md](docs/clickhouse-raw-path.md).
+The Event journal, minimal-closure repair, stable-key, revision, and current
+query contracts are documented in
+[docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
+The measured Event worker → ClickHouse throughput limits, 800k/1M short-window
+results, 30-second fail-closed qualification runs, and ClickHouse query-log
+latencies are in
+[docs/event-worker-clickhouse-benchmark-report.md](docs/event-worker-clickhouse-benchmark-report.md).
 
 `from-open` and `partial` both default to a 500,000 ns gap wait. The two
 settings remain independent (`--from-open-gap-wait-ns` and

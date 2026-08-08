@@ -4,8 +4,21 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace l2flow::ingest {
+
+// Called by a durable raw sink only after one exact raw_tick INSERT has been
+// acknowledged. Implementations must remain noexcept. Returning false is a
+// continuity failure: derived revisions can no longer prove their raw facts
+// durable, so the raw sink stops instead of silently dropping the boundary.
+class RawTickBatchAckListener {
+public:
+    virtual ~RawTickBatchAckListener() = default;
+
+    [[nodiscard]] virtual bool OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick> ticks) noexcept = 0;
+};
 
 // A RawRecordTap is owned by the process boundary and called only by the
 // corresponding decoder lane. Implementations must keep Append/Poll bounded

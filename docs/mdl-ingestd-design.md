@@ -20,8 +20,13 @@ change the recovery contract below. It can also attach the raw ClickHouse sink
 described in [`clickhouse-raw-path.md`](clickhouse-raw-path.md). That sink taps
 decode-complete canonical facts before recovery and persists them in
 `raw_tick`/`raw_snapshot`; its in-memory queues are not a WAL. The repository
-does not contain CSV/WAL replay, checkpoint restore, reconnect epoch inference,
-or intraday restart reconciliation. Startup is exactly one of:
+also contains the optional owner-local Event projection and ClickHouse
+revision sink described in
+[`event-worker-clickhouse.md`](event-worker-clickhouse.md). Event calculation
+consumes ordered and `LateRecovery` ticks, while publication is gated by the
+corresponding raw ACKs. The repository does not contain CSV/WAL replay,
+checkpoint restore, reconnect epoch inference, cold Event bootstrap, or
+intraday restart reconciliation. Startup is exactly one of:
 
 - `from-open`: the process claims coverage beginning at native sequence 1;
 - `partial`: the process claims only a bounded process-start suffix and never
@@ -122,6 +127,11 @@ is likewise not claimed.
 - For `mdl_ingestd`, the configured stream file is the source of physical
   subscriptions. There is no special-case protection for any unselected
   tuple.
+- Event projection is optional and requires the durable raw ClickHouse path.
+  Revision batches are computed in memory but cannot enter the Event sink
+  before all raw occurrences in their pending FIFO entry are ACKed. A raw ACK
+  listener failure, Event repair/index capacity failure, or Event sink queue
+  failure is a sticky process boundary.
 - The default stream file selects the five implemented Shanghai/Shenzhen
   L2 message families used for A-share processing. Tuple subscription and
   instrument-universe filtering are separate: the immutable daily catalog is
@@ -303,8 +313,10 @@ bodies each use one SPSC queue per tick lane and one fair single-consumer
 endpoint. Gap state uses the fixed per-lane/per-Channel mailbox and dirty
 bitmap described above.
 
-The next Event/KLine stage must give each owner index to exactly one consumer.
-Calling one owner endpoint from multiple consumers violates the SPSC contract.
+The executable gives each owner endpoint to exactly one drain thread. That
+thread also owns the corresponding Event worker when Event output is enabled.
+A future KLine stage must preserve the same single-consumer rule; calling one
+owner endpoint from multiple consumers violates the SPSC contract.
 
 ## 7. 64-core / 1-TiB deployment starting point
 
@@ -318,7 +330,7 @@ The defaults are a starting point, not a measured production guarantee:
   reorder slabs.
 
 On a 64-core host, reserve cores for the OS/IRQs, the vendor SDK, ClickHouse
-writer threads, and future Event/KLine stages. Pin decoder lanes only after
+writer threads, Event owners, and future KLine stages. Pin decoder lanes only after
 measuring the actual NUMA topology; a flat logical CPU number does not identify
 socket locality.
 Keep the SDK callback and its hottest decoder lanes in the same NUMA domain
@@ -353,6 +365,8 @@ snapshot dispatch   = snapshot_lanes * owners * edge_capacity * sizeof(snapshot)
 reorder             = observed_channels * reorder_entries * sizeof(pending tick)
 late recovery       = tick_lanes * late_capacity * sizeof(late canonical tick)
 gap state           = tick_lanes * max_channels * sizeof(gap mailbox slot)
+Event facts/uses    = accepted intraday facts plus up to two order roles each
+Event bundles       = current Event rows retained by owner-local BundleCache
 ```
 
 A 1-TiB deployment has ample capacity, but oversized queues increase cold-page,
@@ -360,14 +374,15 @@ TLB, and cache cost. Increase them only from burst and latency measurements.
 
 ## 8. Lifecycle and failure boundaries
 
-Startup order is catalog/stream config -> raw batch preallocation ->
-ClickHouse schema/health check and writer threads -> engine preallocation ->
+Startup order is catalog/stream config -> raw/Event object preallocation ->
+Event ClickHouse schema validation and writer thread when enabled -> raw
+ClickHouse schema validation and writer threads -> engine preallocation ->
 decoder threads -> SDK manager/subscriber -> connect. `Connect()` may invoke
-callbacks synchronously, so both the raw sink and engine are running before it
-is called. The physical session is returned only after successful Logon plus
-confirmation of every configured subscription. Market data is admitted only
-after that readiness state. The readiness timeout defaults to 30 seconds and
-is configurable with `--sdk-ready-timeout-seconds`.
+callbacks synchronously, so the sinks, Event runtime, and engine are running
+before it is called. The physical session is returned only after successful
+Logon plus confirmation of every configured subscription. Market data is
+admitted only after that readiness state. The readiness timeout defaults to
+30 seconds and is configurable with `--sdk-ready-timeout-seconds`.
 
 The first connection/discard/readiness boundary is sticky. The handler stops
 admission immediately, so SDK auto-reconnect callbacks cannot enter the old
@@ -383,8 +398,12 @@ Shutdown order is fixed:
 3. release Subscriber, then IOManager;
 4. drain and join decoder lanes, flushing partial raw batches;
 5. drain instrument/fault/LateRecovery queues and final dirty gap state;
-6. wait for every ClickHouse raw batch ACK and stop writer threads;
-7. seal the optional Arrow hot path and destroy the engine/handler.
+6. flush every final partial Event micro-batch;
+7. wait for every ClickHouse raw batch ACK and stop raw writer threads, which
+   delivers final ACK callbacks to the Event runtime;
+8. finish private Event repair, submit all now-durable revision batches, and
+   stop the Event writer after its recovery markers are ACKed;
+9. seal the optional Arrow hot path and destroy the engine/handler.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
 to reach zero before releasing Subscriber and IOManager. If vendor shutdown
@@ -408,12 +427,22 @@ Raw-path tests additionally prove pre-recovery capture of retransmissions and
 catalog misses, fail-closed tap behavior, fixed BLAKE3 provenance vectors,
 preallocation accounting, ArrowStream-to-ClickHouse mapping, nested Snapshot
 levels, Date partitioning, occurrence uniqueness, and explicit replay order.
+Event tests cover journal-first same-batch ordering, cross-batch late Add
+repair, unknown-reference removal, raw-ACK FIFO gating, Shanghai END additions
+and tombstones, phase-status scope, private budgeted repair, per-order
+generation restart, disjoint live publication during repair, multi-owner
+routing, final partial-batch drain, immutable retry bodies, current-table
+replacement/tombstones, recovery markers, and startup rejection of a mismatched
+external schema.
 
-The implementation passes the strict warning build and ASan/UBSan tests in the
-available environment. TSan builds successfully, but execution in the current
-ptrace/container environment terminates before the test with an unsupported
-memory-mapping error; this is an environment limitation, not a passing TSan
-result.
+The implementation passes the strict warning build and the C++ ASan/UBSan
+suite in the available environment. The external Python process in the
+cross-language Arrow test cannot load an ASan-instrumented shared object
+without preloading the ASan runtime, so it is excluded from that sanitizer
+run. TSan requires `setarch x86_64 -R` in this container; with that address
+layout, the Event worker, Event sink retry fixture, and raw sink/ACK listener
+fixture pass. TSan also found and drove the removal of a race in the local HTTP
+test fixture's listener-fd teardown.
 
 The NUMA-pinned synthetic callback benchmark sustained 800k, 1.0M, and 1.2M
 messages/s for five minutes in both ordered and locally reversed test cases,
@@ -429,4 +458,6 @@ still requires:
 - the same pinned NUMA test under production CPU/IRQ isolation with the
   unchanged 500-microsecond default gap policy;
 - fault injection for malformed bodies, lane saturation, slow owners, SDK
-  disconnects, and process termination.
+  disconnects, and process termination;
+- cold Event bootstrap/reconciliation, explicit session Finalize, and durable
+  external allocation of Event revision epochs/calculation-run IDs.

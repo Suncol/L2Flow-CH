@@ -113,7 +113,10 @@ endif()
 if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
     add_library(l2flow_ch_clickhouse STATIC
         src/blake3.cpp
-        src/clickhouse_raw_sink.cpp)
+        src/clickhouse_event_sink.cpp
+        src/clickhouse_raw_sink.cpp
+        src/event_runtime.cpp
+        src/event_worker.cpp)
     add_library(L2FlowCH::clickhouse ALIAS l2flow_ch_clickhouse)
     l2flow_ch_configure(l2flow_ch_clickhouse)
     target_link_libraries(l2flow_ch_clickhouse
@@ -165,6 +168,18 @@ if(L2FLOW_CH_BUILD_TESTS)
         endif()
     endif()
     if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        add_executable(test_event_worker tests/test_event_worker.cpp)
+        l2flow_ch_configure(test_event_worker)
+        target_link_libraries(test_event_worker PRIVATE
+            L2FlowCH::clickhouse)
+        add_test(NAME event_worker COMMAND test_event_worker)
+
+        add_executable(test_clickhouse_event tests/test_clickhouse_event.cpp)
+        l2flow_ch_configure(test_clickhouse_event)
+        target_link_libraries(test_clickhouse_event PRIVATE
+            L2FlowCH::clickhouse)
+        add_test(NAME clickhouse_event COMMAND test_clickhouse_event)
+
         add_executable(test_clickhouse_raw tests/test_clickhouse_raw.cpp)
         l2flow_ch_configure(test_clickhouse_raw)
         target_link_libraries(test_clickhouse_raw PRIVATE
@@ -196,6 +211,38 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --validate-only)
         set_tests_properties(
             mdl_ingest_clickhouse_requires_epoch PROPERTIES WILL_FAIL TRUE)
+        add_test(
+            NAME mdl_ingest_event_config
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --clickhouse-feed-epoch 42
+                --event-enable
+                --event-revision-epoch 9
+                --event-calculation-run-id
+                    000102030405060708090a0b0c0d0e0f
+                --validate-only)
+        add_test(
+            NAME mdl_ingest_event_requires_revision_epoch
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --clickhouse-feed-epoch 42
+                --event-enable
+                --event-calculation-run-id
+                    000102030405060708090a0b0c0d0e0f
+                --validate-only)
+        set_tests_properties(
+            mdl_ingest_event_requires_revision_epoch
+            PROPERTIES WILL_FAIL TRUE)
     endif()
     add_test(
         NAME mdl_ingest_default_config
