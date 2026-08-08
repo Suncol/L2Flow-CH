@@ -68,7 +68,7 @@ struct RawClickHouseConfig final {
     std::uint64_t snapshot_batch_max_delay_ns = 20'000'000U;
     std::size_t snapshot_queue_batches_per_lane = 8U;
 
-    // Optional per-occurrence durability bridge for derived Event workers.
+    // Optional per-occurrence durability bridge for derived workers.
     // Its lifetime must cover this sink's Start through Stop interval.
     ingest::RawTickBatchAckListener* tick_ack_listener = nullptr;
 

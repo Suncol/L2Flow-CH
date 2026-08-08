@@ -13,6 +13,8 @@ MDL SDK callback
   -> instrument-owner dispatch queues + gap/LateRecovery controls
        -> owner-local Event journal and minimal-closure projection
        -> raw ACK gate -> Event revision log/current ClickHouse tables
+       -> owner-local exchange-time KLine projection
+       -> raw ACK gate -> KLine revision log/current ClickHouse tables
   -> per-owner shared-memory Arrow rings + Python/Polars reader
 ```
 
@@ -23,9 +25,11 @@ The shared-memory Arrow branch remains an independent bounded volatile hot
 path. The optional Event runtime consumes the ordered and `LateRecovery`
 branches, journals each micro-batch before projection, and publishes immutable
 revision batches only after the corresponding `raw_tick` occurrences are
-acknowledged. KLine workers, cold Event-state bootstrap, and historical
-reconciliation remain outside this milestone. The supported startup modes are
-`from-open` and `partial`.
+acknowledged. The optional KLine runtime uses only SDK body exchange time for
+window identity and OHLC ordering, revises historical bars from
+`LateRecovery`, and uses the same raw-ACK publication gate. Cold derived-state
+bootstrap and historical restart reconciliation remain outside this
+milestone. The supported startup modes are `from-open` and `partial`.
 
 ## Build and test
 
@@ -69,6 +73,9 @@ for a local node and
 for a Keeper-backed deployment. Event revision/current DDL is in
 [clickhouse/schema/event_tables.sql](clickhouse/schema/event_tables.sql) and
 [clickhouse/schema/event_tables_replicated.sql](clickhouse/schema/event_tables_replicated.sql).
+KLine revision/current DDL is in
+[clickhouse/schema/kline_tables.sql](clickhouse/schema/kline_tables.sql) and
+[clickhouse/schema/kline_tables_replicated.sql](clickhouse/schema/kline_tables_replicated.sql).
 
 Run the C++ raw writer integration test against that local instance with:
 
@@ -78,6 +85,8 @@ L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
   ./build/test_clickhouse_raw
 L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
   ./build/test_clickhouse_event
+L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
+  ./build/test_clickhouse_kline
 ```
 
 Optional checks:
@@ -206,6 +215,26 @@ persist it. The detailed ordering, repair, raw-ACK, ClickHouse current-table,
 and restart boundaries are documented in
 [docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
 
+Enable one or more integer-second KLine intervals on the same durable raw path:
+
+```text
+--kline-enable
+--kline-interval-seconds 1
+--kline-interval-seconds 5
+--kline-revision-epoch <durably allocated nonzero monotone epoch>
+--kline-calculation-run-id <unique 32-hex calculation run ID>
+--kline-logic-version 1
+--kline-writer-lanes <1|2|4|8>
+```
+
+Intervals are repeatable and restricted to 1 through 86,400 seconds. Window
+keys and OHLC order use the valid SDK `TickTime`/`TransactTime` normalized to
+nanoseconds from exchange midnight; host wall time, receive time, and SDK
+header `LocalTime` never substitute for it. Late recovery emits higher-version
+updates to the same logical bar. The exact eligibility, ordering, provisional,
+raw-ACK, and restart contracts are documented in
+[docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
+
 For replicated production tables, provision the external DDL, add
 `--clickhouse-no-auto-create`, and set the required quorum, normally
 `--clickhouse-insert-quorum 2`.
@@ -231,6 +260,9 @@ contracts are documented in
 The Event journal, minimal-closure repair, stable-key, revision, and current
 query contracts are documented in
 [docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
+The exchange-time KLine, late-revision, and ClickHouse current-query contracts
+are documented in
+[docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
 The measured Event worker → ClickHouse throughput limits, 800k/1M short-window
 results, 30-second fail-closed qualification runs, and ClickHouse query-log
 latencies are in

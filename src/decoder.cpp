@@ -31,6 +31,7 @@ static_assert(sizeof(sh::NGTSTick) == 70U);
 static_assert(offsetof(sh::NGTSTick, BizIndex) == 0U);
 static_assert(offsetof(sh::NGTSTick, Channel) == 8U);
 static_assert(offsetof(sh::NGTSTick, SecurityID) == 12U);
+static_assert(offsetof(sh::NGTSTick, TickTime) == 18U);
 static_assert(sizeof(sz::Snapshot300111_v2) == 224U);
 static_assert(offsetof(sz::Snapshot300111_v2, SecurityID) == 14U);
 static_assert(offsetof(sz::Snapshot300111_v2, SecurityIDSource) == 20U);
@@ -38,9 +39,11 @@ static_assert(sizeof(sz::Snapshot300111_v2::BidPriceLevelItem) == 28U);
 static_assert(sizeof(sz::Order300192_v2) == 58U);
 static_assert(offsetof(sz::Order300192_v2, ChannelNo) == 0U);
 static_assert(offsetof(sz::Order300192_v2, ApplSeqNum) == 4U);
+static_assert(offsetof(sz::Order300192_v2, TransactTime) == 50U);
 static_assert(sizeof(sz::Transaction300191_v2) == 70U);
 static_assert(offsetof(sz::Transaction300191_v2, ChannelNo) == 0U);
 static_assert(offsetof(sz::Transaction300191_v2, ApplSeqNum) == 4U);
+static_assert(offsetof(sz::Transaction300191_v2, TransactTime) == 66U);
 
 inline constexpr std::int32_t kNullI32 =
     std::numeric_limits<std::int32_t>::min();

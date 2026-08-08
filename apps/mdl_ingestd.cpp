@@ -8,8 +8,10 @@
 
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
 #include "l2flow/clickhouse/event_sink.h"
+#include "l2flow/clickhouse/kline_sink.h"
 #include "l2flow/clickhouse/raw_sink.h"
 #include "l2flow/event/runtime.h"
+#include "l2flow/kline/runtime.h"
 #endif
 
 #include <algorithm>
@@ -26,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -79,12 +82,43 @@ struct Options final {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     l2flow::clickhouse::RawClickHouseConfig clickhouse{};
     l2flow::clickhouse::EventClickHouseConfig clickhouse_event{};
+    l2flow::clickhouse::KLineClickHouseConfig clickhouse_kline{};
     l2flow::event::EventRuntimeConfig event{};
+    l2flow::kline::KLineRuntimeConfig kline{};
     std::string clickhouse_password_environment;
     bool clickhouse_enabled = false;
     bool event_enabled = false;
+    bool kline_enabled = false;
 #endif
 };
+
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+class RawTickBatchAckFanout final
+    : public l2flow::ingest::RawTickBatchAckListener {
+public:
+    void Configure(l2flow::ingest::RawTickBatchAckListener* first,
+                   l2flow::ingest::RawTickBatchAckListener* second) noexcept {
+        first_ = first;
+        second_ = second;
+    }
+
+    [[nodiscard]] bool OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick> ticks) noexcept override {
+        bool result = true;
+        if (first_ != nullptr) {
+            result = first_->OnRawTickBatchAcknowledged(ticks) && result;
+        }
+        if (second_ != nullptr) {
+            result = second_->OnRawTickBatchAcknowledged(ticks) && result;
+        }
+        return result;
+    }
+
+private:
+    l2flow::ingest::RawTickBatchAckListener* first_ = nullptr;
+    l2flow::ingest::RawTickBatchAckListener* second_ = nullptr;
+};
+#endif
 
 inline constexpr std::uint64_t kLatencySampleEvery = 64U;
 inline constexpr std::size_t kLatencyRingCapacity = 4'096U;
@@ -266,6 +300,22 @@ void PrintUsage() {
         << "  --event-repair-slice-max-cpu-ns N default 500000\n"
         << "  --event-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
         << "  --event-maximum-late-backlog N default 4096 per owner\n"
+        << "  --kline-enable             enable exchange-time KLine projection; publish after raw ACK\n"
+        << "  --kline-interval-seconds N repeatable; default 1; range 1..86400\n"
+        << "  --kline-revision-epoch N   required nonzero monotone writer epoch\n"
+        << "  --kline-calculation-run-id HEX32 required calculation identity\n"
+        << "  --kline-logic-version N    default 1\n"
+        << "  --kline-micro-batch-rows N default 256\n"
+        << "  --kline-micro-batch-max-delay-ns N default 1000000\n"
+        << "  --kline-insert-chunk-rows N default 16384\n"
+        << "  --kline-writer-lanes N (1,2,4,8) default 1\n"
+        << "  --kline-queue-revision-batches N default 1024\n"
+        << "  --kline-queue-revision-rows N default 1048576\n"
+        << "  --kline-maximum-facts N    default 4194304 per owner\n"
+        << "  --kline-maximum-bars N     default 4194304 per owner\n"
+        << "  --kline-maximum-pending-commits N default 1024 per owner\n"
+        << "  --kline-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
+        << "  --kline-maximum-late-backlog N default 4096 per owner\n"
 #endif
         << "  --run-seconds N            test mode only; 0 means until signal, "
            "max 86400\n"
@@ -305,6 +355,10 @@ template <typename Integer>
     bool event_option_seen = false;
     bool event_revision_epoch_set = false;
     bool event_calculation_run_id_set = false;
+    bool kline_option_seen = false;
+    bool kline_interval_set = false;
+    bool kline_revision_epoch_set = false;
+    bool kline_calculation_run_id_set = false;
 #endif
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -695,6 +749,131 @@ template <typename Integer>
                 return false;
             }
             event_option_seen = true;
+        } else if (argument == "--kline-enable") {
+            parsed.kline_enabled = true;
+            kline_option_seen = true;
+        } else if (argument == "--kline-interval-seconds") {
+            std::uint32_t interval = 0U;
+            if (!ParseInteger(next(argument), &interval)) {
+                *error = "invalid --kline-interval-seconds";
+                return false;
+            }
+            if (!kline_interval_set) {
+                parsed.kline.worker.interval_seconds.clear();
+                kline_interval_set = true;
+            }
+            parsed.kline.worker.interval_seconds.push_back(interval);
+            kline_option_seen = true;
+        } else if (argument == "--kline-revision-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.worker.revision_epoch)) {
+                *error = "invalid --kline-revision-epoch";
+                return false;
+            }
+            kline_revision_epoch_set = true;
+            kline_option_seen = true;
+        } else if (argument == "--kline-calculation-run-id") {
+            if (!l2flow::clickhouse::ParseIdentifier(
+                    next(argument),
+                    &parsed.kline.worker.calculation_run_id)) {
+                *error =
+                    "--kline-calculation-run-id must be 32 hex digits";
+                return false;
+            }
+            kline_calculation_run_id_set = true;
+            kline_option_seen = true;
+        } else if (argument == "--kline-logic-version") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.worker.logic_version)) {
+                *error = "invalid --kline-logic-version";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-micro-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.micro_batch_rows)) {
+                *error = "invalid --kline-micro-batch-rows";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-micro-batch-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.micro_batch_max_delay_ns)) {
+                *error = "invalid --kline-micro-batch-max-delay-ns";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-insert-chunk-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.insert_chunk_rows)) {
+                *error = "invalid --kline-insert-chunk-rows";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-writer-lanes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_kline.writer_lanes)) {
+                *error = "invalid --kline-writer-lanes";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-queue-revision-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.queue_revision_batches)) {
+                *error = "invalid --kline-queue-revision-batches";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-queue-revision-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.queue_revision_rows)) {
+                *error = "invalid --kline-queue-revision-rows";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-maximum-facts") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.worker.maximum_facts)) {
+                *error = "invalid --kline-maximum-facts";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-maximum-bars") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.worker.maximum_bars)) {
+                *error = "invalid --kline-maximum-bars";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-maximum-pending-commits") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.kline.worker.maximum_pending_commits)) {
+                *error = "invalid --kline-maximum-pending-commits";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-maximum-raw-ack-backlog") {
+            std::size_t capacity = 0U;
+            if (!ParseInteger(next(argument), &capacity)) {
+                *error = "invalid --kline-maximum-raw-ack-backlog";
+                return false;
+            }
+            parsed.kline.maximum_raw_ack_backlog_per_owner = capacity;
+            parsed.kline.worker.maximum_acknowledged_raw_dependencies =
+                capacity;
+            kline_option_seen = true;
+        } else if (argument == "--kline-maximum-late-backlog") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.kline.maximum_late_backlog_per_owner)) {
+                *error = "invalid --kline-maximum-late-backlog";
+                return false;
+            }
+            kline_option_seen = true;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         } else if (argument == "--arrow-ring-dir") {
@@ -804,6 +983,10 @@ template <typename Integer>
         *error = "Event options require --event-enable";
         return false;
     }
+    if (kline_option_seen && !parsed.kline_enabled) {
+        *error = "KLine options require --kline-enable";
+        return false;
+    }
     if (clickhouse_option_seen && !parsed.clickhouse_enabled) {
         *error = "ClickHouse options require --clickhouse-url";
         return false;
@@ -898,6 +1081,72 @@ template <typename Integer>
                 parsed.event, error) ||
             !l2flow::clickhouse::ValidateEventClickHouseConfig(
                 parsed.clickhouse_event, error)) {
+            return false;
+        }
+    }
+    if (parsed.kline_enabled) {
+        if (!parsed.clickhouse_enabled) {
+            *error = "--kline-enable requires durable --clickhouse-url raw "
+                     "output";
+            return false;
+        }
+        if (!kline_revision_epoch_set ||
+            parsed.kline.worker.revision_epoch == 0U) {
+            *error = "--kline-enable requires a nonzero "
+                     "--kline-revision-epoch";
+            return false;
+        }
+        if (!kline_calculation_run_id_set ||
+            parsed.kline.worker.calculation_run_id ==
+                l2flow::common::Identifier128{}) {
+            *error = "--kline-enable requires a nonzero "
+                     "--kline-calculation-run-id";
+            return false;
+        }
+        if (parsed.engine.instrument_workers >
+            std::numeric_limits<std::uint32_t>::max()) {
+            *error = "--instrument-workers exceeds the KLine owner range";
+            return false;
+        }
+        parsed.kline.worker.trade_date = parsed.engine.trade_date;
+        parsed.kline.worker.owner = 0U;
+        parsed.kline.worker.owner_count = static_cast<std::uint32_t>(
+            parsed.engine.instrument_workers);
+        std::vector<std::uint32_t>& intervals =
+            parsed.kline.worker.interval_seconds;
+        std::sort(intervals.begin(), intervals.end());
+        intervals.erase(std::unique(intervals.begin(), intervals.end()),
+                        intervals.end());
+
+        parsed.clickhouse_kline.endpoint = parsed.clickhouse.endpoint;
+        parsed.clickhouse_kline.database = parsed.clickhouse.database;
+        parsed.clickhouse_kline.username = parsed.clickhouse.username;
+        parsed.clickhouse_kline.password = parsed.clickhouse.password;
+        parsed.clickhouse_kline.no_proxy = parsed.clickhouse.no_proxy;
+        parsed.clickhouse_kline.connect_timeout_ms =
+            parsed.clickhouse.connect_timeout_ms;
+        parsed.clickhouse_kline.request_timeout_ms =
+            parsed.clickhouse.request_timeout_ms;
+        parsed.clickhouse_kline.retry_initial_backoff_ms =
+            parsed.clickhouse.retry_initial_backoff_ms;
+        parsed.clickhouse_kline.retry_max_backoff_ms =
+            parsed.clickhouse.retry_max_backoff_ms;
+        parsed.clickhouse_kline.maximum_retry_elapsed_ms =
+            parsed.clickhouse.maximum_retry_elapsed_ms;
+        parsed.clickhouse_kline.shutdown_timeout_ms =
+            parsed.clickhouse.shutdown_timeout_ms;
+        parsed.clickhouse_kline.insert_quorum =
+            parsed.clickhouse.insert_quorum;
+        parsed.clickhouse_kline.insert_quorum_parallel =
+            parsed.clickhouse.insert_quorum_parallel;
+        parsed.clickhouse_kline.ensure_local_tables =
+            parsed.clickhouse.ensure_local_tables;
+        parsed.clickhouse_kline.tls_verify_peer =
+            parsed.clickhouse.tls_verify_peer;
+        if (!l2flow::kline::ValidateKLineRuntimeConfig(
+                parsed.kline, error) ||
+            !l2flow::clickhouse::ValidateKLineClickHouseConfig(
+                parsed.clickhouse_kline, error)) {
             return false;
         }
     }
@@ -1007,6 +1256,37 @@ void PrintEventStats(
               << " event_sink_retry_attempts=" << sink.retry_attempts
               << " event_sink_unknown_outcomes=" << sink.unknown_outcomes
               << " event_sink_queued_rows=" << sink.queued_revision_rows
+              << '\n';
+}
+
+void PrintKLineStats(
+    const l2flow::kline::KLineRuntimeStats& runtime,
+    const l2flow::clickhouse::KLineClickHouseStats& sink) {
+    std::cout << "kline_normal_in=" << runtime.normal_ticks_received
+              << " kline_late_in=" << runtime.late_ticks_received
+              << " kline_raw_acks=" << runtime.raw_tick_acks_received
+              << " kline_micro_batches=" << runtime.micro_batches_applied
+              << " kline_facts=" << runtime.workers.facts_journaled
+              << " kline_trades=" << runtime.workers.trades_projected
+              << " kline_invalid_exchange_time="
+              << runtime.workers.invalid_trade_exchange_times
+              << " kline_bars_created=" << runtime.workers.bars_created
+              << " kline_bars_updated=" << runtime.workers.bars_updated
+              << " kline_revisions=" << runtime.workers.revisions_created
+              << " kline_pending_raw="
+              << runtime.workers.pending_raw_commits
+              << " kline_ack_index="
+              << runtime.workers.acknowledged_raw_dependencies
+              << " kline_sink_batches_queued="
+              << sink.revision_batches_queued
+              << " kline_sink_batches_acked="
+              << sink.revision_batches_acked
+              << " kline_sink_rows_acked=" << sink.revision_rows_acked
+              << " kline_recovery_runs_committed="
+              << sink.recovery_runs_committed
+              << " kline_sink_retry_attempts=" << sink.retry_attempts
+              << " kline_sink_unknown_outcomes=" << sink.unknown_outcomes
+              << " kline_sink_queued_rows=" << sink.queued_revision_rows
               << '\n';
 }
 #endif
@@ -1274,8 +1554,11 @@ int main(int argc, char** argv) {
         return 2;
     }
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    RawTickBatchAckFanout raw_ack_fanout;
     std::unique_ptr<l2flow::clickhouse::EventClickHouseSink> clickhouse_event;
     std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
+    std::unique_ptr<l2flow::clickhouse::KLineClickHouseSink> clickhouse_kline;
+    std::unique_ptr<l2flow::kline::KLineRuntime> kline_runtime;
     std::unique_ptr<l2flow::clickhouse::RawClickHouseSink> clickhouse_raw;
     if (options.event_enabled && !options.validate_only) {
         clickhouse_event =
@@ -1292,7 +1575,26 @@ int main(int argc, char** argv) {
             std::cerr << "Event runtime creation failed: " << error << '\n';
             return 1;
         }
-        options.clickhouse.tick_ack_listener = event_runtime.get();
+    }
+    if (options.kline_enabled && !options.validate_only) {
+        clickhouse_kline =
+            l2flow::clickhouse::KLineClickHouseSink::Create(
+                options.clickhouse_kline, &error);
+        if (clickhouse_kline == nullptr) {
+            std::cerr << "ClickHouse KLine sink creation failed: "
+                      << error << '\n';
+            return 1;
+        }
+        kline_runtime = l2flow::kline::KLineRuntime::Create(
+            options.kline, clickhouse_kline.get(), &error);
+        if (kline_runtime == nullptr) {
+            std::cerr << "KLine runtime creation failed: " << error << '\n';
+            return 1;
+        }
+    }
+    if (event_runtime != nullptr || kline_runtime != nullptr) {
+        raw_ack_fanout.Configure(event_runtime.get(), kline_runtime.get());
+        options.clickhouse.tick_ack_listener = &raw_ack_fanout;
     }
     if (options.clickhouse_enabled && !options.validate_only) {
         clickhouse_raw = l2flow::clickhouse::RawClickHouseSink::Create(
@@ -1358,8 +1660,45 @@ int main(int argc, char** argv) {
                   << " writer_lanes="
                   << options.clickhouse_event.writer_lanes << '\n';
     }
+    if (clickhouse_kline != nullptr) {
+        if (!clickhouse_kline->Start(&error)) {
+            if (clickhouse_event != nullptr) {
+                std::string stop_error;
+                static_cast<void>(clickhouse_event->Stop(&stop_error));
+            }
+            std::cerr << "ClickHouse KLine sink start failed: " << error
+                      << '\n';
+            return 1;
+        }
+        std::cout << "clickhouse_kline_writer_instance="
+                  << l2flow::clickhouse::IdentifierString(
+                         clickhouse_kline->writer_instance_id())
+                  << " calculation_run_id="
+                  << l2flow::clickhouse::IdentifierString(
+                         options.kline.worker.calculation_run_id)
+                  << " revision_epoch="
+                  << options.kline.worker.revision_epoch
+                  << " logic_version="
+                  << options.kline.worker.logic_version
+                  << " writer_lanes="
+                  << options.clickhouse_kline.writer_lanes
+                  << " intervals_seconds=";
+        for (std::size_t index = 0U;
+             index < options.kline.worker.interval_seconds.size(); ++index) {
+            if (index != 0U) {
+                std::cout << ',';
+            }
+            std::cout << options.kline.worker.interval_seconds[index];
+        }
+        std::cout << '\n';
+    }
     if (clickhouse_raw != nullptr) {
         if (!clickhouse_raw->Start(&error)) {
+            if (clickhouse_kline != nullptr) {
+                std::string kline_stop_error;
+                static_cast<void>(
+                    clickhouse_kline->Stop(&kline_stop_error));
+            }
             if (clickhouse_event != nullptr) {
                 std::string event_stop_error;
                 static_cast<void>(
@@ -1386,11 +1725,17 @@ int main(int argc, char** argv) {
     if (event_runtime != nullptr && clickhouse_event != nullptr) {
         PrintEventStats(event_runtime->stats(), clickhouse_event->stats());
     }
+    if (kline_runtime != nullptr && clickhouse_kline != nullptr) {
+        PrintKLineStats(kline_runtime->stats(), clickhouse_kline->stats());
+    }
     const auto clickhouse_healthy = [
-        &clickhouse_raw, &clickhouse_event, &event_runtime] {
+        &clickhouse_raw, &clickhouse_event, &event_runtime,
+        &clickhouse_kline, &kline_runtime] {
         return (clickhouse_raw == nullptr || clickhouse_raw->healthy()) &&
                (clickhouse_event == nullptr || clickhouse_event->healthy()) &&
-               (event_runtime == nullptr || event_runtime->healthy());
+               (event_runtime == nullptr || event_runtime->healthy()) &&
+               (clickhouse_kline == nullptr || clickhouse_kline->healthy()) &&
+               (kline_runtime == nullptr || kline_runtime->healthy());
     };
 #else
     const auto clickhouse_healthy = [] { return true; };
@@ -1404,9 +1749,16 @@ int main(int argc, char** argv) {
         if (event_runtime != nullptr) {
             static_cast<void>(event_runtime->DrainAll());
         }
+        if (kline_runtime != nullptr) {
+            static_cast<void>(kline_runtime->DrainAll());
+        }
         if (clickhouse_event != nullptr) {
             std::string stop_error;
             static_cast<void>(clickhouse_event->Stop(&stop_error));
+        }
+        if (clickhouse_kline != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_kline->Stop(&stop_error));
         }
 #endif
         std::cerr << "engine start failed: " << error << '\n';
@@ -1464,6 +1816,10 @@ int main(int argc, char** argv) {
                         static_cast<void>(
                             event_runtime->AppendTick(owner, tick));
                     }
+                    if (kline_runtime != nullptr) {
+                        static_cast<void>(
+                            kline_runtime->AppendTick(owner, tick));
+                    }
 #endif
                     consumed_ticks.fetch_add(1U, std::memory_order_relaxed);
                     progress = true;
@@ -1519,6 +1875,11 @@ int main(int argc, char** argv) {
                                 event_runtime->AppendLateRecovery(
                                     late_recovery));
                         }
+                        if (kline_runtime != nullptr) {
+                            static_cast<void>(
+                                kline_runtime->AppendLateRecovery(
+                                    late_recovery));
+                        }
 #endif
                         consumed_late_recovery.fetch_add(
                             1U, std::memory_order_relaxed);
@@ -1548,6 +1909,10 @@ int main(int argc, char** argv) {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
                 if (event_runtime != nullptr) {
                     static_cast<void>(event_runtime->FlushDue(
+                        owner, l2flow::ingest::MonotonicNowNs()));
+                }
+                if (kline_runtime != nullptr) {
+                    static_cast<void>(kline_runtime->FlushDue(
                         owner, l2flow::ingest::MonotonicNowNs()));
                 }
 #endif
@@ -1598,9 +1963,16 @@ int main(int argc, char** argv) {
     bool event_drain_ok = true;
     bool event_stop_ok = true;
     std::string event_stop_error;
-    const auto flush_event_runtime = [&] {
+    bool kline_flush_ok = true;
+    bool kline_drain_ok = true;
+    bool kline_stop_ok = true;
+    std::string kline_stop_error;
+    const auto flush_derived_runtimes = [&] {
         if (event_runtime != nullptr) {
             event_flush_ok = event_runtime->FlushAll();
+        }
+        if (kline_runtime != nullptr) {
+            kline_flush_ok = kline_runtime->FlushAll();
         }
     };
     const auto stop_clickhouse_raw = [&] {
@@ -1610,17 +1982,28 @@ int main(int argc, char** argv) {
             PrintClickHouseStats(clickhouse_raw->stats());
         }
     };
-    const auto stop_clickhouse_event = [&] {
+    const auto stop_clickhouse_derived = [&] {
         if (event_runtime != nullptr) {
             event_drain_ok = event_runtime->DrainAll();
+        }
+        if (kline_runtime != nullptr) {
+            kline_drain_ok = kline_runtime->DrainAll();
         }
         if (clickhouse_event != nullptr) {
             event_stop_ok =
                 clickhouse_event->Stop(&event_stop_error);
         }
+        if (clickhouse_kline != nullptr) {
+            kline_stop_ok =
+                clickhouse_kline->Stop(&kline_stop_error);
+        }
         if (event_runtime != nullptr && clickhouse_event != nullptr) {
             PrintEventStats(
                 event_runtime->stats(), clickhouse_event->stats());
+        }
+        if (kline_runtime != nullptr && clickhouse_kline != nullptr) {
+            PrintKLineStats(
+                kline_runtime->stats(), clickhouse_kline->stats());
         }
     };
 #endif
@@ -1631,9 +2014,9 @@ int main(int argc, char** argv) {
     if (sdk == nullptr) {
         stop_engine_and_drain();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-        flush_event_runtime();
+        flush_derived_runtimes();
         stop_clickhouse_raw();
-        stop_clickhouse_event();
+        stop_clickhouse_derived();
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         if (arrow_egress != nullptr) {
@@ -1669,6 +2052,10 @@ int main(int argc, char** argv) {
             if (event_runtime != nullptr && clickhouse_event != nullptr) {
                 PrintEventStats(
                     event_runtime->stats(), clickhouse_event->stats());
+            }
+            if (kline_runtime != nullptr && clickhouse_kline != nullptr) {
+                PrintKLineStats(
+                    kline_runtime->stats(), clickhouse_kline->stats());
             }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -1718,6 +2105,10 @@ int main(int argc, char** argv) {
                     PrintEventStats(
                         event_runtime->stats(), clickhouse_event->stats());
                 }
+                if (kline_runtime != nullptr && clickhouse_kline != nullptr) {
+                    PrintKLineStats(
+                        kline_runtime->stats(), clickhouse_kline->stats());
+                }
 #endif
                 previous_stats = current_stats;
                 previous_report_time = now;
@@ -1734,9 +2125,9 @@ int main(int argc, char** argv) {
     sdk->Shutdown();
     stop_engine_and_drain();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-    flush_event_runtime();
+    flush_derived_runtimes();
     stop_clickhouse_raw();
-    stop_clickhouse_event();
+    stop_clickhouse_derived();
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     if (arrow_egress != nullptr) {
@@ -1768,6 +2159,21 @@ int main(int argc, char** argv) {
                   << (event_stop_error.empty()
                           ? clickhouse_event->fatal_error()
                           : event_stop_error)
+                  << '\n';
+        return 1;
+    }
+    if (kline_runtime != nullptr &&
+        (!kline_flush_ok || !kline_drain_ok || !kline_runtime->healthy())) {
+        std::cerr << "fatal KLine runtime error: "
+                  << kline_runtime->fatal_error() << '\n';
+        return 1;
+    }
+    if (clickhouse_kline != nullptr &&
+        (!kline_stop_ok || !clickhouse_kline->healthy())) {
+        std::cerr << "fatal ClickHouse KLine sink error: "
+                  << (kline_stop_error.empty()
+                          ? clickhouse_kline->fatal_error()
+                          : kline_stop_error)
                   << '\n';
         return 1;
     }

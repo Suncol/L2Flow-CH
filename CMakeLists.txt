@@ -114,9 +114,12 @@ if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
     add_library(l2flow_ch_clickhouse STATIC
         src/blake3.cpp
         src/clickhouse_event_sink.cpp
+        src/clickhouse_kline_sink.cpp
         src/clickhouse_raw_sink.cpp
         src/event_runtime.cpp
-        src/event_worker.cpp)
+        src/event_worker.cpp
+        src/kline_runtime.cpp
+        src/kline_worker.cpp)
     add_library(L2FlowCH::clickhouse ALIAS l2flow_ch_clickhouse)
     l2flow_ch_configure(l2flow_ch_clickhouse)
     target_link_libraries(l2flow_ch_clickhouse
@@ -174,11 +177,23 @@ if(L2FLOW_CH_BUILD_TESTS)
             L2FlowCH::clickhouse)
         add_test(NAME event_worker COMMAND test_event_worker)
 
+        add_executable(test_kline_worker tests/test_kline_worker.cpp)
+        l2flow_ch_configure(test_kline_worker)
+        target_link_libraries(test_kline_worker PRIVATE
+            L2FlowCH::clickhouse)
+        add_test(NAME kline_worker COMMAND test_kline_worker)
+
         add_executable(test_clickhouse_event tests/test_clickhouse_event.cpp)
         l2flow_ch_configure(test_clickhouse_event)
         target_link_libraries(test_clickhouse_event PRIVATE
             L2FlowCH::clickhouse)
         add_test(NAME clickhouse_event COMMAND test_clickhouse_event)
+
+        add_executable(test_clickhouse_kline tests/test_clickhouse_kline.cpp)
+        l2flow_ch_configure(test_clickhouse_kline)
+        target_link_libraries(test_clickhouse_kline PRIVATE
+            L2FlowCH::clickhouse)
+        add_test(NAME clickhouse_kline COMMAND test_clickhouse_kline)
 
         add_executable(test_clickhouse_raw tests/test_clickhouse_raw.cpp)
         l2flow_ch_configure(test_clickhouse_raw)
@@ -243,6 +258,43 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --validate-only)
         set_tests_properties(
             mdl_ingest_event_requires_revision_epoch
+            PROPERTIES WILL_FAIL TRUE)
+        add_test(
+            NAME mdl_ingest_kline_config
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --clickhouse-feed-epoch 42
+                --kline-enable
+                --kline-interval-seconds 5
+                --kline-interval-seconds 1
+                --kline-interval-seconds 5
+                --kline-revision-epoch 10
+                --kline-writer-lanes 4
+                --kline-calculation-run-id
+                    101112131415161718191a1b1c1d1e1f
+                --validate-only)
+        add_test(
+            NAME mdl_ingest_kline_requires_revision_epoch
+            COMMAND mdl_ingestd
+                --mode partial
+                --trade-date 20260806
+                --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+                --stream-config
+                    ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
+                --clickhouse-url http://127.0.0.1:8123
+                --clickhouse-feed-epoch 42
+                --kline-enable
+                --kline-interval-seconds 5
+                --kline-calculation-run-id
+                    101112131415161718191a1b1c1d1e1f
+                --validate-only)
+        set_tests_properties(
+            mdl_ingest_kline_requires_revision_epoch
             PROPERTIES WILL_FAIL TRUE)
     endif()
     add_test(

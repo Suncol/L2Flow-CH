@@ -24,9 +24,13 @@ also contains the optional owner-local Event projection and ClickHouse
 revision sink described in
 [`event-worker-clickhouse.md`](event-worker-clickhouse.md). Event calculation
 consumes ordered and `LateRecovery` ticks, while publication is gated by the
-corresponding raw ACKs. The repository does not contain CSV/WAL replay,
-checkpoint restore, reconnect epoch inference, cold Event bootstrap, or
-intraday restart reconciliation. Startup is exactly one of:
+corresponding raw ACKs. The optional KLine plane in
+[`kline-worker-clickhouse.md`](kline-worker-clickhouse.md) consumes the same
+two Tick branches, uses SDK body exchange time for integer-second windows, and
+has an independent revision sink behind the same raw ACK boundary. The
+repository does not contain CSV/WAL replay, checkpoint restore, reconnect
+epoch inference, cold derived-state bootstrap, or intraday restart
+reconciliation. Startup is exactly one of:
 
 - `from-open`: the process claims coverage beginning at native sequence 1;
 - `partial`: the process claims only a bounded process-start suffix and never
@@ -314,9 +318,10 @@ endpoint. Gap state uses the fixed per-lane/per-Channel mailbox and dirty
 bitmap described above.
 
 The executable gives each owner endpoint to exactly one drain thread. That
-thread also owns the corresponding Event worker when Event output is enabled.
-A future KLine stage must preserve the same single-consumer rule; calling one
-owner endpoint from multiple consumers violates the SPSC contract.
+thread also owns the corresponding Event and KLine workers when those outputs
+are enabled. It polls one Tick and fans out copies; it never assigns a second
+consumer to the owner endpoint. Calling one owner endpoint from multiple
+consumers violates the SPSC contract.
 
 ## 7. 64-core / 1-TiB deployment starting point
 
@@ -330,7 +335,7 @@ The defaults are a starting point, not a measured production guarantee:
   reorder slabs.
 
 On a 64-core host, reserve cores for the OS/IRQs, the vendor SDK, ClickHouse
-writer threads, Event owners, and future KLine stages. Pin decoder lanes only after
+writer threads, and Event/KLine owner work. Pin decoder lanes only after
 measuring the actual NUMA topology; a flat logical CPU number does not identify
 socket locality.
 Keep the SDK callback and its hottest decoder lanes in the same NUMA domain
@@ -398,11 +403,12 @@ Shutdown order is fixed:
 3. release Subscriber, then IOManager;
 4. drain and join decoder lanes, flushing partial raw batches;
 5. drain instrument/fault/LateRecovery queues and final dirty gap state;
-6. flush every final partial Event micro-batch;
+6. flush every final partial Event and KLine micro-batch;
 7. wait for every ClickHouse raw batch ACK and stop raw writer threads, which
-   delivers final ACK callbacks to the Event runtime;
-8. finish private Event repair, submit all now-durable revision batches, and
-   stop the Event writer after its recovery markers are ACKed;
+   fans final ACK callbacks out to both enabled derived runtimes;
+8. finish private Event repair, drain both raw-ACK gates, submit all now-durable
+   revision batches, and stop the Event/KLine writers after their independent
+   recovery markers are ACKed;
 9. seal the optional Arrow hot path and destroy the engine/handler.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
@@ -433,7 +439,11 @@ and tombstones, phase-status scope, private budgeted repair, per-order
 generation restart, disjoint live publication during repair, multi-owner
 routing, final partial-batch drain, immutable retry bodies, current-table
 replacement/tombstones, recovery markers, and startup rejection of a mismatched
-external schema.
+external schema. KLine tests cover SDK exchange-time windowing despite opposing
+local receive order, invalid-time no-fallback behavior, deterministic OHLC,
+multiple intervals, duplicate/conflict handling, raw ACK-before-fact, late
+historical revision, runtime routing, immutable sink retries, owner-affine
+writer lanes, current-table replacement, and schema validation.
 
 The implementation passes the strict warning build and the C++ ASan/UBSan
 suite in the available environment. The external Python process in the
@@ -459,5 +469,6 @@ still requires:
   unchanged 500-microsecond default gap policy;
 - fault injection for malformed bodies, lane saturation, slow owners, SDK
   disconnects, and process termination;
-- cold Event bootstrap/reconciliation, explicit session Finalize, and durable
-  external allocation of Event revision epochs/calculation-run IDs.
+- cold Event/KLine bootstrap and reconciliation, explicit derived-state session
+  Finalize, and durable external allocation of revision epochs and calculation
+  run IDs.
