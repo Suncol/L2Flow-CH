@@ -255,6 +255,7 @@ void PrintUsage() {
         << "  --event-micro-batch-rows N default 256\n"
         << "  --event-micro-batch-max-delay-ns N default 1000000\n"
         << "  --event-insert-chunk-rows N default 16384\n"
+        << "  --event-writer-lanes N (1,2,4,8) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
         << "  --event-maximum-facts N    default 4194304 per owner\n"
@@ -604,6 +605,13 @@ template <typename Integer>
             if (!ParseInteger(next(argument),
                               &parsed.clickhouse_event.insert_chunk_rows)) {
                 *error = "invalid --event-insert-chunk-rows";
+                return false;
+            }
+            event_option_seen = true;
+        } else if (argument == "--event-writer-lanes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event.writer_lanes)) {
+                *error = "invalid --event-writer-lanes";
                 return false;
             }
             event_option_seen = true;
@@ -976,6 +984,14 @@ void PrintEventStats(
               << runtime.workers.repair_order_restarts
               << " event_active_repair_orders="
               << runtime.workers.active_repair_orders
+              << " event_ordered_batch_fast_path="
+              << runtime.workers.ordered_batch_fast_path
+              << " event_unordered_batch_sorts="
+              << runtime.workers.unordered_batch_sorts
+              << " event_barrier_index_orders_visited="
+              << runtime.workers.barrier_index_orders_visited
+              << " event_source_only_fast_path="
+              << runtime.workers.source_only_fast_path
               << " event_revisions=" << runtime.workers.revisions_created
               << " event_pending_raw="
               << runtime.workers.pending_raw_commits
@@ -1338,7 +1354,9 @@ int main(int argc, char** argv) {
                   << " revision_epoch="
                   << options.event.worker.revision_epoch
                   << " logic_version="
-                  << options.event.worker.logic_version << '\n';
+                  << options.event.worker.logic_version
+                  << " writer_lanes="
+                  << options.clickhouse_event.writer_lanes << '\n';
     }
     if (clickhouse_raw != nullptr) {
         if (!clickhouse_raw->Start(&error)) {

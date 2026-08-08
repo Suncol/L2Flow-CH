@@ -103,6 +103,13 @@ EventKey =
      event_kind, affected_order_id, occurrence)
 ```
 
+Here `instrument` means the exact catalog-resolved security identity
+`(market, security_id_source, security_id)`.  The catalog supplies a stable
+`instrument_id` for Event/ClickHouse identity and a dense
+`instrument_ordinal` for runtime owner routing.  The ordinal is a daily
+catalog-local routing value; it is not persisted as the Event identity and it
+must not be used as a restart/WAL key.
+
 `FactKey` intentionally omits the instrument. This relies on the upstream
 contract that one positive native sequence identifies at most one canonical
 business position in a `(trade_date, market, channel)` domain. The Event
@@ -127,26 +134,38 @@ normally zero.
 
 ## 4. Owner-local indexes and state
 
-One owner thread mutates a worker. The implementation maintains the following
-logical indexes using ordered C++ maps:
+One owner thread mutates a worker.  The state remains owner-local and is never
+mutated by a background calculation thread.  Hot point lookups use bounded
+hash tables; indexes that require native-sequence range traversal retain an
+ordered vector/tree representation:
 
 | Logical index | Current representation and purpose |
 |---|---|
-| FactJournal | `facts_`, keyed by `FactKey`, retains the source Tick, normalized projection Tick, source fragment, hash, roles, and late/barrier flags |
-| Instrument fact journal | orders Shanghai phase normalization within one Instrument/Channel |
-| Phase/barrier index | stores Shanghai status transitions and every `Ended` barrier |
+| FactJournal | `facts_`, keyed by `FactKey` in a bounded hash table, retains the source Tick, normalized projection Tick, source fragment, hash, roles, and late/barrier flags |
+| Instrument fact journal | hash lookup to an append-ordered `FactKey` vector; late inserts stay sorted for Shanghai phase range scans |
+| Phase/barrier index | phase transitions use an ordered vector; `Ended` barriers retain an ordered map and a direct Instrument/Channel→orders index |
 | OrderUseIndex | `OrderHistory::uses`, keyed by native sequence, records Add/Trade/Cancel/barrier references even when no order state existed |
 | OrderVersionChain | `OrderHistory::versions`, stores the full post-state and semantic input hash after each use |
 | RoleEvalCache | caches the order-role post-state, optional order fragment, source quality contribution, reference resolution, and hashes |
 | BundleCache | stores the complete current EventKey-to-payload set for one FactKey |
 | EventHead | stores the latest revision ID, payload hash, and tombstone state for each EventKey |
 | Pending raw commit FIFO | holds immutable revision batches and their exact raw occurrence dependencies |
-| Acknowledged raw index | retains ACK-before-fact dependencies, with the same per-owner bound as the runtime ACK inbox |
+| Acknowledged raw index | bounded hash set for ACK-before-fact dependencies, with the same per-owner bound as the runtime ACK inbox |
 
 The RoleEval cache key does not store a separate role byte because validated
 input forbids one order ID from occupying two roles in the same fact. Ambiguous
 Shenzhen trades whose positive buy and sell references are equal mutate
 neither order role and carry an explicit ambiguous-reference quality flag.
+
+For an ordered batch containing only projectable Shanghai status facts while
+the owner has no order histories, the worker skips order-use and phase-repair
+walks.  It still journals every fact, builds the same source bundle, allocates
+the same monotonically increasing Event versions, and applies the same raw-ACK
+gate.  This is a semantics-preserving source-only fast path, not a shortcut
+for Add/Trade/Cancel or late-repair batches.  `ordered_batch_fast_path`,
+`unordered_batch_sorts`, `source_only_fast_path`, and
+`barrier_index_orders_visited` are exported so a benchmark can verify which
+path was actually measured.
 
 Shanghai semantic state includes the published snapshot plus hidden
 `pre_add_active_trade_quantity`, minimum and maximum execution prices,
@@ -410,6 +429,25 @@ calculation/logic-version policy. The marker certifies that this sink received
 success for every chunk in that run; it does not turn unrelated recovery runs
 into one transaction.
 
+### Ordered writer lanes
+
+`EventClickHouseConfig::writer_lanes` accepts exactly `1`, `2`, `4`, or `8`.
+Each lane has one HTTP client, one writer thread, and one bounded volatile
+queue. A revision batch is routed by `batch.owner % writer_lanes`; therefore
+all batches from one logical Event owner remain FIFO and their revision chunks
+and recovery marker are serialized on the same lane. Different owners may
+execute ClickHouse INSERTs concurrently. There is deliberately no cross-lane
+total order because the Event contract has no cross-Channel exchange order.
+
+`queue_revision_batches` and `queue_revision_rows` are global budgets shared by
+all lanes. They are not multiplied by the lane count. Queue exhaustion,
+permanent INSERT failure, or a retry-budget expiry changes the whole sink to
+fail-closed; another lane cannot silently continue with an incomplete Event
+view. Query IDs include the lane, while RowBinary bodies and deduplication
+tokens remain immutable across retries. The queues contain only
+`shared_ptr<const EventRevisionBatch>` objects in process memory; this feature
+does not add a WAL, checkpoint, disk queue, or local staging file.
+
 ## 11. Capacity and failure policy
 
 The FactJournal, order count, current BundleCache row count, pending raw commit
@@ -426,11 +464,12 @@ separate reconciliation policy over `raw_tick`.
 ## 12. Complexity and remaining gates
 
 Let `U` be the number of actually visited uses on dirty order chains and `E`
-the number of changed Event rows. With the current ordered-map containers:
+the number of changed Event rows. With the current hash/vector hot indexes
+and ordered range indexes:
 
 ```text
 normal projection:
-    O(batch sorting + logarithmic index operations + involved order roles)
+    O(batch sorting + expected-constant hash lookups + involved order roles)
 
 late lookup and repair:
     O(log N + U + dirty bundle assembly/diff)
@@ -448,6 +487,13 @@ Additional production gates remain:
 - cold bootstrap/reconciliation from durable raw facts after process restart;
 - a public explicit session/day `Finalize` barrier and tests for it;
 - durable supervisor allocation of revision epochs and calculation-run IDs;
+- ClickHouse writer-lane (1/2/4/8) measurements against the target node or
+  cluster, using the observed revision amplification rather than assuming one
+  revision row per callback;
+- a decision on ClickHouse sharding only after those measurements.  This
+  branch intentionally does not add WAL, disk queues, checkpoints, or restart
+  bootstrap from local files.  A ClickHouse outage that exceeds the bounded
+  in-memory queues therefore remains a fail-closed continuity boundary.
 - captured-market equivalence tests against the reference Shanghai and
   Shenzhen projectors;
 - measured peak-rate sizing and recovery-slice latency on the deployment NUMA

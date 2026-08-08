@@ -332,6 +332,7 @@ void PrintUsage() {
         << "  --event-micro-batch-rows N default 256\n"
         << "  --event-micro-batch-max-delay-ns N default 1000000\n"
         << "  --event-insert-chunk-rows N default 16384\n"
+        << "  --event-writer-lanes N (1,2,4,8) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
         << "  --event-maximum-raw-ack-backlog N default 65536\n";
@@ -551,6 +552,13 @@ void PrintUsage() {
             if (!ParseInteger(next(argument),
                               &parsed.clickhouse_event.insert_chunk_rows)) {
                 *error = "invalid --event-insert-chunk-rows";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-writer-lanes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event.writer_lanes)) {
+                *error = "invalid --event-writer-lanes";
                 return false;
             }
             parsed.event_configuration_set = true;
@@ -1249,7 +1257,9 @@ int main(int argc, char** argv) {
             << " micro_batch_max_delay_ns="
             << options.event.micro_batch_max_delay_ns
             << " insert_chunk_rows="
-            << options.clickhouse_event.insert_chunk_rows << '\n';
+            << options.clickhouse_event.insert_chunk_rows
+            << " writer_lanes=" << options.clickhouse_event.writer_lanes
+            << '\n';
     }
     if (clickhouse_raw != nullptr) {
         if (!clickhouse_raw->Start(&error)) {
@@ -2329,6 +2339,8 @@ int main(int argc, char** argv) {
             << options.event.micro_batch_max_delay_ns
             << " insert_chunk_rows="
             << options.clickhouse_event.insert_chunk_rows
+            << " writer_lanes="
+            << options.clickhouse_event.writer_lanes
             << " calculation_run_id="
             << l2flow::clickhouse::IdentifierString(
                    options.event.worker.calculation_run_id) << '\n'
@@ -2363,7 +2375,16 @@ int main(int argc, char** argv) {
             << " invalid_inputs="
             << event_final_runtime_stats.invalid_inputs
             << " source_conflicts="
-            << event_final_runtime_stats.source_conflicts << '\n'
+            << event_final_runtime_stats.source_conflicts
+            << " ordered_batch_fast_path="
+            << event_final_runtime_stats.workers.ordered_batch_fast_path
+            << " unordered_batch_sorts="
+            << event_final_runtime_stats.workers.unordered_batch_sorts
+            << " barrier_index_orders_visited="
+            << event_final_runtime_stats.workers.barrier_index_orders_visited
+            << " source_only_fast_path="
+            << event_final_runtime_stats.workers.source_only_fast_path
+            << '\n'
             << "clickhouse_event_final revision_rows_queued="
             << event_final_stats.revision_rows_queued
             << " revision_rows_acked="

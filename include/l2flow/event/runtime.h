@@ -11,6 +11,11 @@
 namespace l2flow::event {
 
 struct EventRuntimeConfig final {
+    // `worker.owner_count` is the number of single-writer Event state actors.
+    // The ingest engine's instrument_workers must use the same count so one
+    // catalog-resolved security (instrument_ordinal) has exactly one mutable
+    // owner. Increase that count to add actors; do not add locks around one
+    // worker or split an order chain across threads.
     EventWorkerConfig worker{};
     std::size_t micro_batch_rows = 256U;
     std::uint64_t micro_batch_max_delay_ns = 1'000'000U;
@@ -69,6 +74,11 @@ public:
     [[nodiscard]] std::string fatal_error() const;
     [[nodiscard]] EventRuntimeStats stats() const noexcept;
     [[nodiscard]] EventWorker* worker(std::size_t owner) noexcept;
+    // Runtime routing helper.  The ordinal is catalog-local and is only used
+    // for the current actor assignment; Event/ClickHouse identity remains
+    // instrument_id.
+    [[nodiscard]] std::size_t owner_for_instrument(
+        std::uint32_t instrument_ordinal) const noexcept;
     [[nodiscard]] const EventRuntimeConfig& config() const noexcept;
 
 private:

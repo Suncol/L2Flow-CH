@@ -84,11 +84,12 @@ EventRevision Revision(std::uint64_t version,
 std::shared_ptr<const EventRevisionBatch> Batch(
     std::uint64_t batch_sequence,
     Identifier128 recovery_run,
-    std::vector<EventRevision> revisions) {
+    std::vector<EventRevision> revisions,
+    std::uint32_t owner = 0U) {
     auto batch = std::make_shared<EventRevisionBatch>();
     batch->calculation_run_id = Identifier(1U);
     batch->recovery_run_id = recovery_run;
-    batch->owner = 0U;
+    batch->owner = owner;
     batch->batch_sequence = batch_sequence;
     batch->reason = revisions.front().reason;
     batch->revisions = std::move(revisions);
@@ -104,6 +105,11 @@ void TestConfigValidation() {
     config.endpoint = "http://127.0.0.1:8123";
     config.insert_chunk_rows = 0U;
     CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
+    config.insert_chunk_rows = 16'384U;
+    config.writer_lanes = 3U;
+    CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
+    config.writer_lanes = 8U;
+    CHECK(l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
 }
 
 #if defined(__linux__)
@@ -384,6 +390,70 @@ void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
     CHECK(stats.retry_attempts == 1U);
     CHECK(stats.unknown_outcomes == 1U);
 }
+
+void TestOrderedWriterLanesKeepOwnerAffinity() {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "Event writer-lane fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    EventClickHouseConfig config = HttpConfig(server);
+    config.writer_lanes = 2U;
+    config.queue_revision_batches = 8U;
+    config.queue_revision_rows = 32U;
+    std::string error;
+    std::unique_ptr<EventClickHouseSink> sink =
+        EventClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+
+    const Identifier128 recovery0 = Identifier(10U);
+    const Identifier128 recovery1 = Identifier(11U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery0,
+        {Revision(201U, 201U, RevisionOperation::kInsert, 1,
+                  recovery0)},
+        0U)));
+    CHECK(sink->AppendRevisionBatch(Batch(
+        2U, recovery0,
+        {Revision(202U, 202U, RevisionOperation::kInsert, 2,
+                  recovery0)},
+        0U)));
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery1,
+        {Revision(301U, 301U, RevisionOperation::kInsert, 3,
+                  recovery1)},
+        1U)));
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    std::vector<CapturedRequest> inserts;
+    for (const CapturedRequest& request : server.requests()) {
+        if (request.target.find("INSERT") != std::string::npos) {
+            inserts.push_back(request);
+        }
+    }
+    // Every one-row batch has one revision INSERT followed by its marker.
+    CHECK(inserts.size() == 6U);
+    bool saw_lane0 = false;
+    bool saw_lane1 = false;
+    for (const CapturedRequest& request : inserts) {
+        saw_lane0 = saw_lane0 || request.target.find("%2F0%2F") !=
+            std::string::npos;
+        saw_lane1 = saw_lane1 || request.target.find("%2F1%2F") !=
+            std::string::npos;
+    }
+    CHECK(saw_lane0);
+    CHECK(saw_lane1);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_batches_queued == 3U);
+    CHECK(stats.revision_batches_acked == 3U);
+    CHECK(stats.revision_batches_released == 3U);
+    CHECK(stats.revision_rows_acked == 3U);
+    CHECK(stats.recovery_runs_committed == 3U);
+    CHECK(stats.queued_revision_rows == 0U);
+}
 #endif
 
 std::size_t Capture(char* data,
@@ -570,6 +640,7 @@ int main() {
     TestConfigValidation();
 #if defined(__linux__)
     TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit();
+    TestOrderedWriterLanesKeepOwnerAffinity();
 #endif
     const char* const endpoint = std::getenv("L2FLOW_CH_TEST_URL");
     if (endpoint == nullptr || endpoint[0] == '\0') {

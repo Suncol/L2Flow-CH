@@ -44,8 +44,9 @@ synthetic MDL callback
 Event worker 只有在对应的 raw occurrence 收到 raw ClickHouse ACK 后，才会把
 revision batch 交给 Event sink。每个 calculation micro-batch 还会写一个
 `event_recovery_run` marker，所以一个 Event batch 至少产生两次 HTTP INSERT：
-一次 revision rows、一次 recovery marker。当前 Event sink 只有一个 writer
-thread，写入采用同步 HTTP `RowBinary` INSERT。
+一次 revision rows、一次 recovery marker。基线结果使用一个 writer thread；
+当前代码另外支持 `writer_lanes=1/2/4/8`，但本报告中的 ClickHouse 数字没有
+在 2/4/8 lane 下重测，不能直接外推。
 
 报告中几个速率的定义不同，不能混用：
 
@@ -355,9 +356,9 @@ L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
 4. ClickHouse 是同机 loopback、本地 `MergeTree`/`ReplacingMergeTree`、
    `insert_quorum=0`，不是复制集群 quorum ACK，也没有测网络抖动、节点故障、
    磁盘故障或副本合并压力。
-5. Event sink 当前只有一个 writer thread；增加 writer、改变 chunk/batch、
-   使用 Native protocol 或异步/合并写入都会改变结果，不能把这里的数值当成
-   所有部署配置的上限。
+5. 本报告的 Event sink 结果只有一个 writer thread；2/4/8 lane、不同
+   chunk/batch、Native protocol 或异步/合并写入都会改变结果，不能把这里的
+   数值当成所有部署配置的上限。
 6. 800k/1M 完整窗口只有 1 秒；30 秒资格测试明确 fail-closed。没有完成至少
    30 秒、300 秒或更长的稳定窗口，不能宣称持续容量。
 7. query-log 的 INSERT 延迟不包含客户端批次填充和排队；Event effective ACK

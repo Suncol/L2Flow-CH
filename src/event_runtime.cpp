@@ -41,6 +41,11 @@ void AddWorkerStats(EventWorkerStats* destination,
     destination->revision_batches_submitted +=
         source.revision_batches_submitted;
     destination->active_repair_orders += source.active_repair_orders;
+    destination->ordered_batch_fast_path += source.ordered_batch_fast_path;
+    destination->unordered_batch_sorts += source.unordered_batch_sorts;
+    destination->barrier_index_orders_visited +=
+        source.barrier_index_orders_visited;
+    destination->source_only_fast_path += source.source_only_fast_path;
 }
 
 }  // namespace
@@ -92,8 +97,8 @@ public:
                 ingest::kInvalidInstrumentOrdinal) {
             return true;
         }
-        const std::size_t owner =
-            late.tick.common.instrument_ordinal % owners_.size();
+        const std::size_t owner = owner_for_instrument(
+            late.tick.common.instrument_ordinal);
         EventInput input{};
         input.tick = late.tick;
         input.committed_next_sequence = late.committed_next_sequence;
@@ -220,8 +225,8 @@ public:
                     ingest::kInvalidInstrumentOrdinal) {
                     continue;
                 }
-                const std::size_t owner =
-                    tick.common.instrument_ordinal % owners_.size();
+                const std::size_t owner = owner_for_instrument(
+                    tick.common.instrument_ordinal);
                 grouped[owner].push_back(RawTickDependency{
                     tick.common.ingress_sequence, tick.common.kind});
             }
@@ -296,6 +301,15 @@ public:
 
     [[nodiscard]] EventWorker* worker(std::size_t owner) noexcept {
         return ValidOwner(owner) ? owners_[owner]->worker.get() : nullptr;
+    }
+
+    [[nodiscard]] std::size_t owner_for_instrument(
+        std::uint32_t instrument_ordinal) const noexcept {
+        if (instrument_ordinal == ingest::kInvalidInstrumentOrdinal ||
+            owners_.empty()) {
+            return owners_.size();
+        }
+        return static_cast<std::size_t>(instrument_ordinal) % owners_.size();
     }
 
     [[nodiscard]] const EventRuntimeConfig& config() const noexcept {
@@ -507,6 +521,11 @@ EventRuntimeStats EventRuntime::stats() const noexcept {
 
 EventWorker* EventRuntime::worker(std::size_t owner) noexcept {
     return impl_->worker(owner);
+}
+
+std::size_t EventRuntime::owner_for_instrument(
+    std::uint32_t instrument_ordinal) const noexcept {
+    return impl_->owner_for_instrument(instrument_ordinal);
 }
 
 const EventRuntimeConfig& EventRuntime::config() const noexcept {

@@ -922,7 +922,10 @@ bool ValidateEventClickHouseConfig(const EventClickHouseConfig& config,
         !IsIdentifierName(config.database) || config.username.empty()) {
         return fail("invalid ClickHouse Event endpoint, database, or user");
     }
-    if (config.insert_chunk_rows == 0U ||
+    const bool valid_writer_lanes =
+        config.writer_lanes == 1U || config.writer_lanes == 2U ||
+        config.writer_lanes == 4U || config.writer_lanes == 8U;
+    if (!valid_writer_lanes || config.insert_chunk_rows == 0U ||
         config.queue_revision_batches == 0U ||
         config.queue_revision_rows == 0U ||
         config.insert_chunk_rows > config.queue_revision_rows ||
@@ -945,9 +948,21 @@ bool ValidateEventClickHouseConfig(const EventClickHouseConfig& config,
 
 class EventClickHouseSink::Impl final {
 public:
+    struct Lane final {
+        mutable std::mutex mutex;
+        std::condition_variable wake;
+        std::deque<std::shared_ptr<const EventRevisionBatch>> queue;
+        std::thread thread;
+    };
+
     Impl(EventClickHouseConfig config, Identifier128 writer_instance_id)
         : config_(std::move(config)),
-          writer_instance_id_(writer_instance_id) {}
+          writer_instance_id_(writer_instance_id) {
+        lanes_.reserve(config_.writer_lanes);
+        for (std::size_t lane = 0U; lane < config_.writer_lanes; ++lane) {
+            lanes_.push_back(std::make_unique<Lane>());
+        }
+    }
 
     [[nodiscard]] bool Initialize(std::string* error) {
         try {
@@ -1000,13 +1015,26 @@ public:
                 SetFatal("ClickHouse Event schema validation failed");
                 return false;
             }
-            writer_thread_ = std::thread([this] { WriterLoop(); });
+            for (std::size_t lane = 0U; lane < lanes_.size(); ++lane) {
+                lanes_[lane]->thread = std::thread(
+                    [this, lane] { WriterLoop(lane); });
+            }
             accepting_.store(true, std::memory_order_release);
             if (error != nullptr) {
                 error->clear();
             }
             return true;
         } catch (const std::exception& exception) {
+            accepting_.store(false, std::memory_order_release);
+            stopping_.store(true, std::memory_order_release);
+            for (const auto& lane : lanes_) {
+                lane->wake.notify_all();
+            }
+            for (auto& lane : lanes_) {
+                if (lane->thread.joinable()) {
+                    lane->thread.join();
+                }
+            }
             SetFatal(std::string("ClickHouse Event sink start failed: ") +
                      exception.what());
             if (error != nullptr) {
@@ -1017,6 +1045,7 @@ public:
     }
 
     [[nodiscard]] bool Stop(std::string* error) noexcept {
+        std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
         if (!started_.load(std::memory_order_acquire)) {
             if (error != nullptr) {
                 error->clear();
@@ -1038,14 +1067,26 @@ public:
                 std::memory_order_release);
             stopping_.store(true, std::memory_order_release);
             wake_.notify_all();
+            for (const auto& lane : lanes_) {
+                lane->wake.notify_all();
+            }
         }
-        if (writer_thread_.joinable()) {
-            writer_thread_.join();
+        for (auto& lane : lanes_) {
+            if (lane->thread.joinable()) {
+                lane->thread.join();
+            }
+        }
+        for (const auto& lane : lanes_) {
+            std::lock_guard<std::mutex> lock(lane->mutex);
+            if (!lane->queue.empty()) {
+                SetFatal("ClickHouse Event sink stopped with queued batches");
+                break;
+            }
         }
         {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (!queue_.empty()) {
-                SetFatal("ClickHouse Event sink stopped with queued batches");
+            std::lock_guard<std::mutex> budget_lock(queue_budget_mutex_);
+            if (queued_batches_ != 0U || queued_rows_ != 0U) {
+                SetFatal("ClickHouse Event sink queue budget not empty");
             }
         }
         if (error != nullptr) {
@@ -1056,27 +1097,46 @@ public:
 
     [[nodiscard]] bool AppendRevisionBatch(
         std::shared_ptr<const EventRevisionBatch> batch) noexcept {
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         if (!accepting_.load(std::memory_order_acquire) || !healthy() ||
             batch == nullptr || !ValidRevisionBatch(*batch)) {
             return false;
         }
         try {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
             const std::size_t rows = batch->revisions.size();
-            if (queue_.size() >= config_.queue_revision_batches ||
-                rows > config_.queue_revision_rows - queued_rows_) {
-                SetFatal("ClickHouse Event revision queue capacity exhausted");
-                return false;
+            const std::size_t lane_index =
+                static_cast<std::size_t>(batch->owner) % lanes_.size();
+            {
+                std::lock_guard<std::mutex> budget_lock(queue_budget_mutex_);
+                if (queued_batches_ >= config_.queue_revision_batches ||
+                    queued_rows_ > config_.queue_revision_rows ||
+                    rows > config_.queue_revision_rows - queued_rows_) {
+                    SetFatal(
+                        "ClickHouse Event revision queue capacity exhausted");
+                    return false;
+                }
+                ++queued_batches_;
+                queued_rows_ += rows;
             }
-            queued_rows_ += rows;
-            queue_.push_back(std::move(batch));
-            stats_.revision_batches_queued.fetch_add(
-                1U, std::memory_order_relaxed);
-            stats_.revision_rows_queued.fetch_add(
-                static_cast<std::uint64_t>(rows),
-                std::memory_order_relaxed);
-            wake_.notify_one();
-            return true;
+            try {
+                Lane& lane = *lanes_[lane_index];
+                {
+                    std::lock_guard<std::mutex> lane_lock(lane.mutex);
+                    lane.queue.push_back(std::move(batch));
+                }
+                stats_.revision_batches_queued.fetch_add(
+                    1U, std::memory_order_relaxed);
+                stats_.revision_rows_queued.fetch_add(
+                    static_cast<std::uint64_t>(rows),
+                    std::memory_order_relaxed);
+                lane.wake.notify_one();
+                return true;
+            } catch (...) {
+                std::lock_guard<std::mutex> budget_lock(queue_budget_mutex_);
+                --queued_batches_;
+                queued_rows_ -= rows;
+                throw;
+            }
         } catch (...) {
             SetFatal("ClickHouse Event revision queue allocation failed");
             return false;
@@ -1114,7 +1174,7 @@ public:
             stats_.unknown_outcomes.load(std::memory_order_relaxed);
         result.bytes_sent =
             stats_.bytes_sent.load(std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(queue_budget_mutex_);
         result.queued_revision_rows = queued_rows_;
         return result;
     }
@@ -1183,13 +1243,16 @@ private:
     }
 
     [[nodiscard]] bool ProcessBatch(const EventRevisionBatch& batch,
-                                    HttpClient* client) {
-        const std::uint64_t sink_sequence = next_sink_batch_sequence_++;
+                                    HttpClient* client,
+                                    std::size_t lane_index) {
+        const std::uint64_t sink_sequence =
+            next_sink_batch_sequence_.fetch_add(1U, std::memory_order_relaxed);
         if (sink_sequence == 0U) {
             SetFatal("ClickHouse Event sink batch sequence exhausted");
             return false;
         }
         const std::string writer = IdentifierString(writer_instance_id_);
+        const std::string lane_text = std::to_string(lane_index);
         std::uint32_t chunk_index = 0U;
         for (std::size_t begin = 0U; begin < batch.revisions.size();
              begin += config_.insert_chunk_rows, ++chunk_index) {
@@ -1213,6 +1276,7 @@ private:
             }
             const std::string query_id =
                 "l2flow/event_revision_log/" + writer + "/" +
+                lane_text + "/" +
                 std::to_string(sink_sequence) + "/" +
                 std::to_string(chunk_index);
             const std::string token =
@@ -1261,6 +1325,7 @@ private:
             "committed_utc_ns,writer_instance_id,commit_id,schema_version";
         const std::string marker_query_id =
             "l2flow/event_recovery_run/" + writer + "/" +
+            lane_text + "/" +
             IdentifierString(batch.recovery_run_id);
         const std::string marker_token =
             "l2flow/event_recovery_run/" + IdentifierString(commit_id) +
@@ -1279,42 +1344,55 @@ private:
         return true;
     }
 
-    void WriterLoop() noexcept {
+    void WriterLoop(std::size_t lane_index) noexcept {
         try {
             HttpClient client(config_);
+            Lane& lane = *lanes_[lane_index];
             for (;;) {
                 std::shared_ptr<const EventRevisionBatch> batch;
                 {
-                    std::unique_lock<std::mutex> lock(queue_mutex_);
-                    wake_.wait_for(lock, std::chrono::milliseconds(1),
-                                   [this] {
-                                       return !queue_.empty() ||
-                                           stopping_.load(
-                                               std::memory_order_acquire);
-                                   });
-                    if (queue_.empty()) {
-                        if (stopping_.load(std::memory_order_acquire)) {
+                    std::unique_lock<std::mutex> lock(lane.mutex);
+                    lane.wake.wait_for(
+                        lock, std::chrono::milliseconds(1), [this, &lane] {
+                            return !lane.queue.empty() ||
+                                stopping_.load(std::memory_order_acquire) ||
+                                !healthy();
+                        });
+                    if (lane.queue.empty()) {
+                        if (stopping_.load(std::memory_order_acquire) ||
+                            !healthy()) {
                             return;
                         }
                         continue;
                     }
-                    batch = queue_.front();
+                    batch = lane.queue.front();
                 }
-                if (!ProcessBatch(*batch, &client)) {
+                if (!healthy() ||
+                    !ProcessBatch(*batch, &client, lane_index)) {
                     return;
                 }
                 {
-                    std::lock_guard<std::mutex> lock(queue_mutex_);
-                    if (queue_.empty() || queue_.front() != batch) {
+                    std::lock_guard<std::mutex> lock(lane.mutex);
+                    if (lane.queue.empty() || lane.queue.front() != batch) {
                         SetFatal("ClickHouse Event queue invariant failed");
                         return;
                     }
+                    lane.queue.pop_front();
+                }
+                {
+                    std::lock_guard<std::mutex> budget_lock(
+                        queue_budget_mutex_);
+                    if (queued_batches_ == 0U ||
+                        queued_rows_ < batch->revisions.size()) {
+                        SetFatal("ClickHouse Event queue budget invariant failed");
+                        return;
+                    }
+                    --queued_batches_;
                     queued_rows_ -= batch->revisions.size();
-                    queue_.pop_front();
                 }
                 stats_.revision_batches_released.fetch_add(
                     1U, std::memory_order_release);
-                wake_.notify_all();
+                lane.wake.notify_all();
             }
         } catch (const std::exception& exception) {
             SetFatal(std::string("ClickHouse Event writer failed: ") +
@@ -1337,16 +1415,20 @@ private:
         } catch (...) {
         }
         wake_.notify_all();
+        for (const auto& lane : lanes_) {
+            lane->wake.notify_all();
+        }
     }
 
     EventClickHouseConfig config_{};
     Identifier128 writer_instance_id_{};
     AtomicStats stats_{};
-    mutable std::mutex queue_mutex_;
-    std::deque<std::shared_ptr<const EventRevisionBatch>> queue_;
+    std::vector<std::unique_ptr<Lane>> lanes_;
+    mutable std::mutex queue_budget_mutex_;
+    mutable std::mutex lifecycle_mutex_;
+    std::size_t queued_batches_ = 0U;
     std::size_t queued_rows_ = 0U;
-    std::thread writer_thread_;
-    std::uint64_t next_sink_batch_sequence_ = 1U;
+    std::atomic<std::uint64_t> next_sink_batch_sequence_{1U};
     std::atomic<std::uint64_t> shutdown_deadline_ns_{
         std::numeric_limits<std::uint64_t>::max()};
     std::atomic<bool> started_{false};

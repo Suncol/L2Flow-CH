@@ -223,6 +223,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --clickhouse-feed-epoch 42
                 --event-enable
                 --event-revision-epoch 9
+                --event-writer-lanes 4
                 --event-calculation-run-id
                     000102030405060708090a0b0c0d0e0f
                 --validate-only)
@@ -324,5 +325,19 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(benchmark_mdl_ingest PRIVATE _GNU_SOURCE)
+    endif()
+    if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
+        add_executable(benchmark_event_state
+            benchmarks/benchmark_event_state.cpp)
+        l2flow_ch_configure(benchmark_event_state)
+        target_link_libraries(benchmark_event_state PRIVATE
+            L2FlowCH::clickhouse)
+        if(L2FLOW_CH_BUILD_TESTS)
+            add_test(
+                NAME event_state_benchmark_smoke
+                COMMAND benchmark_event_state
+                    --rate 1000 --seconds 1 --actors 1
+                    --micro-batch-rows 32)
+        endif()
     endif()
 endif()

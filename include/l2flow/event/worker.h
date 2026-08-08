@@ -80,6 +80,12 @@ struct EventWorkerStats final {
     std::uint64_t acknowledged_raw_dependencies = 0U;
     std::uint64_t revision_batches_submitted = 0U;
     std::uint64_t active_repair_orders = 0U;
+    // Hot-path counters used to distinguish ordered append work from the
+    // bounded late/乱序 fallback and to verify Shanghai END index coverage.
+    std::uint64_t ordered_batch_fast_path = 0U;
+    std::uint64_t unordered_batch_sorts = 0U;
+    std::uint64_t barrier_index_orders_visited = 0U;
+    std::uint64_t source_only_fast_path = 0U;
 };
 
 // Owner-local view of one upstream Channel. journal_tail includes every

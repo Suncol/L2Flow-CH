@@ -18,6 +18,11 @@ struct EventClickHouseConfig final {
     std::string no_proxy = "*";
 
     std::size_t insert_chunk_rows = 16'384U;
+    // Number of independent, ordered Event INSERT lanes.  The supported
+    // production values are 1, 2, 4, and 8.  A batch is routed by its
+    // logical Event owner, so all revisions for one owner stay FIFO on one
+    // lane while different owners may be written concurrently.
+    std::size_t writer_lanes = 1U;
     std::size_t queue_revision_batches = 1'024U;
     std::size_t queue_revision_rows = 1U * 1'024U * 1'024U;
 

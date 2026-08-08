@@ -444,6 +444,11 @@ void TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment() {
     }
     worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->DrainDurableCommits());
+    const EventWorkerStats indexed_stats = worker->stats();
+    CHECK(indexed_stats.ordered_batch_fast_path >= 1U);
+    // Only the one order for this security/channel is visited by END; a
+    // second unrelated order would not increase this counter.
+    CHECK(indexed_stats.barrier_index_orders_visited == 1U);
 
     const CanonicalTick late = ShanghaiAdd(3U, 23U, 200);
     EventInput late_input{late};
@@ -887,6 +892,9 @@ void TestRuntimeRoutesOwnersLateRecoveryAndRawAcks() {
     std::unique_ptr<EventRuntime> runtime =
         EventRuntime::Create(config, &sink, &error);
     CHECK(runtime != nullptr);
+    CHECK(runtime->owner_for_instrument(0U) == 0U);
+    CHECK(runtime->owner_for_instrument(1U) == 1U);
+    CHECK(runtime->owner_for_instrument(kInvalidInstrumentOrdinal) == 2U);
 
     CanonicalTick owner0 = ShenzhenAdd(101U, 80U);
     CanonicalTick owner1 = ShenzhenAdd(201U, 81U);

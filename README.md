@@ -196,6 +196,7 @@ Enable the Event projection on top of that durable raw path with:
 --event-revision-epoch <durably allocated nonzero monotone epoch>
 --event-calculation-run-id <unique 32-hex calculation run ID>
 --event-logic-version 1
+--event-writer-lanes <1|2|4|8>
 ```
 
 The revision epoch occupies the high 32 bits of each Event version and must be
@@ -234,6 +235,9 @@ The measured Event worker → ClickHouse throughput limits, 800k/1M short-window
 results, 30-second fail-closed qualification runs, and ClickHouse query-log
 latencies are in
 [docs/event-worker-clickhouse-benchmark-report.md](docs/event-worker-clickhouse-benchmark-report.md).
+The volatile-memory state-compute isolation benchmark and its 800k/1M
+results are in
+[docs/event-state-capacity-benchmark-report.md](docs/event-state-capacity-benchmark-report.md).
 
 `from-open` and `partial` both default to a 500,000 ns gap wait. The two
 settings remain independent (`--from-open-gap-wait-ns` and
