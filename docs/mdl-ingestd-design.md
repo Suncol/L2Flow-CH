@@ -28,7 +28,10 @@ corresponding raw ACKs. The optional KLine plane in
 [`kline-worker-clickhouse.md`](kline-worker-clickhouse.md) consumes the same
 two Tick branches, uses SDK body exchange time for integer-second windows, and
 has an independent revision sink behind the same raw ACK boundary. The
-repository does not contain CSV/WAL replay, checkpoint restore, reconnect
+Event and KLine planes share the local disk-backed process-lifetime
+FactJournal described in [`fact-journal.md`](fact-journal.md). That file is not
+a durable restart/replay boundary. The repository does not contain CSV/WAL
+replay, checkpoint restore, reconnect
 epoch inference, cold derived-state bootstrap, or intraday restart
 reconciliation. Startup is exactly one of:
 
@@ -122,8 +125,11 @@ is likewise not claimed.
 - The process does not equate an immediate error-free `Connect()` return with
   feed readiness. It requires a successful Logon response and successful
   status for every configured tuple. Bounds-invalid control lists, rejected
-  statuses, pre-ready market data, and the local readiness deadline terminate
-  the process/feed epoch.
+  statuses, and the local readiness deadline terminate the process/feed epoch.
+  In PARTIAL mode, business callbacks received before readiness are counted
+  and discarded; the first callback after readiness establishes the admitted
+  live prefix. FROM_OPEN keeps pre-ready business data fatal because dropping
+  it would violate the declared from-open continuity.
 - API service-timeout and message-discard events also terminate the current
   process/feed epoch. Their message names and IDs are SDK facts; choosing a
   fatal boundary is conservative implementation policy, not a claim that the
@@ -428,7 +434,8 @@ overlapping dynamic range rejection, configured stream exclusion, and runtime
 tuple handling. Wire-level control tests additionally cover Logon/Subscribe
 readiness accumulation, nonzero return/status rejection, malformed and
 overlapping list rejection, API timeout/discard classification, sticky first
-boundary behavior, pre-ready market rejection, and readiness timeout.
+boundary behavior, PARTIAL pre-ready discard, FROM_OPEN pre-ready rejection,
+and readiness timeout.
 Raw-path tests additionally prove pre-recovery capture of retransmissions and
 catalog misses, fail-closed tap behavior, fixed BLAKE3 provenance vectors,
 preallocation accounting, ArrowStream-to-ClickHouse mapping, nested Snapshot

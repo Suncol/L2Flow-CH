@@ -46,17 +46,6 @@ void HashAppend(std::uint64_t* state, Value value) noexcept {
               (*state >> 2U);
 }
 
-struct FactKeyHash final {
-    [[nodiscard]] std::size_t operator()(const FactKey& key) const noexcept {
-        std::uint64_t state = UINT64_C(0x243f6a8885a308d3);
-        HashAppend(&state, key.trade_date);
-        HashAppend(&state, key.market);
-        HashAppend(&state, key.channel);
-        HashAppend(&state, key.native_sequence);
-        return static_cast<std::size_t>(state);
-    }
-};
-
 struct KLineKeyHash final {
     [[nodiscard]] std::size_t operator()(const KLineKey& key) const noexcept {
         std::uint64_t state = UINT64_C(0x13198a2e03707344);
@@ -211,61 +200,6 @@ void AppendAnchor(HashInput* hash, const TradeAnchor& anchor) {
     return hash.Finish();
 }
 
-[[nodiscard]] FactKey MakeFactKey(const CanonicalTick& tick) noexcept {
-    return FactKey{tick.common.trade_date, tick.common.identity.market,
-                   tick.common.channel, tick.common.native_sequence};
-}
-
-[[nodiscard]] bool IdentityEqual(const ingest::ExactIdentity& left,
-                                 const ingest::ExactIdentity& right) noexcept {
-    return left.market == right.market &&
-           left.security_id_source_size == right.security_id_source_size &&
-           left.security_id_size == right.security_id_size &&
-           std::equal(left.security_id_source.begin(),
-                      left.security_id_source.end(),
-                      right.security_id_source.begin()) &&
-           std::equal(left.security_id.begin(), left.security_id.end(),
-                      right.security_id.begin());
-}
-
-[[nodiscard]] bool DecimalEqual(const ingest::FixedDecimal& left,
-                                const ingest::FixedDecimal& right) noexcept {
-    return left.raw == right.raw && left.source_scale == right.source_scale &&
-           left.raw_valid == right.raw_valid;
-}
-
-[[nodiscard]] bool QuantityEqual(const ingest::ScaledInteger& left,
-                                 const ingest::ScaledInteger& right) noexcept {
-    return left.raw == right.raw && left.scale == right.scale &&
-           left.valid == right.valid;
-}
-
-// Keep this aligned with SequenceRecovery/Event business-payload equality.
-// Arrival timestamps and recovery annotations are not business identity.
-[[nodiscard]] bool FactPayloadEqual(const CanonicalTick& left,
-                                    const CanonicalTick& right) noexcept {
-    return left.common.trade_date == right.common.trade_date &&
-           left.common.instrument_id == right.common.instrument_id &&
-           left.common.message_key == right.common.message_key &&
-           left.common.kind == right.common.kind &&
-           left.common.channel == right.common.channel &&
-           left.common.native_sequence == right.common.native_sequence &&
-           left.common.exchange_time_raw == right.common.exchange_time_raw &&
-           IdentityEqual(left.common.identity, right.common.identity) &&
-           DecimalEqual(left.price, right.price) &&
-           DecimalEqual(left.amount, right.amount) &&
-           QuantityEqual(left.quantity, right.quantity) &&
-           left.primary_order_id == right.primary_order_id &&
-           left.buy_order_id == right.buy_order_id &&
-           left.sell_order_id == right.sell_order_id &&
-           left.sh_add_matched_quantity_raw ==
-               right.sh_add_matched_quantity_raw &&
-           left.raw_type == right.raw_type && left.raw_side == right.raw_side &&
-           left.action == right.action && left.side == right.side &&
-           left.aggressor == right.aggressor &&
-           left.order_type == right.order_type && left.phase == right.phase;
-}
-
 [[nodiscard]] bool StructurallyValid(const KLineWorkerConfig& config,
                                      const KLineInput& input) noexcept {
     const CanonicalTick& tick = input.tick;
@@ -392,6 +326,7 @@ struct AtomicStats final {
 class KLineWorker::Impl final {
 public:
     struct FactRecord final {
+        FactKey key{};
         CanonicalTick tick{};
         Identifier128 contribution_hash{};
         bool projected_trade = false;
@@ -416,7 +351,6 @@ public:
 
     Impl(KLineWorkerConfig config, KLineRevisionSink* sink)
         : config_(std::move(config)), sink_(sink) {
-        facts_.reserve(config_.maximum_facts);
         bars_.reserve(config_.maximum_bars);
         heads_.reserve(config_.maximum_bars);
         acknowledged_raw_.reserve(
@@ -441,7 +375,11 @@ public:
 
         try {
             std::set<RawTickDependency> dependencies;
-            std::vector<FactKey> inserted;
+            std::vector<CanonicalTick> admission_ticks;
+            std::vector<const KLineInput*> admission_inputs;
+            admission_ticks.reserve(inputs.size());
+            admission_inputs.reserve(inputs.size());
+            std::vector<FactRecord> inserted;
             inserted.reserve(inputs.size());
             bool saw_conflict = false;
             bool saw_invalid = false;
@@ -463,43 +401,66 @@ public:
                         1U, std::memory_order_relaxed);
                     continue;
                 }
-                const FactKey key = MakeFactKey(input.tick);
-                const auto existing = facts_.find(key);
-                if (existing != facts_.end()) {
-                    if (FactPayloadEqual(existing->second.tick, input.tick)) {
-                        ++result.duplicates;
-                        stats_.duplicate_facts.fetch_add(
-                            1U, std::memory_order_relaxed);
-                    } else {
-                        saw_conflict = true;
-                        stats_.source_conflicts.fetch_add(
-                            1U, std::memory_order_relaxed);
-                    }
+                admission_ticks.push_back(input.tick);
+                admission_inputs.push_back(&input);
+            }
+
+            std::vector<CanonicalTick> admission_winners(
+                admission_ticks.size());
+            const std::vector<journal::AdmitResult> admissions =
+                config_.fact_journal->AdmitBatch(
+                    journal::FactConsumer::kKLine, admission_ticks,
+                    admission_winners);
+            if (admissions.size() != admission_ticks.size() ||
+                !config_.fact_journal->healthy()) {
+                return Failure(
+                    &result,
+                    config_.fact_journal->fatal_error().empty()
+                        ? "KLine FactJournal admission failed"
+                        : config_.fact_journal->fatal_error());
+            }
+            for (std::size_t index = 0U; index < admissions.size(); ++index) {
+                const journal::AdmitResult& admission = admissions[index];
+                const KLineInput& input = *admission_inputs[index];
+                if (admission.code == journal::AdmitCode::kDuplicate) {
+                    ++result.duplicates;
+                    stats_.duplicate_facts.fetch_add(
+                        1U, std::memory_order_relaxed);
                     continue;
                 }
-                if (facts_.size() >= config_.maximum_facts) {
-                    return CapacityFailure(
-                        &result, "KLine FactJournal capacity exhausted");
+                if (admission.code == journal::AdmitCode::kConflict) {
+                    saw_conflict = true;
+                    stats_.source_conflicts.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    continue;
+                }
+                if (admission.code != journal::AdmitCode::kNew) {
+                    return Failure(&result,
+                                   "KLine FactJournal admission failed");
                 }
                 FactRecord record{};
-                record.tick = input.tick;
+                record.key = FactKey{
+                    input.tick.common.trade_date,
+                    input.tick.common.identity.market,
+                    input.tick.common.channel,
+                    input.tick.common.native_sequence};
+                record.tick = admission_winners[index];
                 record.late = input.late_recovery;
-                record.projected_trade = TradeProjectionValid(input.tick);
+                record.projected_trade = TradeProjectionValid(record.tick);
                 if (record.projected_trade) {
-                    record.contribution_hash = HashContribution(input.tick);
+                    record.contribution_hash = HashContribution(record.tick);
                 }
-                if (input.tick.action == TickAction::kTrade &&
+                if (record.tick.action == TickAction::kTrade &&
                     !record.projected_trade) {
                     saw_invalid = true;
                     stats_.invalid_facts.fetch_add(
                         1U, std::memory_order_relaxed);
-                    if (!ExchangeTimeValidForKLine(input.tick)) {
+                    if (!ExchangeTimeValidForKLine(record.tick)) {
                         stats_.invalid_trade_exchange_times.fetch_add(
                             1U, std::memory_order_relaxed);
                     }
                 }
-                facts_.emplace(key, std::move(record));
-                inserted.push_back(key);
+                inserted.push_back(std::move(record));
                 ++result.facts_inserted;
                 stats_.facts_journaled.fetch_add(
                     1U, std::memory_order_relaxed);
@@ -508,8 +469,7 @@ public:
             std::map<KLineKey, BarState> bar_patch;
             std::set<KLineKey> new_bars;
             bool batch_has_late_trade = false;
-            for (const FactKey& key : inserted) {
-                const FactRecord& record = facts_.at(key);
+            for (const FactRecord& record : inserted) {
                 if (!record.projected_trade) {
                     continue;
                 }
@@ -525,7 +485,7 @@ public:
                         record.tick.common.exchange_time_ns_from_midnight /
                         duration * duration;
                     const KLineKey bar_key{
-                        key.trade_date, key.market,
+                        record.key.trade_date, record.key.market,
                         record.tick.common.instrument_id, interval, start};
                     auto patched = bar_patch.find(bar_key);
                     if (patched == bar_patch.end()) {
@@ -891,7 +851,6 @@ private:
 
     KLineWorkerConfig config_{};
     KLineRevisionSink* sink_ = nullptr;
-    std::unordered_map<FactKey, FactRecord, FactKeyHash> facts_;
     std::unordered_map<KLineKey, BarState, KLineKeyHash> bars_;
     std::unordered_map<KLineKey, BarHead, KLineKeyHash> heads_;
     std::deque<PendingCommit> pending_commits_;
@@ -919,7 +878,7 @@ bool ValidateKLineWorkerConfig(const KLineWorkerConfig& config,
     if (!ValidTradeDate(config.trade_date) || config.owner_count == 0U ||
         config.owner >= config.owner_count || config.revision_epoch == 0U ||
         config.logic_version == 0U || IsZero(config.calculation_run_id) ||
-        config.interval_seconds.empty() || config.maximum_facts == 0U ||
+        config.interval_seconds.empty() ||
         config.maximum_bars == 0U || config.maximum_pending_commits == 0U ||
         config.maximum_acknowledged_raw_dependencies == 0U) {
         return fail("invalid KLine worker configuration");
@@ -952,6 +911,19 @@ std::unique_ptr<KLineWorker> KLineWorker::Create(
     if (sink == nullptr) {
         if (error != nullptr) {
             *error = "KLine revision sink is null";
+        }
+        return nullptr;
+    }
+    if (config.fact_journal == nullptr) {
+        if (error != nullptr) {
+            *error = "KLine FactJournal is null";
+        }
+        return nullptr;
+    }
+    if (!config.fact_journal->healthy()) {
+        if (error != nullptr) {
+            *error = "KLine FactJournal is unhealthy: " +
+                     config.fact_journal->fatal_error();
         }
         return nullptr;
     }

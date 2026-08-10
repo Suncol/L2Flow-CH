@@ -89,6 +89,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(l2flow_ch_ingest PRIVATE _GNU_SOURCE)
 endif()
 
+add_library(l2flow_ch_journal STATIC
+    src/fact_journal.cpp)
+add_library(L2FlowCH::journal ALIAS l2flow_ch_journal)
+l2flow_ch_configure(l2flow_ch_journal)
+target_link_libraries(l2flow_ch_journal PUBLIC Threads::Threads)
+
 if(L2FLOW_CH_ENABLE_ARROW_RING OR L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
     add_library(l2flow_ch_arrow_schemas STATIC
         src/arrow_schemas.cpp)
@@ -123,7 +129,7 @@ if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
     add_library(L2FlowCH::clickhouse ALIAS l2flow_ch_clickhouse)
     l2flow_ch_configure(l2flow_ch_clickhouse)
     target_link_libraries(l2flow_ch_clickhouse
-        PUBLIC L2FlowCH::ingest L2FlowCH::arrow_schemas
+        PUBLIC L2FlowCH::ingest L2FlowCH::journal L2FlowCH::arrow_schemas
                Arrow::arrow_shared CURL::libcurl Threads::Threads)
 endif()
 
@@ -150,6 +156,19 @@ if(L2FLOW_CH_BUILD_TESTS)
     l2flow_ch_configure(test_mdl_ingest)
     target_link_libraries(test_mdl_ingest PRIVATE L2FlowCH::ingest)
     add_test(NAME mdl_ingest_core COMMAND test_mdl_ingest)
+
+    add_executable(test_fact_journal tests/test_fact_journal.cpp)
+    l2flow_ch_configure(test_fact_journal)
+    target_link_libraries(test_fact_journal PRIVATE L2FlowCH::journal)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR
+        CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+        target_compile_definitions(test_fact_journal PRIVATE
+            L2FLOW_TEST_WRAP_PWRITE=1)
+        target_link_options(test_fact_journal PRIVATE
+            -Wl,--wrap=pwrite -Wl,--wrap=pread -Wl,--wrap=fdatasync)
+    endif()
+    add_test(NAME fact_journal COMMAND test_fact_journal)
     if(L2FLOW_CH_ENABLE_ARROW_RING)
         add_executable(test_arrow_ring tests/test_arrow_ring.cpp)
         l2flow_ch_configure(test_arrow_ring)
@@ -240,6 +259,8 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --clickhouse-url http://127.0.0.1:8123
                 --clickhouse-feed-epoch 42
                 --event-enable
+                --fact-journal-path /tmp/l2flow-event-config.fjn
+                --fact-journal-maximum-directory-pages 16
                 --event-revision-epoch 9
                 --event-writer-lanes 4
                 --event-calculation-run-id
@@ -263,6 +284,14 @@ if(L2FLOW_CH_BUILD_TESTS)
             mdl_ingest_event_requires_revision_epoch
             PROPERTIES WILL_FAIL TRUE)
         add_test(
+            NAME mdl_ingest_rejects_removed_event_fact_capacity
+            COMMAND ${CMAKE_COMMAND}
+                -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
+                -DARGUMENT=--event-maximum-facts
+                -DVALUE=4194304
+                "-DEXPECTED=unknown option: --event-maximum-facts"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
+        add_test(
             NAME mdl_ingest_kline_config
             COMMAND mdl_ingestd
                 --mode partial
@@ -273,6 +302,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --clickhouse-url http://127.0.0.1:8123
                 --clickhouse-feed-epoch 42
                 --kline-enable
+                --fact-journal-path /tmp/l2flow-kline-config.fjn
                 --kline-interval-seconds 5
                 --kline-interval-seconds 1
                 --kline-interval-seconds 5
@@ -299,6 +329,14 @@ if(L2FLOW_CH_BUILD_TESTS)
         set_tests_properties(
             mdl_ingest_kline_requires_revision_epoch
             PROPERTIES WILL_FAIL TRUE)
+        add_test(
+            NAME mdl_ingest_rejects_removed_kline_fact_capacity
+            COMMAND ${CMAKE_COMMAND}
+                -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
+                -DARGUMENT=--kline-maximum-facts
+                -DVALUE=4194304
+                "-DEXPECTED=unknown option: --kline-maximum-facts"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
     endif()
     add_test(
         NAME mdl_ingest_default_config
@@ -323,6 +361,22 @@ if(L2FLOW_CH_BUILD_TESTS)
             --trade-date 20260806
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --sdk-ready-timeout-seconds 1
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_dispatch_queue_capacity
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --dispatch-queue-capacity 65536
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_late_recovery_queue_capacity
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --late-recovery-queue-capacity 65536
             --validate-only)
     add_test(
         NAME mdl_ingest_rejects_zero_ready_timeout
@@ -426,6 +480,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 L2FLOW_MDL_USER=config-test
                 L2FLOW_CLICKHOUSE_USER=default
                 L2FLOW_CLICKHOUSE_PASSWORD=
+                L2FLOW_FACT_JOURNAL_PATH=/tmp/l2flow-production-config.fjn
                 L2FLOW_SOURCE_INSTANCE_HEX32=000102030405060708090a0b0c0d0e0f
                 L2FLOW_RAW_FEED_EPOCH=42
                 L2FLOW_ARROW_FEED_EPOCH=43
@@ -453,6 +508,8 @@ if(L2FLOW_CH_BUILD_TESTS)
         mdl_ingest_default_config
         mdl_ingest_test_operation_mode
         mdl_ingest_custom_ready_timeout
+        mdl_ingest_dispatch_queue_capacity
+        mdl_ingest_late_recovery_queue_capacity
         mdl_ingest_config_file
         mdl_ingest_process_cpu_list
         PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -464,6 +521,20 @@ if(L2FLOW_CH_BUILD_TESTS)
 endif()
 
 if(L2FLOW_CH_BUILD_BENCHMARKS)
+    add_executable(benchmark_fact_journal
+        benchmarks/benchmark_fact_journal.cpp)
+    l2flow_ch_configure(benchmark_fact_journal)
+    target_link_libraries(benchmark_fact_journal PRIVATE
+        L2FlowCH::journal)
+    if(L2FLOW_CH_BUILD_TESTS)
+        add_test(
+            NAME fact_journal_benchmark_smoke
+            COMMAND benchmark_fact_journal
+                --rate 10000 --seconds 1 --batch-rows 128 --owners 4
+                --journal-dir /tmp --hot-cache 4096 --probe-samples 64
+                --mixed-read-rate 100 --seed-records 16)
+    endif()
+
     add_executable(benchmark_mdl_ingest benchmarks/benchmark_mdl_ingest.cpp)
     l2flow_ch_configure(benchmark_mdl_ingest)
     target_link_libraries(benchmark_mdl_ingest PRIVATE L2FlowCH::ingest)
@@ -477,6 +548,19 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
             L2FlowCH::clickhouse)
         target_compile_definitions(benchmark_mdl_ingest PRIVATE
             L2FLOW_CH_HAS_CLICKHOUSE_RAW=1)
+        if(L2FLOW_CH_BUILD_TESTS)
+            add_test(
+                NAME mdl_ingest_event_benchmark_construction_smoke
+                COMMAND benchmark_mdl_ingest
+                    --rate 1 --seconds 1 --warmup-seconds 0
+                    --channels 1 --tick-lanes 1 --owners 1
+                    --producer-cpu 0 --first-consumer-cpu 1
+                    --first-decoder-cpu 2
+                    --clickhouse-url http://127.0.0.1:8123
+                    --clickhouse-feed-epoch 1 --event-enable
+                    --event-journal-dir /tmp
+                    --event-construction-smoke)
+        endif()
     endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(benchmark_mdl_ingest PRIVATE _GNU_SOURCE)

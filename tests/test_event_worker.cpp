@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -21,6 +26,35 @@ using namespace l2flow::ingest;
             std::exit(1);                                                    \
         }                                                                    \
     } while (false)
+
+std::filesystem::path TestJournalPath(const std::string& label) {
+    static std::uint64_t next_id = 0U;
+    return std::filesystem::temp_directory_path() /
+        ("l2flow-event-test-" + label + "-" +
+         std::to_string(::getpid()) + "-" +
+         std::to_string(next_id++) + ".journal");
+}
+
+std::shared_ptr<l2flow::journal::CanonicalFactJournal> MakeTestJournal(
+    const std::filesystem::path& path,
+    std::size_t hot_cache_entries = 64U) {
+    l2flow::journal::FactJournalConfig config{};
+    config.trade_date = 20260807U;
+    config.path = path;
+    config.hot_cache_entries = hot_cache_entries;
+    std::string error;
+    std::unique_ptr<l2flow::journal::CanonicalFactJournal> created =
+        l2flow::journal::CanonicalFactJournal::Create(
+            std::move(config), &error);
+    CHECK(created != nullptr);
+    auto* const raw = created.release();
+    return std::shared_ptr<l2flow::journal::CanonicalFactJournal>(
+        raw, [path](l2flow::journal::CanonicalFactJournal* journal) noexcept {
+            delete journal;
+            std::error_code ignored;
+            static_cast<void>(std::filesystem::remove(path, ignored));
+        });
+}
 
 class RecordingSink final : public EventRevisionSink {
 public:
@@ -197,7 +231,7 @@ EventWorkerConfig Config() {
     config.owner_count = 1U;
     config.revision_epoch = 9U;
     config.calculation_run_id.bytes[0U] = std::byte{1U};
-    config.maximum_facts = 1'024U;
+    config.fact_journal = MakeTestJournal(TestJournalPath("default"));
     config.maximum_orders = 1'024U;
     config.maximum_cached_events = 4'096U;
     config.maximum_pending_commits = 64U;
@@ -237,9 +271,13 @@ const EventPayload& FindPayload(
 
 void TestLateAddRepairsOnlyReferencedChainAndWaitsForRawAck() {
     RecordingSink sink;
+    const std::filesystem::path path = TestJournalPath("cold-repair");
+    const auto fact_journal = MakeTestJournal(path);
+    EventWorkerConfig config = Config();
+    config.fact_journal = fact_journal;
     std::string error;
     std::unique_ptr<EventWorker> worker =
-        EventWorker::Create(Config(), &sink, &error);
+        EventWorker::Create(config, &sink, &error);
     CHECK(worker != nullptr);
 
     const CanonicalTick trade = ShenzhenTrade(102U, 1U, 101, 0);
@@ -261,6 +299,9 @@ void TestLateAddRepairsOnlyReferencedChainAndWaitsForRawAck() {
            ShenzhenEventQualityBit(
                ShenzhenEventQualityFlag::kUnknownBuyOrderReference)) != 0U);
 
+    fact_journal->ClearHotCache();
+    const std::uint64_t reads_before_repair =
+        fact_journal->stats().read_calls;
     const CanonicalTick add = ShenzhenAdd(101U, 2U);
     EventInput add_input{add};
     add_input.late_recovery = true;
@@ -268,6 +309,7 @@ void TestLateAddRepairsOnlyReferencedChainAndWaitsForRawAck() {
     applied = worker->ApplyBatch(
         std::span<const EventInput>(&add_input, 1U));
     CHECK(applied.code == EventApplyCode::kApplied);
+    CHECK(fact_journal->stats().read_calls > reads_before_repair);
     CHECK(sink.batches.size() == 1U);
     Ack(worker.get(), add);
     CHECK(sink.batches.size() == 2U);
@@ -465,6 +507,45 @@ void TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment() {
                                  revision.operation ==
                                      RevisionOperation::kInsert;
                       }));
+}
+
+void TestShanghaiBarrierBulkRolesStayOrdered() {
+    constexpr std::size_t kOrderCount = 128U;
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<EventWorker> worker =
+        EventWorker::Create(Config(), &sink, &error);
+    CHECK(worker != nullptr);
+
+    std::vector<EventInput> inputs;
+    inputs.reserve(kOrderCount + 2U);
+    inputs.push_back(EventInput{
+        ShanghaiStatus(1U, 500U, TradingPhase::kContinuous)});
+    for (std::size_t index = 0U; index < kOrderCount; ++index) {
+        const std::uint64_t sequence = 2U + index;
+        const std::int64_t order = static_cast<std::int64_t>(
+            kOrderCount - index);
+        inputs.push_back(EventInput{
+            ShanghaiAdd(sequence, 501U + index, order)});
+    }
+    const std::uint64_t end_sequence = kOrderCount + 2U;
+    inputs.push_back(EventInput{ShanghaiStatus(
+        end_sequence, 501U + kOrderCount, TradingPhase::kEnded)});
+
+    CHECK(worker->ApplyBatch(inputs).code == EventApplyCode::kApplied);
+    CHECK(worker->stats().barrier_index_orders_visited == kOrderCount);
+    std::vector<std::pair<EventKey, EventPayload>> bundle;
+    CHECK(worker->CopyBundle(
+        FactKey{20260807U, Market::kShanghai, 7U, end_sequence}, &bundle));
+    std::vector<std::int64_t> finalized_orders;
+    for (const auto& [key, payload] : bundle) {
+        static_cast<void>(payload);
+        if (key.event_kind == EventKind::kShanghaiOrderRevision) {
+            finalized_orders.push_back(key.affected_order_id);
+        }
+    }
+    CHECK(finalized_orders.size() == kOrderCount);
+    CHECK(std::is_sorted(finalized_orders.begin(), finalized_orders.end()));
 }
 
 void TestShanghaiEndSourceOnlyCutRetainsBarrierForLateOrder() {
@@ -1143,9 +1224,13 @@ void TestWorkerBoundsAcknowledgedRawIndex() {
 
 void TestDuplicateAndConflictClassification() {
     RecordingSink sink;
+    const std::filesystem::path path = TestJournalPath("duplicate");
+    const auto fact_journal = MakeTestJournal(path);
+    EventWorkerConfig config = Config();
+    config.fact_journal = fact_journal;
     std::string error;
     std::unique_ptr<EventWorker> worker =
-        EventWorker::Create(Config(), &sink, &error);
+        EventWorker::Create(config, &sink, &error);
     CHECK(worker != nullptr);
     const CanonicalTick add = ShenzhenAdd(1U, 40U);
     EventInput input{add};
@@ -1153,13 +1238,26 @@ void TestDuplicateAndConflictClassification() {
               std::span<const EventInput>(&input, 1U)).code ==
           EventApplyCode::kApplied);
     Ack(worker.get(), add);
+    const l2flow::journal::FactJournalStats new_stats =
+        fact_journal->stats();
+    CHECK(new_stats.records == 1U);
+    CHECK(new_stats.read_calls == 0U);
+    const std::vector<l2flow::journal::AdmitResult> kline_fanout =
+        fact_journal->AdmitBatch(
+            l2flow::journal::FactConsumer::kKLine,
+            std::span<const CanonicalTick>(&add, 1U));
+    CHECK(kline_fanout.size() == 1U);
+    CHECK(kline_fanout[0U].code == l2flow::journal::AdmitCode::kNew);
+    CHECK(fact_journal->stats().records == 1U);
 
     CanonicalTick duplicate = add;
     duplicate.common.ingress_sequence = 41U;
     EventInput duplicate_input{duplicate};
+    fact_journal->ClearHotCache();
     CHECK(worker->ApplyBatch(
               std::span<const EventInput>(&duplicate_input, 1U)).code ==
           EventApplyCode::kDuplicateOnly);
+    CHECK(fact_journal->stats().read_calls == new_stats.read_calls + 1U);
     Ack(worker.get(), duplicate);
     CHECK(sink.batches.size() == 1U);
 
@@ -1175,6 +1273,106 @@ void TestDuplicateAndConflictClassification() {
     CHECK(sink.batches.size() == 1U);
 }
 
+void TestSharedJournalUsesAuthoritativeFirstWinner() {
+    RecordingSink sink;
+    const std::filesystem::path path = TestJournalPath("shared-winner");
+    const auto fact_journal = MakeTestJournal(path);
+
+    const CanonicalTick winner = ShenzhenTrade(11U, 50U, 0, 0);
+    const std::vector<l2flow::journal::AdmitResult> kline_admission =
+        fact_journal->AdmitBatch(
+            l2flow::journal::FactConsumer::kKLine,
+            std::span<const CanonicalTick>(&winner, 1U));
+    CHECK(kline_admission.size() == 1U);
+    CHECK(kline_admission[0U].code ==
+          l2flow::journal::AdmitCode::kNew);
+
+    EventWorkerConfig config = Config();
+    config.fact_journal = fact_journal;
+    std::string error;
+    std::unique_ptr<EventWorker> worker =
+        EventWorker::Create(config, &sink, &error);
+    CHECK(worker != nullptr);
+
+    CanonicalTick event_occurrence = winner;
+    event_occurrence.common.ingress_sequence = 51U;
+    event_occurrence.common.vendor_sequence_id = 10'051U;
+    event_occurrence.common.receive_monotonic_ns = 20'051U;
+    EventInput input{event_occurrence};
+    const EventApplyResult applied = worker->ApplyBatch(
+        std::span<const EventInput>(&input, 1U));
+    CHECK(applied.code == EventApplyCode::kApplied);
+    CHECK(applied.facts_inserted == 1U);
+    Ack(worker.get(), event_occurrence);
+
+    std::vector<std::pair<EventKey, EventPayload>> bundle;
+    CHECK(worker->CopyBundle(
+        FactKey{20260807U, Market::kShenzhen, 7U, 11U}, &bundle));
+    const EventPayload& projected = FindPayload(
+        bundle, EventKind::kShenzhenTrade);
+    CHECK(projected.source_anchor.ingress_sequence ==
+          winner.common.ingress_sequence);
+    const l2flow::journal::FactJournalStats stats = fact_journal->stats();
+    CHECK(stats.records == 1U);
+    CHECK(stats.consumer_new == 2U);
+    CHECK(stats.read_calls == 0U);
+}
+
+void TestWorkerRequiresExplicitFactJournal() {
+    RecordingSink sink;
+    EventWorkerConfig config = Config();
+    config.fact_journal.reset();
+    std::string error;
+    std::unique_ptr<EventWorker> worker =
+        EventWorker::Create(config, &sink, &error);
+    CHECK(worker == nullptr);
+    CHECK(error.find("FactJournal is null") != std::string::npos);
+}
+
+void TestJournalCorruptionFailsClosed() {
+    RecordingSink sink;
+    const std::filesystem::path path = TestJournalPath("corruption");
+    const auto fact_journal = MakeTestJournal(path);
+    EventWorkerConfig config = Config();
+    config.fact_journal = fact_journal;
+    std::string error;
+    std::unique_ptr<EventWorker> worker =
+        EventWorker::Create(config, &sink, &error);
+    CHECK(worker != nullptr);
+
+    const CanonicalTick add = ShenzhenAdd(21U, 60U);
+    EventInput input{add};
+    CHECK(worker->ApplyBatch(
+              std::span<const EventInput>(&input, 1U)).code ==
+          EventApplyCode::kApplied);
+    Ack(worker.get(), add);
+    CHECK(fact_journal->Flush());
+    fact_journal->ClearHotCache();
+
+    const int descriptor = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    CHECK(descriptor >= 0);
+    const off_t payload_offset = static_cast<off_t>(
+        l2flow::journal::kFactJournalFileHeaderBytes +
+        l2flow::journal::kFactJournalRecordHeaderBytes + 7U);
+    std::uint8_t octet = 0U;
+    CHECK(::pread(descriptor, &octet, sizeof(octet), payload_offset) ==
+          static_cast<ssize_t>(sizeof(octet)));
+    octet ^= UINT8_C(0x5a);
+    CHECK(::pwrite(descriptor, &octet, sizeof(octet), payload_offset) ==
+          static_cast<ssize_t>(sizeof(octet)));
+    CHECK(::close(descriptor) == 0);
+
+    CanonicalTick duplicate = add;
+    duplicate.common.ingress_sequence = 61U;
+    EventInput duplicate_input{duplicate};
+    const EventApplyResult failed = worker->ApplyBatch(
+        std::span<const EventInput>(&duplicate_input, 1U));
+    CHECK(failed.code == EventApplyCode::kFailed);
+    CHECK(!worker->healthy());
+    CHECK(!fact_journal->healthy());
+    CHECK(worker->fatal_error().find("FactJournal") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -1183,6 +1381,7 @@ int main() {
     TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo();
     TestUnresolvedLateCancelConvergesBeforeLaterTrade();
     TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment();
+    TestShanghaiBarrierBulkRolesStayOrdered();
     TestShanghaiEndSourceOnlyCutRetainsBarrierForLateOrder();
     TestShanghaiTerminalBeforeEndTombstonesOldFinalize();
     TestLateShanghaiStatusRepairsOnlyUntilNextStatus();
@@ -1198,6 +1397,9 @@ int main() {
     TestPendingCanonicalConflictKeepsRetainedFactAuthoritative();
     TestWorkerBoundsAcknowledgedRawIndex();
     TestDuplicateAndConflictClassification();
+    TestSharedJournalUsesAuthoritativeFirstWinner();
+    TestWorkerRequiresExplicitFactJournal();
+    TestJournalCorruptionFailsClosed();
     std::cout << "all Event worker tests passed\n";
     return 0;
 }

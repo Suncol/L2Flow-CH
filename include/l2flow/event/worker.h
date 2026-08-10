@@ -1,6 +1,7 @@
 #pragma once
 
 #include "l2flow/event/types.h"
+#include "l2flow/journal/fact_journal.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,7 +32,11 @@ struct EventWorkerConfig final {
     std::uint32_t logic_version = 1U;
     Identifier128 calculation_run_id{};
 
-    std::size_t maximum_facts = 4U * 1'024U * 1'024U;
+    // Event and KLine must share this instance so one canonical payload is
+    // appended once while each consumer retains independent first-seen state.
+    // Worker creation rejects a null journal.
+    std::shared_ptr<journal::CanonicalFactJournal> fact_journal;
+
     std::size_t maximum_orders = 2U * 1'024U * 1'024U;
     std::size_t maximum_cached_events = 16U * 1'024U * 1'024U;
     std::size_t maximum_pending_commits = 1'024U;

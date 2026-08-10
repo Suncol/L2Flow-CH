@@ -60,6 +60,7 @@ public:
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] bool feed_ready() const noexcept;
     [[nodiscard]] std::uint64_t feed_ready_monotonic_ns() const noexcept;
+    [[nodiscard]] std::uint64_t pre_ready_messages_discarded() const noexcept;
     [[nodiscard]] StreamMask expected_streams() const noexcept;
     [[nodiscard]] MdlConnectionBoundaryReason connection_boundary_reason()
         const noexcept;
@@ -77,6 +78,24 @@ private:
         MdlConnectionBoundaryReason reason,
         std::uint64_t observed_monotonic_ns,
         std::string_view detail) noexcept;
+    void ClaimConnectionBoundaryLocked(
+        MdlConnectionBoundaryReason reason,
+        std::uint64_t observed_monotonic_ns,
+        std::string_view detail) noexcept;
+
+    enum class ReadinessState : std::uint8_t {
+        kAwaiting,
+        kReady,
+        kClosed,
+    };
+    enum class MarketReadinessDecision : std::uint8_t {
+        kAdmit,
+        kDiscard,
+        kClosed,
+    };
+
+    [[nodiscard]] MarketReadinessDecision CheckMarketReadiness(
+        std::uint64_t observed_monotonic_ns);
 
     IngestEngine* engine_ = nullptr;
     StreamMask expected_streams_ = 0U;
@@ -86,11 +105,13 @@ private:
     std::atomic<bool> failed_{false};
     std::atomic<bool> feed_ready_{false};
     std::atomic<std::uint64_t> feed_ready_monotonic_ns_{0U};
+    std::atomic<std::uint64_t> pre_ready_messages_discarded_{0U};
     std::atomic<MdlConnectionBoundaryReason> connection_boundary_reason_{
         MdlConnectionBoundaryReason::kNone};
     std::atomic<std::uint64_t> connection_boundary_monotonic_ns_{0U};
     mutable std::mutex connection_mutex_;
     std::condition_variable connection_condition_;
+    ReadinessState readiness_state_ = ReadinessState::kAwaiting;
     StreamMask confirmed_streams_ = 0U;
     bool logon_accepted_ = false;
     std::string connection_boundary_detail_;

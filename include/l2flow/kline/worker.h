@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l2flow/journal/fact_journal.h"
 #include "l2flow/kline/types.h"
 
 #include <cstddef>
@@ -31,7 +32,10 @@ struct KLineWorkerConfig final {
     // unique, nonzero intraday second counts.
     std::vector<std::uint32_t> interval_seconds{1U};
 
-    std::size_t maximum_facts = 4U * 1'024U * 1'024U;
+    // Shared across every Event/KLine owner for one trade date. Fact identity
+    // is channel-global, while mutable projection state remains owner-local.
+    std::shared_ptr<journal::CanonicalFactJournal> fact_journal;
+
     std::size_t maximum_bars = 4U * 1'024U * 1'024U;
     std::size_t maximum_pending_commits = 1'024U;
     std::size_t maximum_acknowledged_raw_dependencies = 65'536U;

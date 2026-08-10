@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -28,6 +29,17 @@ struct MdlMessageHandlerTestAccess final {
         MdlMessageHandler* handler,
         std::chrono::milliseconds timeout) noexcept {
         return handler != nullptr && handler->WaitUntilReady(timeout);
+    }
+
+    static void ConfirmStreams(
+        MdlMessageHandler* handler,
+        StreamMask streams,
+        bool successful_logon,
+        std::uint64_t observed_monotonic_ns) noexcept {
+        if (handler != nullptr) {
+            handler->ConfirmStreams(
+                streams, successful_logon, observed_monotonic_ns);
+        }
     }
 };
 
@@ -1301,19 +1313,280 @@ void TestMdlReadinessWaitTimeoutIsAnEpochBoundary() {
     engine->Stop();
 }
 
-void TestMdlMarketDataBeforeReadinessStopsAdmission() {
+void TestMdlReadinessConfirmationAndTimeoutAreSerialized() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    const StreamMask expected = StreamBit(kShanghaiTick);
+    constexpr std::uint64_t kConfirmationTime = 123U;
+    for (std::size_t iteration = 0U; iteration < 128U; ++iteration) {
+        MdlMessageHandler handler(nullptr, expected);
+        std::atomic<bool> start{false};
+        bool wait_result = false;
+        std::thread waiter([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            wait_result = MdlMessageHandlerTestAccess::WaitUntilReady(
+                &handler, std::chrono::milliseconds(0));
+        });
+        std::thread confirmer([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            MdlMessageHandlerTestAccess::ConfirmStreams(
+                &handler, expected, true, kConfirmationTime);
+        });
+        start.store(true, std::memory_order_release);
+        waiter.join();
+        confirmer.join();
+
+        if (handler.feed_ready()) {
+            CHECK(wait_result);
+            CHECK(handler.feed_ready_monotonic_ns() == kConfirmationTime);
+            CHECK(handler.connection_boundary_reason() ==
+                  MdlConnectionBoundaryReason::kNone);
+        } else {
+            CHECK(!wait_result);
+            CHECK(handler.feed_ready_monotonic_ns() == 0U);
+            CHECK(handler.connection_boundary_reason() ==
+                  MdlConnectionBoundaryReason::kReadyTimeout);
+        }
+    }
+}
+
+void TestMdlMarketCallbackAndReadinessConfirmationAreSerialized() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    const StreamMask expected = StreamBit(kShanghaiTick);
+    constexpr std::size_t kIterations = 512U;
+
+    for (const StartMode mode :
+         std::array{StartMode::kPartial, StartMode::kFromOpen}) {
+        std::unique_ptr<IngestEngine> engine = MakeEngine(mode);
+        for (std::size_t iteration = 0U;
+             iteration < kIterations; ++iteration) {
+            MdlMessageHandler handler(engine.get(), expected);
+            // The readiness gate precedes engine decoding.  Keep the market
+            // tuple real but its payload empty so a callback that crosses the
+            // gate is counted synchronously and cannot fill decoder lanes.
+            const std::vector<std::byte> body;
+            TestMdlMessage message(
+                MakeHeader(kShanghaiTick, body.size(), iteration + 1U),
+                body);
+            const EngineStats stats_before = engine->stats();
+            const std::uint64_t confirmation_time = iteration + 1U;
+            std::atomic<std::uint32_t> at_start{0U};
+
+            const auto arrive_and_start = [&] {
+                at_start.fetch_add(1U, std::memory_order_acq_rel);
+                while (at_start.load(std::memory_order_acquire) != 2U) {
+                    std::this_thread::yield();
+                }
+            };
+            const auto deliver_market = [&] {
+                arrive_and_start();
+                handler.OnMessage(nullptr, &message);
+            };
+            const auto confirm_readiness = [&] {
+                arrive_and_start();
+                MdlMessageHandlerTestAccess::ConfirmStreams(
+                    &handler, expected, true, confirmation_time);
+            };
+
+            std::thread market;
+            std::thread confirmer;
+            if ((iteration & 1U) == 0U) {
+                market = std::thread(deliver_market);
+                confirmer = std::thread(confirm_readiness);
+            } else {
+                confirmer = std::thread(confirm_readiness);
+                market = std::thread(deliver_market);
+            }
+            market.join();
+            confirmer.join();
+
+            const bool ready = handler.feed_ready();
+            const MdlConnectionBoundaryReason reason =
+                handler.connection_boundary_reason();
+            const bool ready_without_boundary =
+                ready && reason == MdlConnectionBoundaryReason::kNone;
+            const bool closed_by_pre_ready_market =
+                !ready && reason ==
+                              MdlConnectionBoundaryReason::
+                                  kControlProtocolError;
+            CHECK(!(ready && reason ==
+                                MdlConnectionBoundaryReason::
+                                    kControlProtocolError));
+            CHECK(ready_without_boundary || closed_by_pre_ready_market);
+
+            const EngineStats stats_after = engine->stats();
+            const std::uint64_t engine_callbacks =
+                stats_after.callbacks - stats_before.callbacks;
+            CHECK(engine_callbacks <= 1U);
+            CHECK(stats_after.admitted == stats_before.admitted);
+            if (mode == StartMode::kPartial) {
+                CHECK(ready_without_boundary);
+                CHECK(handler.feed_ready_monotonic_ns() ==
+                      confirmation_time);
+                CHECK(handler.pre_ready_messages_discarded() +
+                          engine_callbacks ==
+                      1U);
+            } else if (ready_without_boundary) {
+                CHECK(handler.feed_ready_monotonic_ns() ==
+                      confirmation_time);
+                CHECK(handler.pre_ready_messages_discarded() == 0U);
+                CHECK(engine_callbacks == 1U);
+            } else {
+                CHECK(handler.feed_ready_monotonic_ns() == 0U);
+                CHECK(handler.pre_ready_messages_discarded() == 0U);
+                CHECK(engine_callbacks == 0U);
+            }
+        }
+        engine->Stop();
+    }
+}
+
+void TestMdlMarketCallbackAndReadinessTimeoutAreSerialized() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    const StreamMask expected = StreamBit(kShanghaiTick);
+    constexpr std::size_t kIterations = 512U;
+
+    for (const StartMode mode :
+         std::array{StartMode::kPartial, StartMode::kFromOpen}) {
+        std::unique_ptr<IngestEngine> engine = MakeEngine(mode);
+        for (std::size_t iteration = 0U;
+             iteration < kIterations; ++iteration) {
+            MdlMessageHandler handler(engine.get(), expected);
+            const std::vector<std::byte> body = MakeShTick(
+                static_cast<std::int64_t>(iteration + 1U), "600000");
+            TestMdlMessage message(
+                MakeHeader(kShanghaiTick, body.size(), iteration + 1U),
+                body);
+            const std::uint64_t admitted_before =
+                engine->stats().admitted;
+            std::atomic<std::uint32_t> at_start{0U};
+            bool wait_result = true;
+
+            const auto arrive_and_start = [&] {
+                at_start.fetch_add(1U, std::memory_order_acq_rel);
+                while (at_start.load(std::memory_order_acquire) != 2U) {
+                    std::this_thread::yield();
+                }
+            };
+            const auto deliver_market = [&] {
+                arrive_and_start();
+                handler.OnMessage(nullptr, &message);
+            };
+            const auto expire_readiness = [&] {
+                arrive_and_start();
+                wait_result = MdlMessageHandlerTestAccess::WaitUntilReady(
+                    &handler, std::chrono::milliseconds(0));
+            };
+
+            std::thread market;
+            std::thread waiter;
+            if ((iteration & 1U) == 0U) {
+                market = std::thread(deliver_market);
+                waiter = std::thread(expire_readiness);
+            } else {
+                waiter = std::thread(expire_readiness);
+                market = std::thread(deliver_market);
+            }
+            market.join();
+            waiter.join();
+
+            CHECK(!wait_result);
+            CHECK(!handler.feed_ready());
+            CHECK(handler.feed_ready_monotonic_ns() == 0U);
+            CHECK(engine->stats().admitted == admitted_before);
+            const MdlConnectionBoundaryReason reason =
+                handler.connection_boundary_reason();
+            if (mode == StartMode::kPartial) {
+                CHECK(reason == MdlConnectionBoundaryReason::kReadyTimeout);
+                CHECK(handler.pre_ready_messages_discarded() <= 1U);
+            } else {
+                CHECK(reason == MdlConnectionBoundaryReason::kReadyTimeout ||
+                      reason == MdlConnectionBoundaryReason::
+                                    kControlProtocolError);
+                CHECK(handler.pre_ready_messages_discarded() == 0U);
+            }
+        }
+        engine->Stop();
+    }
+}
+
+void TestMdlPartialDiscardsMarketDataUntilReadiness() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
     std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kPartial);
     MdlMessageHandler handler(
-        engine.get(), StreamBit({4U, 101U, 24U}));
-    const std::vector<std::byte> body = MakeShTick(1, "600000");
-    TestMdlMessage message(
-        MakeHeader({4U, 101U, 24U}, body.size()), body);
-    handler.OnMessage(nullptr, &message);
+        engine.get(), StreamBit(kShanghaiTick));
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(1, "600000"));
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(2, "600000"));
+    CHECK(handler.last_result() == AdmissionResult::kFeedNotReady);
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kNone);
+    CHECK(handler.pre_ready_messages_discarded() == 2U);
+    CHECK(engine->stats().admitted == 0U);
+
+    const std::array statuses{
+        TestSubscriptionStatus{kShanghaiTick, 0U}};
+    DeliverToHandler(
+        &handler, {2U, 101U, 2U},
+        MakeSystemResponse({2U, 101U, 2U}, statuses));
+    CHECK(handler.feed_ready());
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kNone);
+
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(3, "600000"));
+    CHECK(handler.last_result() == AdmissionResult::kAccepted);
+    CHECK(engine->stats().admitted == 1U);
+    CHECK(handler.pre_ready_messages_discarded() == 2U);
+    engine->Stop();
+}
+
+void TestMdlFromOpenRejectsMarketDataBeforeReadiness() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kFromOpen);
+    MdlMessageHandler handler(
+        engine.get(), StreamBit(kShanghaiTick));
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(1, "600000"));
     CHECK(handler.last_result() == AdmissionResult::kFeedNotReady);
     CHECK(handler.connection_boundary_reason() ==
           MdlConnectionBoundaryReason::kControlProtocolError);
-    CHECK(handler.connection_boundary_detail().find("before MDL feed") !=
+    CHECK(handler.connection_boundary_detail().find("from-open") !=
           std::string::npos);
+    CHECK(handler.pre_ready_messages_discarded() == 0U);
+    CHECK(engine->stats().admitted == 0U);
+    engine->Stop();
+}
+
+void TestMdlPartialDiscardedPrefixDoesNotSurviveReadinessRejection() {
+    constexpr MessageKey kShanghaiTick{4U, 101U, 24U};
+    std::unique_ptr<IngestEngine> engine = MakeEngine(StartMode::kPartial);
+    MdlMessageHandler handler(
+        engine.get(), StreamBit(kShanghaiTick));
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(1, "600000"));
+    CHECK(handler.pre_ready_messages_discarded() == 1U);
+
+    DeliverToHandler(
+        &handler, {2U, 101U, 2U},
+        MakeSystemResponse(
+            {2U, 101U, 2U},
+            std::span<const TestSubscriptionStatus>{},
+            static_cast<std::uint32_t>(
+                datayes::mdl::MDLEC_UNAUTHORIZED)));
+    CHECK(!handler.feed_ready());
+    CHECK(handler.connection_boundary_reason() ==
+          MdlConnectionBoundaryReason::kSubscriptionRejected);
+    CHECK(engine->stats().admitted == 0U);
+
+    const std::array statuses{
+        TestSubscriptionStatus{kShanghaiTick, 0U}};
+    DeliverToHandler(
+        &handler, {2U, 101U, 2U},
+        MakeSystemResponse({2U, 101U, 2U}, statuses));
+    DeliverToHandler(&handler, kShanghaiTick, MakeShTick(2, "600000"));
+    CHECK(!handler.feed_ready());
+    CHECK(handler.last_result() == AdmissionResult::kNotRunning);
+    CHECK(handler.pre_ready_messages_discarded() == 1U);
     CHECK(engine->stats().admitted == 0U);
     engine->Stop();
 }
@@ -1347,7 +1620,12 @@ int main() {
     TestMdlReadinessRejectsFailedAndMalformedResponses();
     TestMdlApiFaultEventsAndFirstBoundaryAreSticky();
     TestMdlReadinessWaitTimeoutIsAnEpochBoundary();
-    TestMdlMarketDataBeforeReadinessStopsAdmission();
+    TestMdlReadinessConfirmationAndTimeoutAreSerialized();
+    TestMdlMarketCallbackAndReadinessConfirmationAreSerialized();
+    TestMdlMarketCallbackAndReadinessTimeoutAreSerialized();
+    TestMdlPartialDiscardsMarketDataUntilReadiness();
+    TestMdlFromOpenRejectsMarketDataBeforeReadiness();
+    TestMdlPartialDiscardedPrefixDoesNotSurviveReadinessRejection();
     std::cout << "all mdl_ingest tests passed\n";
     return 0;
 }

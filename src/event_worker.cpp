@@ -369,10 +369,9 @@ void HashOrderSnapshot(SemanticHasher* hasher,
 }
 
 [[nodiscard]] FactKey MakeFactKey(const CanonicalTick& tick) noexcept {
-    return FactKey{tick.common.trade_date,
-                   tick.common.identity.market,
-                   tick.common.channel,
-                   tick.common.native_sequence};
+    const journal::FactKey key = journal::MakeFactKey(tick);
+    return FactKey{key.trade_date, key.market, key.channel,
+                   key.native_sequence};
 }
 
 [[nodiscard]] OrderKey MakeOrderKey(const CanonicalTick& tick,
@@ -382,61 +381,6 @@ void HashOrderSnapshot(SemanticHasher* hasher,
                     tick.common.instrument_id,
                     tick.common.channel,
                     order_id};
-}
-
-[[nodiscard]] bool IdentityEqual(const ingest::ExactIdentity& left,
-                                 const ingest::ExactIdentity& right) noexcept {
-    return left.market == right.market &&
-           left.security_id_source_size ==
-               right.security_id_source_size &&
-           left.security_id_size == right.security_id_size &&
-           std::equal(left.security_id_source.begin(),
-                      left.security_id_source.end(),
-                      right.security_id_source.begin()) &&
-           std::equal(left.security_id.begin(), left.security_id.end(),
-                      right.security_id.begin());
-}
-
-[[nodiscard]] bool DecimalEqual(const ingest::FixedDecimal& left,
-                                const ingest::FixedDecimal& right) noexcept {
-    return left.raw == right.raw &&
-           left.source_scale == right.source_scale &&
-           left.raw_valid == right.raw_valid;
-}
-
-[[nodiscard]] bool QuantityEqual(const ingest::ScaledInteger& left,
-                                 const ingest::ScaledInteger& right) noexcept {
-    return left.raw == right.raw && left.scale == right.scale &&
-           left.valid == right.valid;
-}
-
-// Arrival provenance and recovery annotations are intentionally excluded.
-// This is the same canonical business-payload comparison used by upstream
-// SequenceRecovery, with catalog identity added explicitly.
-[[nodiscard]] bool FactPayloadEqual(const CanonicalTick& left,
-                                    const CanonicalTick& right) noexcept {
-    return left.common.trade_date == right.common.trade_date &&
-           left.common.instrument_id == right.common.instrument_id &&
-           left.common.message_key == right.common.message_key &&
-           left.common.kind == right.common.kind &&
-           left.common.channel == right.common.channel &&
-           left.common.native_sequence == right.common.native_sequence &&
-           left.common.exchange_time_raw == right.common.exchange_time_raw &&
-           IdentityEqual(left.common.identity, right.common.identity) &&
-           DecimalEqual(left.price, right.price) &&
-           DecimalEqual(left.amount, right.amount) &&
-           QuantityEqual(left.quantity, right.quantity) &&
-           left.primary_order_id == right.primary_order_id &&
-           left.buy_order_id == right.buy_order_id &&
-           left.sell_order_id == right.sell_order_id &&
-           left.sh_add_matched_quantity_raw ==
-               right.sh_add_matched_quantity_raw &&
-           left.raw_type == right.raw_type &&
-           left.raw_side == right.raw_side &&
-           left.action == right.action && left.side == right.side &&
-           left.aggressor == right.aggressor &&
-           left.order_type == right.order_type &&
-           left.phase == right.phase;
 }
 
 [[nodiscard]] Identifier128 HashFact(const CanonicalTick& tick) noexcept {
@@ -1329,15 +1273,57 @@ struct OrderHistory final {
 };
 
 struct FactRecord final {
-    EventInput input{};
-    CanonicalTick source_tick{};
+    journal::FactHandle handle{};
     Identifier128 fact_hash{};
-    SourceFragment source{};
-    std::map<OrderKey, OrderRole> roles;
+    std::vector<std::pair<OrderKey, OrderRole>> roles;
+    std::uint32_t instrument_id = 0U;
+    TradingPhase projected_phase = TradingPhase::kUnknown;
     bool projectable = false;
     bool late = false;
     bool barrier = false;
+    bool projected_phase_valid = false;
+    bool roles_ordered = true;
 };
+
+// Barrier callers establish uniqueness from OrderHistory creation: a new END
+// sees each indexed order once, and a newly created order has never been added
+// to any retained END. Appending keeps those paths amortized O(1).
+void AppendUniqueFactRole(FactRecord* record,
+                          const OrderKey& order,
+                          OrderRole role) {
+    const bool remains_ordered = record->roles_ordered &&
+        (record->roles.empty() || record->roles.back().first < order);
+    record->roles.emplace_back(order, role);
+    record->roles_ordered = remains_ordered;
+}
+
+void UpsertFactRole(FactRecord* record,
+                    const OrderKey& order,
+                    OrderRole role) {
+    const auto existing = std::find_if(
+        record->roles.begin(), record->roles.end(),
+        [&order](const auto& entry) { return entry.first == order; });
+    if (existing != record->roles.end()) {
+        existing->second = role;
+        return;
+    }
+    if (record->roles.empty()) {
+        // Direct Add/Cancel/Trade facts have at most two distinct roles.
+        record->roles.reserve(2U);
+    }
+    AppendUniqueFactRole(record, order, role);
+}
+
+void EnsureFactRolesOrdered(FactRecord* record) {
+    if (record->roles_ordered) {
+        return;
+    }
+    std::sort(record->roles.begin(), record->roles.end(),
+              [](const auto& left, const auto& right) {
+                  return left.first < right.first;
+              });
+    record->roles_ordered = true;
+}
 
 struct Bundle final {
     std::map<EventKey, EventPayload> rows;
@@ -1349,7 +1335,10 @@ struct InstrumentFactIndex final {
     // A late insertion uses lower_bound and remains bounded by the per-
     // instrument journal; this avoids one tree node allocation per normal
     // fact while retaining ordered range traversal for phase repair.
-    std::vector<FactKey> ordered;
+    // The enclosing InstrumentChannelKey already owns every other FactKey
+    // component.  Keeping only native_sequence avoids repeating 16 bytes of
+    // partition identity for every fact retained during the trading day.
+    std::vector<std::uint64_t> ordered;
 };
 
 struct PhaseIndex final {
@@ -1357,21 +1346,16 @@ struct PhaseIndex final {
 };
 
 void InsertInstrumentFact(InstrumentFactIndex* index,
-                          std::uint64_t sequence,
-                          const FactKey& key) {
+                          std::uint64_t sequence) {
     auto& values = index->ordered;
-    if (values.empty() || values.back().native_sequence < sequence) {
-        values.push_back(key);
+    if (values.empty() || values.back() < sequence) {
+        values.push_back(sequence);
         return;
     }
-    const auto position = std::lower_bound(
-        values.begin(), values.end(), sequence,
-        [](const FactKey& fact, std::uint64_t value) {
-            return fact.native_sequence < value;
-        });
-    if (position == values.end() ||
-        position->native_sequence != sequence) {
-        values.insert(position, key);
+    const auto position = std::lower_bound(values.begin(), values.end(),
+                                           sequence);
+    if (position == values.end() || *position != sequence) {
+        values.insert(position, sequence);
     }
 }
 
@@ -1638,6 +1622,13 @@ struct AtomicEventWorkerStats final {
                                 fact.common.channel};
 }
 
+[[nodiscard]] InstrumentChannelKey InstrumentChannel(
+    const FactKey& key,
+    const FactRecord& fact) noexcept {
+    return InstrumentChannelKey{key.trade_date, key.market,
+                                fact.instrument_id, key.channel};
+}
+
 [[nodiscard]] bool RoleObservableEqual(const RoleEval& left,
                                        const RoleEval& right) noexcept {
     return left.post_state == right.post_state &&
@@ -1734,7 +1725,8 @@ public:
             table->max_load_factor(0.80F);
             table->reserve(std::min(limit, kMaximumInitialBuckets));
         };
-        reserve_bounded(&facts_, config_.maximum_facts);
+        reserve_bounded(&facts_, 65'536U);
+        batch_tick_cache_.reserve(65'536U);
         reserve_bounded(&channel_states_, 1'024U);
         reserve_bounded(&barriers_, 4'096U);
         reserve_bounded(&instrument_facts_, 4'096U);
@@ -1743,7 +1735,7 @@ public:
                         4'096U);
         reserve_bounded(&order_histories_, config_.maximum_orders);
         reserve_bounded(&role_cache_, config_.maximum_orders);
-        reserve_bounded(&bundle_cache_, config_.maximum_facts);
+        reserve_bounded(&bundle_cache_, 65'536U);
         reserve_bounded(&event_heads_, config_.maximum_cached_events);
     }
 
@@ -1768,8 +1760,14 @@ public:
         }
 
         try {
+            batch_tick_cache_.clear();
             std::vector<FactKey> inserted;
             inserted.reserve(inputs.size());
+            std::vector<std::pair<FactKey, RawTickDependency>>
+                inserted_dependencies;
+            inserted_dependencies.reserve(inputs.size());
+            std::vector<CanonicalTick> journal_ticks;
+            journal_ticks.reserve(inputs.size());
             std::map<ChannelKey, std::uint64_t> cut_frontiers;
             std::set<RawTickDependency> dependencies;
             bool saw_conflict = false;
@@ -1800,8 +1798,22 @@ public:
                     channel_state == channel_states_.end()
                         ? 0U
                         : channel_state->second.projected_frontier);
+                journal_ticks.push_back(input.tick);
             }
 
+            std::vector<CanonicalTick> journal_winners(
+                journal_ticks.size());
+            const std::vector<journal::AdmitResult> admissions =
+                config_.fact_journal->AdmitBatch(
+                    journal::FactConsumer::kEvent, journal_ticks,
+                    journal_winners);
+            if (admissions.size() != journal_ticks.size()) {
+                return Failure(
+                    &result, "Event FactJournal batch admission failed: " +
+                        config_.fact_journal->fatal_error());
+            }
+
+            std::size_t admission_index = 0U;
             for (const EventInput& input : inputs) {
                 if (!StructurallyValid(config_, input)) {
                     continue;
@@ -1825,55 +1837,83 @@ public:
                     saw_conflict = true;
                     continue;
                 }
-                const auto existing = facts_.find(key);
-                if (existing != facts_.end()) {
-                    if (FactPayloadEqual(existing->second.source_tick,
-                                         input.tick)) {
-                        ++result.duplicates;
-                        ++stats_.duplicate_facts;
-                    } else {
-                        ++stats_.source_conflicts;
-                        saw_conflict = true;
-                    }
+                const std::size_t current_admission = admission_index++;
+                const journal::AdmitResult& admission =
+                    admissions[current_admission];
+                if (admission.code == journal::AdmitCode::kDuplicate) {
+                    ++result.duplicates;
+                    ++stats_.duplicate_facts;
                     continue;
                 }
-                if (facts_.size() >= config_.maximum_facts) {
-                    return CapacityFailure(&result,
-                                           "Event FactJournal capacity exhausted");
+                if (admission.code == journal::AdmitCode::kConflict) {
+                    ++stats_.source_conflicts;
+                    saw_conflict = true;
+                    continue;
+                }
+                if (admission.code == journal::AdmitCode::kFailed) {
+                    return Failure(
+                        &result,
+                        "Event FactJournal admission failed: " +
+                            config_.fact_journal->fatal_error());
+                }
+                if (facts_.contains(key)) {
+                    return Failure(
+                        &result,
+                        "Event FactJournal consumer state diverged from "
+                        "Event metadata");
+                }
+                const CanonicalTick& winner =
+                    journal_winners[current_admission];
+                if (MakeFactKey(winner) != key) {
+                    return Failure(
+                        &result,
+                        "Event FactJournal returned a mismatched fact handle");
                 }
                 FactRecord record{};
-                record.input = input;
-                record.source_tick = input.tick;
-                record.fact_hash = HashFact(input.tick);
-                record.projectable = ProjectionInputValid(input.tick);
+                record.handle = admission.handle;
+                record.fact_hash = HashFact(winner);
+                record.instrument_id = winner.common.instrument_id;
+                record.projected_phase = winner.phase;
+                record.projected_phase_valid =
+                    (winner.validity & ingest::kTickPhaseValid) != 0U;
+                record.projectable = ProjectionInputValid(winner);
                 source_only_candidate = source_only_candidate &&
                     record.projectable;
                 record.late = input.late_recovery ||
                     key.native_sequence <= cut_frontiers.at(channel);
                 if (record.projectable) {
-                    record.source = ProjectSource(input.tick);
                     record.barrier =
                         key.market == Market::kShanghai &&
-                        input.tick.action == TickAction::kStatus &&
-                        (input.tick.validity & ingest::kTickPhaseValid) != 0U &&
-                        input.tick.phase == TradingPhase::kEnded;
+                        winner.action == TickAction::kStatus &&
+                        (winner.validity & ingest::kTickPhaseValid) != 0U &&
+                        winner.phase == TradingPhase::kEnded;
                 }
+                batch_tick_cache_.emplace_back(key, winner);
                 facts_.emplace(key, std::move(record));
                 inserted.push_back(key);
+                inserted_dependencies.emplace_back(
+                    key, RawTickDependency{
+                        input.tick.common.ingress_sequence,
+                        input.tick.common.kind});
                 InsertInstrumentFact(
-                    &instrument_facts_[InstrumentChannel(input.tick)],
-                    key.native_sequence, key);
+                    &instrument_facts_[InstrumentChannel(winner)],
+                    key.native_sequence);
                 if (key.market == Market::kShanghai &&
-                    input.tick.action == TickAction::kStatus &&
-                    (input.tick.validity & ingest::kTickPhaseValid) != 0U) {
+                    winner.action == TickAction::kStatus &&
+                    (winner.validity & ingest::kTickPhaseValid) != 0U) {
                     InsertPhase(
-                        &phase_statuses_[InstrumentChannel(input.tick)],
-                        key.native_sequence, input.tick.phase);
+                        &phase_statuses_[InstrumentChannel(winner)],
+                        key.native_sequence, winner.phase);
                 }
                 channel_state.journal_tail = std::max(
                     channel_state.journal_tail, key.native_sequence);
                 ++result.facts_inserted;
                 ++stats_.facts_journaled;
+            }
+            if (admission_index != admissions.size()) {
+                return Failure(
+                    &result,
+                    "Event FactJournal admission/result count diverged");
             }
 
             if (inserted.empty()) {
@@ -1890,6 +1930,17 @@ public:
                 ++stats_.ordered_batch_fast_path;
             } else {
                 std::sort(inserted.begin(), inserted.end());
+                std::sort(
+                    inserted_dependencies.begin(),
+                    inserted_dependencies.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.first < right.first;
+                    });
+                std::sort(
+                    batch_tick_cache_.begin(), batch_tick_cache_.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.first < right.first;
+                    });
                 ++stats_.unordered_batch_sorts;
             }
             const bool source_only_fast = source_only_candidate &&
@@ -1897,9 +1948,12 @@ public:
             if (source_only_fast) {
                 ++stats_.source_only_fast_path;
             }
-            std::set<FactKey> phase_changed = source_only_fast
-                ? std::set<FactKey>{}
-                : NormalizeShanghaiPhases(inserted);
+            std::set<FactKey> phase_changed;
+            if (!source_only_fast &&
+                !NormalizeShanghaiPhases(inserted, &phase_changed)) {
+                return Failure(&result,
+                               "Event Shanghai phase normalization failed");
+            }
             std::map<OrderKey, DirtyOrder> dirty_orders;
             std::map<FactKey, bool> dirty_bundles;
             for (const FactKey& key : inserted) {
@@ -1912,6 +1966,10 @@ public:
                 if (!source_only_fast) {
                     if (!RegisterFactUses(key, &record, &dirty_orders,
                                           &result)) {
+                        if (!healthy_) {
+                            result.code = EventApplyCode::kFailed;
+                            return result;
+                        }
                         return CapacityFailure(
                             &result,
                             "Event OrderUseIndex capacity exhausted");
@@ -1922,7 +1980,7 @@ public:
                     // later through late recovery.  RegisterFactUses also
                     // applies the barrier to existing orders; this branch
                     // only needs the persistent in-memory barrier index.
-                    barriers_[InstrumentChannel(record.source_tick)]
+                    barriers_[InstrumentChannel(key, record)]
                         [key.native_sequence] = key;
                 }
             }
@@ -2019,18 +2077,35 @@ public:
 
             std::set<RawTickDependency> repair_dependencies;
             std::set<RawTickDependency> live_dependencies;
-            const auto add_fact_dependency = [this](
+            const auto add_fact_dependency = [&inserted_dependencies](
                 const FactKey& key,
-                std::set<RawTickDependency>* output) {
-                const CanonicalTick& tick = facts_.at(key).source_tick;
-                output->insert(RawTickDependency{
-                    tick.common.ingress_sequence, tick.common.kind});
+                std::set<RawTickDependency>* output) -> bool {
+                const auto dependency = std::lower_bound(
+                    inserted_dependencies.begin(),
+                    inserted_dependencies.end(), key,
+                    [](const auto& entry, const FactKey& value) {
+                        return entry.first < value;
+                    });
+                if (dependency == inserted_dependencies.end()) {
+                    return false;
+                }
+                if (dependency->first != key) {
+                    return false;
+                }
+                output->insert(dependency->second);
+                return true;
             };
             for (const FactKey& key : repair_inserted) {
-                add_fact_dependency(key, &repair_dependencies);
+                if (!add_fact_dependency(key, &repair_dependencies)) {
+                    return Failure(
+                        &result, "Event raw dependency fact read failed");
+                }
             }
             for (const FactKey& key : live_inserted) {
-                add_fact_dependency(key, &live_dependencies);
+                if (!add_fact_dependency(key, &live_dependencies)) {
+                    return Failure(
+                        &result, "Event raw dependency fact read failed");
+                }
             }
             for (const RawTickDependency& dependency : dependencies) {
                 if (!repair_dependencies.contains(dependency) &&
@@ -2325,6 +2400,41 @@ private:
         healthy_.store(false, std::memory_order_release);
     }
 
+    [[nodiscard]] bool LoadSourceTick(const FactKey& key,
+                                      const FactRecord& record,
+                                      CanonicalTick* output) {
+        const auto hot = std::lower_bound(
+            batch_tick_cache_.begin(), batch_tick_cache_.end(), key,
+            [](const auto& entry, const FactKey& value) {
+                return entry.first < value;
+            });
+        if (hot != batch_tick_cache_.end() && hot->first == key) {
+            *output = hot->second;
+            return true;
+        }
+        if (config_.fact_journal->Read(record.handle, output)) {
+            return true;
+        }
+        SetFatal("Event FactJournal read failed: " +
+                 config_.fact_journal->fatal_error());
+        return false;
+    }
+
+    [[nodiscard]] bool LoadProjectedTick(const FactKey& key,
+                                         const FactRecord& record,
+                                         CanonicalTick* output) {
+        if (!LoadSourceTick(key, record, output)) {
+            return false;
+        }
+        output->phase = record.projected_phase;
+        if (record.projected_phase_valid) {
+            output->validity |= ingest::kTickPhaseValid;
+        } else {
+            output->validity &= ~ingest::kTickPhaseValid;
+        }
+        return true;
+    }
+
     void ClearRepairEvalPatch(RepairTransaction* repair,
                               const OrderKey& order) noexcept {
         auto position = repair->eval_patch.lower_bound(
@@ -2480,6 +2590,10 @@ private:
             return false;
         }
         const FactRecord& fact = fact_position->second;
+        CanonicalTick projected_tick{};
+        if (!LoadProjectedTick(fact_key, fact, &projected_tick)) {
+            return false;
+        }
         const RoleCacheKey cache_key{task->key, sequence};
         const auto old_position = role_cache_.find(cache_key);
         const RoleEval* old_eval = old_position == role_cache_.end()
@@ -2487,7 +2601,7 @@ private:
             : &old_position->second;
         const std::optional<OrderState> prior_state = task->previous.state;
         const ApplyRoleResult applied = ApplyOrderRole(
-            task->previous.state, fact.input.tick, use->second,
+            task->previous.state, projected_tick, use->second,
             task->previous.input_set_hash, fact.fact_hash);
         if (!applied.ok) {
             return false;
@@ -2592,7 +2706,12 @@ private:
         std::size_t projected_event_count = cached_event_count_;
         for (const auto& [key, late_reason] : *dirty_bundles) {
             static_cast<void>(late_reason);
-            Bundle assembled = AssembleBundle(key, *eval_patch);
+            Bundle assembled{};
+            if (!AssembleBundle(key, *eval_patch, &assembled)) {
+                static_cast<void>(Failure(
+                    result, "Event bundle source fact read failed"));
+                return false;
+            }
             const auto old = bundle_cache_.find(key);
             const std::size_t old_size = old == bundle_cache_.end()
                 ? 0U
@@ -2841,22 +2960,27 @@ private:
     }
 
     [[nodiscard]] bool NormalizeOneShanghaiPhase(
-        const FactKey& key) {
+        const FactKey& key,
+        bool* changed) {
+        *changed = false;
         FactRecord& record = facts_.at(key);
-        CanonicalTick& projected = record.input.tick;
-        if (projected.common.identity.market != Market::kShanghai ||
-            projected.action == TickAction::kStatus) {
+        CanonicalTick projected{};
+        if (!LoadProjectedTick(key, record, &projected)) {
             return false;
         }
+        if (projected.common.identity.market != Market::kShanghai ||
+            projected.action == TickAction::kStatus) {
+            return true;
+        }
         const std::optional<TradingPhase> phase = PhaseAt(
-            InstrumentChannel(record.source_tick), key.native_sequence);
+            InstrumentChannel(key, record), key.native_sequence);
         const TradingPhase next = phase.value_or(TradingPhase::kUnknown);
         const bool next_valid = phase.has_value() &&
                                 next != TradingPhase::kUnknown;
         const bool old_valid =
             (projected.validity & ingest::kTickPhaseValid) != 0U;
         if (projected.phase == next && old_valid == next_valid) {
-            return false;
+            return true;
         }
         projected.phase = next;
         if (next_valid) {
@@ -2864,28 +2988,34 @@ private:
         } else {
             projected.validity &= ~ingest::kTickPhaseValid;
         }
+        record.projected_phase = projected.phase;
+        record.projected_phase_valid = next_valid;
         record.fact_hash = HashFact(projected);
-        record.source = ProjectSource(projected);
+        *changed = true;
         return true;
     }
 
-    [[nodiscard]] std::set<FactKey> NormalizeShanghaiPhases(
-        std::span<const FactKey> inserted) {
+    [[nodiscard]] bool NormalizeShanghaiPhases(
+        std::span<const FactKey> inserted,
+        std::set<FactKey>* changed) {
         std::set<FactKey> candidates;
         for (const FactKey& key : inserted) {
             const FactRecord& record = facts_.at(key);
             if (key.market != Market::kShanghai) {
                 continue;
             }
+            CanonicalTick source{};
+            if (!LoadSourceTick(key, record, &source)) {
+                return false;
+            }
             const InstrumentChannelKey range =
-                InstrumentChannel(record.source_tick);
+                InstrumentChannel(key, record);
             const auto journal = instrument_facts_.find(range);
             if (journal == instrument_facts_.end()) {
                 continue;
             }
-            if (record.source_tick.action != TickAction::kStatus ||
-                (record.source_tick.validity &
-                 ingest::kTickPhaseValid) == 0U) {
+            if (source.action != TickAction::kStatus ||
+                (source.validity & ingest::kTickPhaseValid) == 0U) {
                 candidates.insert(key);
                 continue;
             }
@@ -2905,23 +3035,24 @@ private:
             }
             const auto& values = journal->second.ordered;
             const auto position = std::upper_bound(
-                values.begin(), values.end(), key.native_sequence,
-                [](std::uint64_t value, const FactKey& fact) {
-                    return value < fact.native_sequence;
-                });
+                values.begin(), values.end(), key.native_sequence);
             for (auto cursor = position;
-                 cursor != values.end() && cursor->native_sequence < end;
+                 cursor != values.end() && *cursor < end;
                  ++cursor) {
-                candidates.insert(*cursor);
+                candidates.insert(FactKey{
+                    range.trade_date, range.market, range.channel, *cursor});
             }
         }
-        std::set<FactKey> changed;
         for (const FactKey& key : candidates) {
-            if (NormalizeOneShanghaiPhase(key)) {
-                changed.insert(key);
+            bool one_changed = false;
+            if (!NormalizeOneShanghaiPhase(key, &one_changed)) {
+                return false;
+            }
+            if (one_changed) {
+                changed->insert(key);
             }
         }
-        return changed;
+        return true;
     }
 
     [[nodiscard]] bool EnsureOrder(
@@ -2950,8 +3081,8 @@ private:
                             OrderRole::kBarrier)) {
                         return false;
                     }
-                    facts_.at(fact_key).roles.emplace(
-                        order, OrderRole::kBarrier);
+                    AppendUniqueFactRole(
+                        &facts_.at(fact_key), order, OrderRole::kBarrier);
                 }
             }
         }
@@ -2961,6 +3092,7 @@ private:
 
     [[nodiscard]] bool AddDirectRole(
         FactRecord* record,
+        std::uint64_t native_sequence,
         const OrderKey& order,
         OrderRole role,
         std::map<OrderKey, DirtyOrder>* dirty_orders,
@@ -2970,13 +3102,12 @@ private:
             return false;
         }
         if (!SetOrderUse(
-                history, record->input.tick.common.native_sequence, role)) {
+                history, native_sequence, role)) {
             return false;
         }
-        record->roles[order] = role;
+        UpsertFactRole(record, order, role);
         DirtyOrder& dirty = (*dirty_orders)[order];
-        dirty.new_sequences.insert(
-            record->input.tick.common.native_sequence);
+        dirty.new_sequences.insert(native_sequence);
         dirty.late = dirty.late || record->late;
         static_cast<void>(result);
         return true;
@@ -2987,11 +3118,15 @@ private:
         FactRecord* record,
         std::map<OrderKey, DirtyOrder>* dirty_orders,
         EventApplyResult* result) {
-        const CanonicalTick& fact = record->input.tick;
+        CanonicalTick fact{};
+        if (!LoadProjectedTick(fact_key, *record, &fact)) {
+            return false;
+        }
         if (fact.action == TickAction::kAdd ||
             fact.action == TickAction::kCancel) {
             if (!AddDirectRole(
-                    record, MakeOrderKey(fact, fact.primary_order_id),
+                    record, fact_key.native_sequence,
+                    MakeOrderKey(fact, fact.primary_order_id),
                     OrderRole::kPrimary, dirty_orders, result)) {
                 return false;
             }
@@ -3003,7 +3138,7 @@ private:
             } else {
                 if (fact.buy_order_id > 0) {
                     if (!AddDirectRole(
-                            record,
+                            record, fact_key.native_sequence,
                             MakeOrderKey(fact, fact.buy_order_id),
                             OrderRole::kBuy, dirty_orders, result)) {
                         return false;
@@ -3011,7 +3146,7 @@ private:
                 }
                 if (fact.sell_order_id > 0) {
                     if (!AddDirectRole(
-                            record,
+                            record, fact_key.native_sequence,
                             MakeOrderKey(fact, fact.sell_order_id),
                             OrderRole::kSell, dirty_orders, result)) {
                         return false;
@@ -3031,6 +3166,8 @@ private:
             stats_.barrier_index_orders_visited.fetch_add(
                 static_cast<std::uint64_t>(indexed_orders->second.size()),
                 std::memory_order_relaxed);
+            record->roles.reserve(
+                record->roles.size() + indexed_orders->second.size());
             for (const OrderKey& order : indexed_orders->second) {
                 auto history_position = order_histories_.find(order);
                 if (history_position == order_histories_.end()) {
@@ -3042,7 +3179,7 @@ private:
                         OrderRole::kBarrier)) {
                     return false;
                 }
-                record->roles[order] = OrderRole::kBarrier;
+                AppendUniqueFactRole(record, order, OrderRole::kBarrier);
                 DirtyOrder& dirty = (*dirty_orders)[order];
                 dirty.new_sequences.insert(fact_key.native_sequence);
                 dirty.late = dirty.late || record->late;
@@ -3088,13 +3225,17 @@ private:
                 return false;
             }
             const FactRecord& fact = fact_position->second;
+            CanonicalTick projected_tick{};
+            if (!LoadProjectedTick(fact_key, fact, &projected_tick)) {
+                return false;
+            }
             const RoleCacheKey cache_key{order, sequence};
             const auto old_position = role_cache_.find(cache_key);
             const RoleEval* old_eval = old_position == role_cache_.end()
                 ? nullptr
                 : &old_position->second;
             const ApplyRoleResult applied = ApplyOrderRole(
-                previous.state, fact.input.tick, use->second,
+                previous.state, projected_tick, use->second,
                 previous.input_set_hash, fact.fact_hash);
             if (!applied.ok) {
                 return false;
@@ -3149,16 +3290,23 @@ private:
         return true;
     }
 
-    [[nodiscard]] Bundle AssembleBundle(
+    [[nodiscard]] bool AssembleBundle(
         const FactKey& fact_key,
-        const std::map<RoleCacheKey, RoleEval>& eval_patch) const {
-        Bundle bundle{};
-        const FactRecord& fact = facts_.at(fact_key);
+        const std::map<RoleCacheKey, RoleEval>& eval_patch,
+        Bundle* output) {
+        *output = {};
+        FactRecord& fact = facts_.at(fact_key);
         if (!fact.projectable) {
-            return bundle;
+            return true;
         }
-        SourceFragment source = fact.source;
+        CanonicalTick projected_tick{};
+        if (!LoadProjectedTick(fact_key, fact, &projected_tick)) {
+            return false;
+        }
+        Bundle bundle{};
+        SourceFragment source = ProjectSource(projected_tick);
         Identifier128 source_input_hash = fact.fact_hash;
+        EnsureFactRolesOrdered(&fact);
         for (const auto& [order, role] : fact.roles) {
             const RoleEval* eval = FindEval(
                 RoleCacheKey{order, fact_key.native_sequence}, eval_patch);
@@ -3171,7 +3319,7 @@ private:
             if (source.kind.has_value()) {
                 source.payload.event_quality_flags |=
                     eval->source_quality_contribution;
-                if (fact.input.tick.action == TickAction::kCancel) {
+                if (projected_tick.action == TickAction::kCancel) {
                     source.payload.referenced_order_found =
                         eval->referenced_order_found;
                     if (fact_key.market == Market::kShenzhen &&
@@ -3185,7 +3333,7 @@ private:
             if (eval->order_fragment.has_value()) {
                 EventKey key{fact_key.trade_date,
                              fact_key.market,
-                             fact.input.tick.common.instrument_id,
+                             fact.instrument_id,
                              fact_key.channel,
                              fact_key.native_sequence,
                              fact_key.market == Market::kShanghai
@@ -3204,7 +3352,7 @@ private:
         if (source.kind.has_value()) {
             EventKey key{fact_key.trade_date,
                          fact_key.market,
-                         fact.input.tick.common.instrument_id,
+                         fact.instrument_id,
                          fact_key.channel,
                          fact_key.native_sequence,
                          *source.kind,
@@ -3213,7 +3361,8 @@ private:
             bundle.rows.emplace(key, source.payload);
             bundle.input_set_hashes.emplace(key, source_input_hash);
         }
-        return bundle;
+        *output = std::move(bundle);
+        return true;
     }
 
     [[nodiscard]] bool AllocateVersion(std::uint32_t* counter,
@@ -3348,6 +3497,10 @@ private:
     EventWorkerConfig config_{};
     EventRevisionSink* sink_ = nullptr;
     std::unordered_map<FactKey, FactRecord, FactKeyHash> facts_;
+    // At most one owner micro-batch. This keeps the normal new-fact projection
+    // path off disk; historical repair and cold duplicate validation use the
+    // shared journal synchronously in this first implementation.
+    std::vector<std::pair<FactKey, CanonicalTick>> batch_tick_cache_;
     std::unordered_map<ChannelKey, EventChannelState, ChannelKeyHash>
         channel_states_;
     std::unordered_map<InstrumentChannelKey,
@@ -3398,7 +3551,7 @@ bool ValidateEventWorkerConfig(const EventWorkerConfig& config,
     if (!ValidTradeDate(config.trade_date) || config.owner_count == 0U ||
         config.owner >= config.owner_count || config.revision_epoch == 0U ||
         config.logic_version == 0U || IsZero(config.calculation_run_id) ||
-        config.maximum_facts == 0U || config.maximum_orders == 0U ||
+        config.maximum_orders == 0U ||
         config.maximum_cached_events == 0U ||
         config.maximum_pending_commits == 0U ||
         config.maximum_acknowledged_raw_dependencies == 0U ||
@@ -3426,6 +3579,19 @@ std::unique_ptr<EventWorker> EventWorker::Create(
         return nullptr;
     }
     try {
+        if (config.fact_journal == nullptr) {
+            if (error != nullptr) {
+                *error = "Event FactJournal is null";
+            }
+            return nullptr;
+        }
+        if (!config.fact_journal->healthy()) {
+            if (error != nullptr) {
+                *error = "Event FactJournal is unhealthy: " +
+                    config.fact_journal->fatal_error();
+            }
+            return nullptr;
+        }
         return std::unique_ptr<EventWorker>(new EventWorker(
             std::make_unique<Impl>(std::move(config), sink)));
     } catch (const std::exception& exception) {

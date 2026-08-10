@@ -28,7 +28,10 @@ The worker may calculate an in-memory revision before its raw occurrence is
 durable. It cannot submit that revision to the KLine sink until all raw Tick
 dependencies at the head of its pending FIFO have received a successful raw
 ClickHouse ACK. The raw, runtime, and revision queues are volatile memory, not
-a WAL.
+a WAL. Event and KLine must share one local disk-backed canonical FactJournal;
+that file is a process-lifetime spill/cache and is not reopened after a crash.
+See [fact-journal.md](fact-journal.md) for its capacity, I/O, and recovery
+contract.
 
 ## 2. Exchange-time-only windows
 
@@ -152,8 +155,9 @@ The logical KLine key is:
 
 `instrument_id` is the stable catalog identity. The dense
 `instrument_ordinal` is used only for owner routing and is not persisted as a
-KLine identity. Multiple configured intervals share one fact journal but
-produce independent keys.
+KLine identity. Multiple configured intervals and all Event/KLine owners share
+one canonical journal but produce independent KLine keys. KLine retains bar
+state, not a full trading-day `CanonicalTick` map.
 
 Each changed bar produces an immutable revision. Its version is:
 

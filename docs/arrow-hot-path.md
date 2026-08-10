@@ -186,7 +186,10 @@ successful `MessageStatus`. Successful statuses may be accumulated from
 subsequent `SubscribeResponse` messages, but a `SubscribeResponse` does not
 replace the successful Logon response. The recorded event time is the callback
 entry time of the response that completes readiness. A market callback before
-this state is a control-order failure; it is not admitted silently.
+this state is counted and discarded in PARTIAL mode; that callback is not
+published to raw, derived, or Arrow outputs. FROM_OPEN treats the same callback
+as a fatal control-order failure because its complete-prefix contract does not
+permit dropping initial records.
 
 The event names and IDs above are SDK facts. The following shutdown decisions
 are local continuity policy. `ConnectErrorEvent`, `DisconnectedEvent`, a

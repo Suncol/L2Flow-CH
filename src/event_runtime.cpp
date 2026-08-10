@@ -15,6 +15,8 @@ struct AtomicRuntimeStats final {
     std::atomic<std::uint64_t> normal_ticks_received{0U};
     std::atomic<std::uint64_t> late_ticks_received{0U};
     std::atomic<std::uint64_t> raw_tick_acks_received{0U};
+    std::atomic<std::uint64_t> late_inbox_backlog{0U};
+    std::atomic<std::uint64_t> raw_ack_inbox_backlog{0U};
     std::atomic<std::uint64_t> micro_batches_applied{0U};
     std::atomic<std::uint64_t> source_conflicts{0U};
     std::atomic<std::uint64_t> invalid_inputs{0U};
@@ -60,6 +62,12 @@ public:
         mutable std::mutex inbox_mutex;
         std::vector<EventInput> late_inbox;
         std::vector<RawTickDependency> ack_inbox;
+        // Owner-local drain buffers keep inbox allocations on a stable
+        // two-buffer cycle. Raw ACK and LateRecovery producers run on other
+        // threads, so destroying the swapped inbox on every drain causes
+        // sustained cross-thread allocator growth under a live feed.
+        std::vector<EventInput> late_drain;
+        std::vector<RawTickDependency> ack_drain;
     };
 
     Impl(EventRuntimeConfig config,
@@ -117,6 +125,8 @@ public:
                 return false;
             }
             state.late_inbox.push_back(std::move(input));
+            stats_.late_inbox_backlog.fetch_add(
+                1U, std::memory_order_release);
             stats_.late_ticks_received.fetch_add(
                 1U, std::memory_order_relaxed);
             return true;
@@ -136,7 +146,7 @@ public:
             monotonic_ns >= state.active_started_ns &&
             monotonic_ns - state.active_started_ns >=
                 config_.micro_batch_max_delay_ns) {
-            return Flush(owner);
+            return FlushActive(owner);
         }
         return ServiceWorkerOnce(owner);
     }
@@ -145,6 +155,10 @@ public:
         if (!ValidOwner(owner) || !healthy() || !DrainInboxes(owner)) {
             return false;
         }
+        return FlushActive(owner);
+    }
+
+    [[nodiscard]] bool FlushActive(std::size_t owner) noexcept {
         OwnerState& state = *owners_[owner];
         if (state.active.empty()) {
             return ServiceWorkerOnce(owner);
@@ -245,6 +259,9 @@ public:
                 state.ack_inbox.insert(state.ack_inbox.end(),
                                        grouped[owner].begin(),
                                        grouped[owner].end());
+                stats_.raw_ack_inbox_backlog.fetch_add(
+                    static_cast<std::uint64_t>(grouped[owner].size()),
+                    std::memory_order_release);
                 stats_.raw_tick_acks_received.fetch_add(
                     static_cast<std::uint64_t>(grouped[owner].size()),
                     std::memory_order_relaxed);
@@ -287,6 +304,10 @@ public:
             std::memory_order_relaxed);
         result.raw_tick_acks_received = stats_.raw_tick_acks_received.load(
             std::memory_order_relaxed);
+        result.late_inbox_backlog = stats_.late_inbox_backlog.load(
+            std::memory_order_acquire);
+        result.raw_ack_inbox_backlog = stats_.raw_ack_inbox_backlog.load(
+            std::memory_order_acquire);
         result.micro_batches_applied = stats_.micro_batches_applied.load(
             std::memory_order_relaxed);
         result.source_conflicts = stats_.source_conflicts.load(
@@ -327,7 +348,7 @@ private:
         OwnerState& state = *owners_[owner];
         try {
             if (state.active.size() >= config_.micro_batch_rows &&
-                !Flush(owner)) {
+                !FlushActive(owner)) {
                 return false;
             }
             if (state.active.empty()) {
@@ -335,7 +356,7 @@ private:
             }
             state.active.push_back(std::move(input));
             if (state.active.size() >= config_.micro_batch_rows) {
-                return Flush(owner);
+                return FlushActive(owner);
             }
             return true;
         } catch (...) {
@@ -346,27 +367,37 @@ private:
 
     [[nodiscard]] bool DrainInboxes(std::size_t owner) noexcept {
         OwnerState& state = *owners_[owner];
-        std::vector<EventInput> late;
-        std::vector<RawTickDependency> acknowledgements;
+        if (!state.late_drain.empty() || !state.ack_drain.empty()) {
+            SetFatal("Event owner drain buffers are not empty");
+            return false;
+        }
         {
             std::lock_guard<std::mutex> lock(state.inbox_mutex);
-            late.swap(state.late_inbox);
-            acknowledgements.swap(state.ack_inbox);
+            state.late_drain.swap(state.late_inbox);
+            state.ack_drain.swap(state.ack_inbox);
         }
-        if (!acknowledgements.empty()) {
-            state.worker->AcknowledgeRawTicks(acknowledgements);
+        stats_.late_inbox_backlog.fetch_sub(
+            static_cast<std::uint64_t>(state.late_drain.size()),
+            std::memory_order_acq_rel);
+        stats_.raw_ack_inbox_backlog.fetch_sub(
+            static_cast<std::uint64_t>(state.ack_drain.size()),
+            std::memory_order_acq_rel);
+        if (!state.ack_drain.empty()) {
+            state.worker->AcknowledgeRawTicks(state.ack_drain);
             if (!state.worker->healthy()) {
                 SetFatal(state.worker->fatal_error());
                 return false;
             }
         }
-        for (EventInput& input : late) {
+        for (EventInput& input : state.late_drain) {
             const std::uint64_t received =
                 input.tick.common.receive_monotonic_ns;
             if (!AppendInput(owner, std::move(input), received)) {
                 return false;
             }
         }
+        state.late_drain.clear();
+        state.ack_drain.clear();
         return ServiceWorkerOnce(owner);
     }
 
@@ -461,6 +492,10 @@ std::unique_ptr<EventRuntime> EventRuntime::Create(
             state->late_inbox.reserve(
                 config.maximum_late_backlog_per_owner);
             state->ack_inbox.reserve(
+                config.maximum_raw_ack_backlog_per_owner);
+            state->late_drain.reserve(
+                config.maximum_late_backlog_per_owner);
+            state->ack_drain.reserve(
                 config.maximum_raw_ack_backlog_per_owner);
             owners.push_back(std::move(state));
         }

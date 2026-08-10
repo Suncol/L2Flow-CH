@@ -492,13 +492,14 @@ void MdlMessageHandler::OnMessage(
                 AdmissionResult::kAccepted, std::memory_order_release);
             return;
         }
-        if (!feed_ready()) {
-            ClaimConnectionBoundary(
-                MdlConnectionBoundaryReason::kControlProtocolError,
-                callback_entry_ns,
-                "market data arrived before MDL feed readiness");
+        const MarketReadinessDecision readiness =
+            CheckMarketReadiness(callback_entry_ns);
+        if (readiness != MarketReadinessDecision::kAdmit) {
             last_result_.store(
-                AdmissionResult::kFeedNotReady, std::memory_order_release);
+                readiness == MarketReadinessDecision::kDiscard
+                    ? AdmissionResult::kFeedNotReady
+                    : AdmissionResult::kNotRunning,
+                std::memory_order_release);
             return;
         }
         const AdmissionResult result = engine_->AdmitMdlMessage(
@@ -518,6 +519,7 @@ void MdlMessageHandler::OnMessage(
 void MdlMessageHandler::StopAccepting() noexcept {
     static_cast<void>(
         accepting_.exchange(false, std::memory_order_acq_rel));
+    connection_condition_.notify_all();
 }
 
 std::uint64_t MdlMessageHandler::active_callbacks() const noexcept {
@@ -541,6 +543,11 @@ std::uint64_t MdlMessageHandler::feed_ready_monotonic_ns() const noexcept {
         return 0U;
     }
     return feed_ready_monotonic_ns_.load(std::memory_order_relaxed);
+}
+
+std::uint64_t MdlMessageHandler::pre_ready_messages_discarded()
+    const noexcept {
+    return pre_ready_messages_discarded_.load(std::memory_order_acquire);
 }
 
 StreamMask MdlMessageHandler::expected_streams() const noexcept {
@@ -567,36 +574,88 @@ std::string MdlMessageHandler::connection_boundary_detail() const {
     return connection_boundary_detail_;
 }
 
+MdlMessageHandler::MarketReadinessDecision
+MdlMessageHandler::CheckMarketReadiness(
+    std::uint64_t observed_monotonic_ns) {
+    if (feed_ready()) {
+        return MarketReadinessDecision::kAdmit;
+    }
+
+    bool notify = false;
+    MarketReadinessDecision decision = MarketReadinessDecision::kClosed;
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        const bool boundary_free =
+            connection_boundary_reason_.load(std::memory_order_relaxed) ==
+            MdlConnectionBoundaryReason::kNone;
+        const bool accepting =
+            accepting_.load(std::memory_order_acquire);
+        if (readiness_state_ == ReadinessState::kReady &&
+            boundary_free && accepting) {
+            decision = MarketReadinessDecision::kAdmit;
+        } else if (readiness_state_ == ReadinessState::kAwaiting &&
+                   boundary_free && accepting) {
+            if (engine_->config().start_mode == StartMode::kPartial) {
+                pre_ready_messages_discarded_.fetch_add(
+                    1U, std::memory_order_relaxed);
+            } else {
+                accepting_.store(false, std::memory_order_release);
+                ClaimConnectionBoundaryLocked(
+                    MdlConnectionBoundaryReason::kControlProtocolError,
+                    observed_monotonic_ns,
+                    "market data arrived before MDL feed readiness in "
+                    "from-open mode");
+                notify = true;
+            }
+            decision = MarketReadinessDecision::kDiscard;
+        }
+    }
+    if (notify) {
+        connection_condition_.notify_all();
+    }
+    return decision;
+}
+
 bool MdlMessageHandler::WaitUntilReady(
     std::chrono::milliseconds timeout) noexcept {
-    bool timed_out = false;
+    bool notify = false;
+    bool ready = false;
     try {
         std::unique_lock<std::mutex> lock(connection_mutex_);
         static_cast<void>(connection_condition_.wait_for(
             lock, timeout, [this] {
-                return feed_ready_.load(std::memory_order_acquire) ||
+                return readiness_state_ != ReadinessState::kAwaiting ||
                        connection_boundary_reason_.load(
                            std::memory_order_acquire) !=
                            MdlConnectionBoundaryReason::kNone ||
-                       failed_.load(std::memory_order_acquire);
+                       failed_.load(std::memory_order_acquire) ||
+                       !accepting_.load(std::memory_order_acquire);
             }));
-        timed_out = !feed_ready_.load(std::memory_order_acquire) &&
-                    connection_boundary_reason_.load(
-                        std::memory_order_acquire) ==
-                        MdlConnectionBoundaryReason::kNone &&
-                    !failed_.load(std::memory_order_acquire);
+        if (readiness_state_ == ReadinessState::kAwaiting &&
+            connection_boundary_reason_.load(std::memory_order_relaxed) ==
+                MdlConnectionBoundaryReason::kNone &&
+            !failed_.load(std::memory_order_acquire) &&
+            accepting_.load(std::memory_order_acquire)) {
+            accepting_.store(false, std::memory_order_release);
+            ClaimConnectionBoundaryLocked(
+                MdlConnectionBoundaryReason::kReadyTimeout,
+                MonotonicNowNs(),
+                "timed out waiting for successful MDL subscription status");
+            notify = true;
+        }
+        ready = readiness_state_ == ReadinessState::kReady &&
+                connection_boundary_reason_.load(std::memory_order_relaxed) ==
+                    MdlConnectionBoundaryReason::kNone &&
+                !failed_.load(std::memory_order_acquire) &&
+                accepting_.load(std::memory_order_acquire);
     } catch (...) {
         failed_.store(true, std::memory_order_release);
+        notify = true;
     }
-    if (timed_out) {
-        ClaimConnectionBoundary(
-            MdlConnectionBoundaryReason::kReadyTimeout,
-            MonotonicNowNs(),
-            "timed out waiting for successful MDL subscription status");
+    if (notify) {
+        connection_condition_.notify_all();
     }
-    return feed_ready() && !failed() &&
-           connection_boundary_reason() ==
-               MdlConnectionBoundaryReason::kNone;
+    return ready;
 }
 
 void MdlMessageHandler::ConfirmStreams(
@@ -606,8 +665,10 @@ void MdlMessageHandler::ConfirmStreams(
     bool became_ready = false;
     try {
         std::lock_guard<std::mutex> lock(connection_mutex_);
-        if (connection_boundary_reason_.load(std::memory_order_acquire) !=
-            MdlConnectionBoundaryReason::kNone) {
+        if (readiness_state_ != ReadinessState::kAwaiting ||
+            !accepting_.load(std::memory_order_acquire) ||
+            connection_boundary_reason_.load(std::memory_order_relaxed) !=
+                MdlConnectionBoundaryReason::kNone) {
             return;
         }
         confirmed_streams_ |= streams;
@@ -617,6 +678,7 @@ void MdlMessageHandler::ConfirmStreams(
             (confirmed_streams_ & expected_streams_) == expected_streams_) {
             feed_ready_monotonic_ns_.store(
                 observed_monotonic_ns, std::memory_order_relaxed);
+            readiness_state_ = ReadinessState::kReady;
             feed_ready_.store(true, std::memory_order_release);
             became_ready = true;
         }
@@ -635,26 +697,38 @@ void MdlMessageHandler::ClaimConnectionBoundary(
     if (reason == MdlConnectionBoundaryReason::kNone) {
         return;
     }
-    static_cast<void>(
-        accepting_.exchange(false, std::memory_order_acq_rel));
+    bool claimed = false;
     try {
         std::lock_guard<std::mutex> lock(connection_mutex_);
         if (connection_boundary_reason_.load(std::memory_order_relaxed) !=
             MdlConnectionBoundaryReason::kNone) {
             return;
         }
-        try {
-            connection_boundary_detail_.assign(detail);
-        } catch (...) {
-            connection_boundary_detail_.clear();
-        }
-        connection_boundary_monotonic_ns_.store(
-            observed_monotonic_ns, std::memory_order_relaxed);
-        connection_boundary_reason_.store(reason, std::memory_order_release);
+        accepting_.store(false, std::memory_order_release);
+        ClaimConnectionBoundaryLocked(
+            reason, observed_monotonic_ns, detail);
+        claimed = true;
     } catch (...) {
         failed_.store(true, std::memory_order_release);
     }
-    connection_condition_.notify_all();
+    if (claimed || failed()) {
+        connection_condition_.notify_all();
+    }
+}
+
+void MdlMessageHandler::ClaimConnectionBoundaryLocked(
+    MdlConnectionBoundaryReason reason,
+    std::uint64_t observed_monotonic_ns,
+    std::string_view detail) noexcept {
+    readiness_state_ = ReadinessState::kClosed;
+    try {
+        connection_boundary_detail_.assign(detail);
+    } catch (...) {
+        connection_boundary_detail_.clear();
+    }
+    connection_boundary_monotonic_ns_.store(
+        observed_monotonic_ns, std::memory_order_relaxed);
+    connection_boundary_reason_.store(reason, std::memory_order_release);
 }
 
 namespace {

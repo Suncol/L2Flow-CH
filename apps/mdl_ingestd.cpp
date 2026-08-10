@@ -11,6 +11,7 @@
 #include "l2flow/clickhouse/kline_sink.h"
 #include "l2flow/clickhouse/raw_sink.h"
 #include "l2flow/event/runtime.h"
+#include "l2flow/journal/fact_journal.h"
 #include "l2flow/kline/runtime.h"
 #endif
 
@@ -101,6 +102,7 @@ struct Options final {
     l2flow::clickhouse::KLineClickHouseConfig clickhouse_kline{};
     l2flow::event::EventRuntimeConfig event{};
     l2flow::kline::KLineRuntimeConfig kline{};
+    l2flow::journal::FactJournalConfig fact_journal{};
     std::string clickhouse_password_environment;
     bool clickhouse_enabled = false;
     bool event_enabled = false;
@@ -252,6 +254,8 @@ void PrintUsage() {
         << "  --tick-lanes N             default 12\n"
         << "  --snapshot-lanes N         default 4\n"
         << "  --instrument-workers N     default 16\n"
+        << "  --dispatch-queue-capacity N per decoder-to-owner edge; default 1024\n"
+        << "  --late-recovery-queue-capacity N per tick decoder; default 4096\n"
         << "  --operation-mode live|test default live\n"
         << "  --stream-config FILE       default "
            "config/production.streams.conf\n"
@@ -305,6 +309,10 @@ void PrintUsage() {
         << "  --clickhouse-insert-quorum N default 0 (local/no quorum)\n"
         << "  --clickhouse-no-auto-create use externally managed tables\n"
         << "  --clickhouse-no-tls-verify disable HTTPS peer verification\n"
+        << "  --fact-journal-path FILE   required for Event/KLine; process-lifetime disk spill\n"
+        << "  --fact-journal-hot-cache N decoded winners retained; default 65536\n"
+        << "  --fact-journal-maximum-records N global first-winner cap; default 600000000\n"
+        << "  --fact-journal-maximum-directory-pages N sparse 64KiB page cap; default 262144\n"
         << "  --event-enable             enable Event projection; publish after raw ACK\n"
         << "  --event-revision-epoch N   required nonzero monotone writer epoch\n"
         << "  --event-calculation-run-id HEX32 required calculation identity\n"
@@ -315,7 +323,6 @@ void PrintUsage() {
         << "  --event-writer-lanes N (1,2,4,8) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
-        << "  --event-maximum-facts N    default 4194304 per owner\n"
         << "  --event-maximum-orders N   default 2097152 per owner\n"
         << "  --event-maximum-cached-events N default 16777216 per owner\n"
         << "  --event-maximum-pending-commits N default 1024 per owner\n"
@@ -334,7 +341,6 @@ void PrintUsage() {
         << "  --kline-writer-lanes N (1,2,4,8) default 1\n"
         << "  --kline-queue-revision-batches N default 1024\n"
         << "  --kline-queue-revision-rows N default 1048576\n"
-        << "  --kline-maximum-facts N    default 4194304 per owner\n"
         << "  --kline-maximum-bars N     default 4194304 per owner\n"
         << "  --kline-maximum-pending-commits N default 1024 per owner\n"
         << "  --kline-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
@@ -824,6 +830,7 @@ struct CpuSelection final {
     bool kline_interval_set = false;
     bool kline_revision_epoch_set = false;
     bool kline_calculation_run_id_set = false;
+    bool fact_journal_option_seen = false;
 #endif
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -890,6 +897,19 @@ struct CpuSelection final {
             if (!ParseInteger(next(argument),
                               &parsed.engine.instrument_workers)) {
                 *error = "invalid --instrument-workers";
+                return false;
+            }
+        } else if (argument == "--dispatch-queue-capacity") {
+            if (!ParseInteger(next(argument),
+                              &parsed.engine.dispatch_queue_capacity)) {
+                *error = "invalid --dispatch-queue-capacity";
+                return false;
+            }
+        } else if (argument == "--late-recovery-queue-capacity") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.engine.late_recovery_queue_capacity)) {
+                *error = "invalid --late-recovery-queue-capacity";
                 return false;
             }
         } else if (argument == "--first-decoder-cpu") {
@@ -1087,6 +1107,33 @@ struct CpuSelection final {
         } else if (argument == "--clickhouse-no-tls-verify") {
             parsed.clickhouse.tls_verify_peer = false;
             clickhouse_option_seen = true;
+        } else if (argument == "--fact-journal-path") {
+            parsed.fact_journal.path = next(argument);
+            fact_journal_option_seen = true;
+        } else if (argument == "--fact-journal-hot-cache") {
+            if (!ParseInteger(next(argument),
+                              &parsed.fact_journal.hot_cache_entries)) {
+                *error = "invalid --fact-journal-hot-cache";
+                return false;
+            }
+            fact_journal_option_seen = true;
+        } else if (argument == "--fact-journal-maximum-records") {
+            if (!ParseInteger(next(argument),
+                              &parsed.fact_journal.maximum_records)) {
+                *error = "invalid --fact-journal-maximum-records";
+                return false;
+            }
+            fact_journal_option_seen = true;
+        } else if (argument ==
+                   "--fact-journal-maximum-directory-pages") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.fact_journal.maximum_directory_pages)) {
+                *error =
+                    "invalid --fact-journal-maximum-directory-pages";
+                return false;
+            }
+            fact_journal_option_seen = true;
         } else if (argument == "--event-enable") {
             parsed.event_enabled = true;
             event_option_seen = true;
@@ -1156,13 +1203,6 @@ struct CpuSelection final {
                     next(argument),
                     &parsed.clickhouse_event.queue_revision_rows)) {
                 *error = "invalid --event-queue-revision-rows";
-                return false;
-            }
-            event_option_seen = true;
-        } else if (argument == "--event-maximum-facts") {
-            if (!ParseInteger(next(argument),
-                              &parsed.event.worker.maximum_facts)) {
-                *error = "invalid --event-maximum-facts";
                 return false;
             }
             event_option_seen = true;
@@ -1305,13 +1345,6 @@ struct CpuSelection final {
                     next(argument),
                     &parsed.clickhouse_kline.queue_revision_rows)) {
                 *error = "invalid --kline-queue-revision-rows";
-                return false;
-            }
-            kline_option_seen = true;
-        } else if (argument == "--kline-maximum-facts") {
-            if (!ParseInteger(next(argument),
-                              &parsed.kline.worker.maximum_facts)) {
-                *error = "invalid --kline-maximum-facts";
                 return false;
             }
             kline_option_seen = true;
@@ -1461,6 +1494,21 @@ struct CpuSelection final {
         *error = "KLine options require --kline-enable";
         return false;
     }
+    if (fact_journal_option_seen &&
+        !parsed.event_enabled && !parsed.kline_enabled) {
+        *error = "FactJournal options require --event-enable or --kline-enable";
+        return false;
+    }
+    if ((parsed.event_enabled || parsed.kline_enabled) &&
+        (parsed.fact_journal.path.empty() ||
+         parsed.fact_journal.hot_cache_entries == 0U ||
+         parsed.fact_journal.maximum_records == 0U ||
+         parsed.fact_journal.maximum_directory_pages == 0U)) {
+        *error = "Event/KLine requires a nonempty --fact-journal-path and "
+                 "nonzero FactJournal capacities";
+        return false;
+    }
+    parsed.fact_journal.trade_date = parsed.engine.trade_date;
     if (clickhouse_option_seen && !parsed.clickhouse_enabled) {
         *error = "ClickHouse options require --clickhouse-url";
         return false;
@@ -1695,7 +1743,10 @@ void PrintEventStats(
     const l2flow::clickhouse::EventClickHouseStats& sink) {
     std::cout << "event_normal_in=" << runtime.normal_ticks_received
               << " event_late_in=" << runtime.late_ticks_received
+              << " event_late_backlog=" << runtime.late_inbox_backlog
               << " event_raw_acks=" << runtime.raw_tick_acks_received
+              << " event_raw_ack_backlog="
+              << runtime.raw_ack_inbox_backlog
               << " event_micro_batches=" << runtime.micro_batches_applied
               << " event_facts=" << runtime.workers.facts_journaled
               << " event_repaired_uses="
@@ -1741,7 +1792,10 @@ void PrintKLineStats(
     const l2flow::clickhouse::KLineClickHouseStats& sink) {
     std::cout << "kline_normal_in=" << runtime.normal_ticks_received
               << " kline_late_in=" << runtime.late_ticks_received
+              << " kline_late_backlog=" << runtime.late_inbox_backlog
               << " kline_raw_acks=" << runtime.raw_tick_acks_received
+              << " kline_raw_ack_backlog="
+              << runtime.raw_ack_inbox_backlog
               << " kline_micro_batches=" << runtime.micro_batches_applied
               << " kline_facts=" << runtime.workers.facts_journaled
               << " kline_trades=" << runtime.workers.trades_projected
@@ -1987,6 +2041,8 @@ void PrintMonitor(const EngineStats& current,
               << " decode_errors=" << current.decode_errors
               << " catalog_misses=" << current.catalog_misses
               << " gaps=" << current.gaps_skipped
+              << " late_recovery_out="
+              << current.late_recovery_dispatched
               << " lane_full=" << current.lane_full << '\n'
               << std::flush;
 }
@@ -2051,11 +2107,26 @@ int main(int argc, char** argv) {
     }
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     RawTickBatchAckFanout raw_ack_fanout;
+    std::shared_ptr<l2flow::journal::CanonicalFactJournal> fact_journal;
     std::unique_ptr<l2flow::clickhouse::EventClickHouseSink> clickhouse_event;
     std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
     std::unique_ptr<l2flow::clickhouse::KLineClickHouseSink> clickhouse_kline;
     std::unique_ptr<l2flow::kline::KLineRuntime> kline_runtime;
     std::unique_ptr<l2flow::clickhouse::RawClickHouseSink> clickhouse_raw;
+    if ((options.event_enabled || options.kline_enabled) &&
+        !options.validate_only) {
+        std::unique_ptr<l2flow::journal::CanonicalFactJournal> created =
+            l2flow::journal::CanonicalFactJournal::Create(
+                options.fact_journal, &error);
+        if (created == nullptr) {
+            std::cerr << "FactJournal creation failed: " << error << '\n';
+            return 1;
+        }
+        fact_journal = std::shared_ptr<
+            l2flow::journal::CanonicalFactJournal>(std::move(created));
+        options.event.worker.fact_journal = fact_journal;
+        options.kline.worker.fact_journal = fact_journal;
+    }
     if (options.event_enabled && !options.validate_only) {
         clickhouse_event =
             l2flow::clickhouse::EventClickHouseSink::Create(
@@ -2225,13 +2296,14 @@ int main(int argc, char** argv) {
         PrintKLineStats(kline_runtime->stats(), clickhouse_kline->stats());
     }
     const auto clickhouse_healthy = [
-        &clickhouse_raw, &clickhouse_event, &event_runtime,
+        &clickhouse_raw, &clickhouse_event, &event_runtime, &fact_journal,
         &clickhouse_kline, &kline_runtime] {
         return (clickhouse_raw == nullptr || clickhouse_raw->healthy()) &&
                (clickhouse_event == nullptr || clickhouse_event->healthy()) &&
                (event_runtime == nullptr || event_runtime->healthy()) &&
                (clickhouse_kline == nullptr || clickhouse_kline->healthy()) &&
-               (kline_runtime == nullptr || kline_runtime->healthy());
+               (kline_runtime == nullptr || kline_runtime->healthy()) &&
+               (fact_journal == nullptr || fact_journal->healthy());
     };
 #else
     const auto clickhouse_healthy = [] { return true; };
@@ -2463,6 +2535,7 @@ int main(int argc, char** argv) {
     bool kline_drain_ok = true;
     bool kline_stop_ok = true;
     std::string kline_stop_error;
+    bool fact_journal_flush_ok = true;
     const auto flush_derived_runtimes = [&] {
         if (event_runtime != nullptr) {
             event_flush_ok = event_runtime->FlushAll();
@@ -2472,6 +2545,9 @@ int main(int argc, char** argv) {
         }
     };
     const auto stop_clickhouse_raw = [&] {
+        if (fact_journal != nullptr) {
+            fact_journal_flush_ok = fact_journal->Flush();
+        }
         if (clickhouse_raw != nullptr) {
             clickhouse_stop_ok =
                 clickhouse_raw->Stop(&clickhouse_stop_error);
@@ -2505,9 +2581,17 @@ int main(int argc, char** argv) {
 #endif
 
     MdlMessageHandler handler(engine.get(), stream_mask);
+    const auto print_mdl_readiness_summary = [&handler] {
+        std::cout << "mdl_feed_ready_monotonic_ns="
+                  << handler.feed_ready_monotonic_ns()
+                  << " pre_ready_messages_discarded="
+                  << handler.pre_ready_messages_discarded() << '\n'
+                  << std::flush;
+    };
     std::unique_ptr<PhysicalSdkSession> sdk = PhysicalSdkSession::Connect(
         options.sdk, &handler, &error);
     if (sdk == nullptr) {
+        print_mdl_readiness_summary();
         stop_engine_and_drain();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
         flush_derived_runtimes();
@@ -2524,6 +2608,7 @@ int main(int argc, char** argv) {
         std::cerr << "SDK connect failed: " << error << '\n';
         return 1;
     }
+    print_mdl_readiness_summary();
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     if (arrow_egress != nullptr && handler.feed_ready()) {
         static_cast<void>(arrow_egress->MarkFeedConnected(
@@ -2680,6 +2765,12 @@ int main(int argc, char** argv) {
                           ? clickhouse_raw->fatal_error()
                           : clickhouse_stop_error)
                   << '\n';
+        return 1;
+    }
+    if (fact_journal != nullptr &&
+        (!fact_journal_flush_ok || !fact_journal->healthy())) {
+        std::cerr << "fatal FactJournal error: "
+                  << fact_journal->fatal_error() << '\n';
         return 1;
     }
 #endif

@@ -126,7 +126,7 @@ tuple-specific hard-fail branch: an unconfigured tuple is not subscribed, a
 configured-but-unimplemented tuple is rejected during configuration, and an
 unexpected runtime tuple is reported as `unsupported_message`.
 
-For live Arrow-ring tests that must exclude snapshots, use
+For live deployments and Arrow-ring tests that must exclude snapshots, use
 [`config/live-ticks.streams.conf`](config/live-ticks.streams.conf). It subscribes
 only to Shanghai Tick plus Shenzhen Order and Transaction. The Arrow manifest
 still contains empty Snapshot rings as part of protocol v2's fixed ring set;
@@ -175,6 +175,9 @@ and credentials are intentionally supplied through environment variables;
 [`config/current-server.production.env.example`](config/current-server.production.env.example)
 lists every required variable without committing a credential or reusable
 identity.
+The profile subscribes only to the three Tick tuples in
+`config/live-ticks.streams.conf`; fixed empty Snapshot lanes and Arrow rings are
+retained for the current engine and Arrow protocol layout.
 
 Run validation from the repository working directory before starting the SDK:
 
@@ -190,7 +193,7 @@ set +a
 
 The live supervisor uses the same environment and command without
 `--validate-only`. Set its working directory to
-`/home/sunc/code/L2Flow-CH-shared-memory-arrow-ring`, or replace relative paths
+`/home/sunc/code/L2Flow-CH-latency-optimization`, or replace relative paths
 in the profile with absolute paths. `L2FLOW_START_MODE=from-open` is valid only
 when the subscribed sequence domains genuinely start with complete coverage
 from sequence 1. A mid-session start or restart must use `partial`.
@@ -302,6 +305,20 @@ Example local raw launch arguments are:
 --clickhouse-source-instance-id <stable 32-hex source ID>
 ```
 
+Event and KLine require one shared process-lifetime canonical fact journal:
+
+```text
+--fact-journal-path <path on dedicated local storage>
+--fact-journal-hot-cache 262144
+--fact-journal-maximum-records 600000000
+--fact-journal-maximum-directory-pages 262144
+```
+
+The record-count, disk, memory-directory, latency, and restart boundaries are
+documented in [docs/fact-journal.md](docs/fact-journal.md). This local file is
+not a replacement for durable raw ClickHouse data and is not reopened after a
+crash.
+
 Enable the Event projection on top of that durable raw path with:
 
 ```text
@@ -347,6 +364,13 @@ An error-free return from the SDK `Connect()` call is not considered ready.
 `mdl_ingestd` waits up to `--sdk-ready-timeout-seconds` (default 30) for a
 successful Logon response and successful status for every configured stream;
 failure creates a continuity boundary and requires a new feed session epoch.
+In `partial` mode, business callbacks delivered by the SDK before readiness
+are counted and discarded, and normal admission starts only after readiness.
+`from-open` rejects the same condition because dropping an initial record would
+invalidate its complete-prefix contract.
+Both successful and failed connection attempts print the stable startup field
+`pre_ready_messages_discarded`; these callbacks are rejected by the handler
+before engine, raw, Event, KLine, or Arrow admission.
 The core library exposes `TryPollTick`, `TryPollSnapshot`, `TryPollGap`,
 `TryPollLateRecovery`, and `TryPollChannelFault` for the next-stage workers.
 In either startup mode, a native record arriving behind the already-published
@@ -367,6 +391,8 @@ query contracts are documented in
 The exchange-time KLine, late-revision, and ClickHouse current-query contracts
 are documented in
 [docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
+The shared Event/KLine FactJournal capacity and storage contract is documented
+in [docs/fact-journal.md](docs/fact-journal.md).
 The measured Event worker → ClickHouse throughput limits, 800k/1M short-window
 results, 30-second fail-closed qualification runs, and ClickHouse query-log
 latencies are in

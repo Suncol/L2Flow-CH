@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -22,6 +25,29 @@ using namespace l2flow::kline;
             std::exit(1);                                                    \
         }                                                                    \
     } while (false)
+
+std::shared_ptr<l2flow::journal::CanonicalFactJournal> TestJournal() {
+    static std::atomic<std::uint64_t> next_id{0U};
+    const std::uint64_t id = next_id.fetch_add(1U, std::memory_order_relaxed);
+    const std::uint64_t clock = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("l2flow-kline-worker-" + std::to_string(clock) + "-" +
+         std::to_string(id) + ".fjn");
+    std::string error;
+    std::unique_ptr<l2flow::journal::CanonicalFactJournal> journal =
+        l2flow::journal::CanonicalFactJournal::Create(
+            l2flow::journal::FactJournalConfig{20260808U, path, 1'024U},
+            &error);
+    CHECK(journal != nullptr);
+    return std::shared_ptr<l2flow::journal::CanonicalFactJournal>(
+        journal.release(), [path](auto* value) {
+            delete value;
+            std::error_code ignored;
+            static_cast<void>(std::filesystem::remove(path, ignored));
+        });
+}
 
 class RecordingSink final : public KLineRevisionSink {
 public:
@@ -98,7 +124,7 @@ KLineWorkerConfig Config(std::vector<std::uint32_t> intervals = {5U}) {
     config.revision_epoch = 11U;
     config.calculation_run_id.bytes[0U] = std::byte{1U};
     config.interval_seconds = std::move(intervals);
-    config.maximum_facts = 1'024U;
+    config.fact_journal = TestJournal();
     config.maximum_bars = 1'024U;
     config.maximum_pending_commits = 64U;
     config.maximum_acknowledged_raw_dependencies = 1'024U;
@@ -343,6 +369,64 @@ void TestRawAckBeforeFactAndRuntimeRouting() {
     CHECK(runtime->stats().raw_tick_acks_received == 1U);
 }
 
+void TestChannelGlobalFirstWinnerAcrossInstrumentOwners() {
+    RecordingSink owner_zero_sink;
+    RecordingSink owner_one_sink;
+    const auto journal = TestJournal();
+    KLineWorkerConfig owner_zero_config = Config({1U});
+    owner_zero_config.owner_count = 2U;
+    owner_zero_config.owner = 0U;
+    owner_zero_config.fact_journal = journal;
+    KLineWorkerConfig owner_one_config = owner_zero_config;
+    owner_one_config.owner = 1U;
+
+    std::string error;
+    std::unique_ptr<KLineWorker> owner_zero = KLineWorker::Create(
+        owner_zero_config, &owner_zero_sink, &error);
+    CHECK(owner_zero != nullptr);
+    std::unique_ptr<KLineWorker> owner_one = KLineWorker::Create(
+        owner_one_config, &owner_one_sink, &error);
+    CHECK(owner_one != nullptr);
+
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+    CanonicalTick winner = Trade(
+        77U, 50U, base + 1U, 100U, 10'000'000, 1);
+    winner.common.instrument_ordinal = 0U;
+    const KLineInput winner_input{winner};
+    CHECK(owner_zero->ApplyBatch(
+              std::span<const KLineInput>(&winner_input, 1U)).code ==
+          KLineApplyCode::kApplied);
+
+    CanonicalTick conflicting_identity = winner;
+    conflicting_identity.common.ingress_sequence = 51U;
+    conflicting_identity.common.instrument_id = 2U;
+    conflicting_identity.common.instrument_ordinal = 1U;
+    conflicting_identity.common.identity.security_id[5U] = std::byte{'2'};
+    const KLineInput conflict_input{conflicting_identity};
+    CHECK(owner_one->ApplyBatch(
+              std::span<const KLineInput>(&conflict_input, 1U)).code ==
+          KLineApplyCode::kSourceConflict);
+    CHECK(owner_one->stats().facts_journaled == 0U);
+    CHECK(journal->stats().records == 1U);
+}
+
+void TestWorkerRejectsUnhealthyFactJournal() {
+    RecordingSink sink;
+    const auto journal = TestJournal();
+    CanonicalTick ignored{};
+    CHECK(!journal->Read(
+        l2flow::journal::FactHandle{
+            l2flow::journal::kFactJournalFileHeaderBytes},
+        &ignored));
+    CHECK(!journal->healthy());
+
+    KLineWorkerConfig config = Config({1U});
+    config.fact_journal = journal;
+    std::string error;
+    CHECK(KLineWorker::Create(config, &sink, &error) == nullptr);
+    CHECK(error.find("FactJournal is unhealthy") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -352,6 +436,8 @@ int main() {
     TestHalfOpenWindowAndEqualTimestampTieBreak();
     TestDuplicateConflictAndMultipleIntervals();
     TestRawAckBeforeFactAndRuntimeRouting();
+    TestChannelGlobalFirstWinnerAcrossInstrumentOwners();
+    TestWorkerRejectsUnhealthyFactJournal();
     std::cout << "all KLine worker tests passed\n";
     return 0;
 }

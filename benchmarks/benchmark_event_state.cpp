@@ -1,5 +1,6 @@
 #include "l2flow/event/runtime.h"
 #include "l2flow/ingest/engine.h"
+#include "l2flow/journal/fact_journal.h"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -16,8 +19,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -33,13 +42,23 @@ using l2flow::ingest::MessageKey;
 using l2flow::ingest::MonotonicNowNs;
 using l2flow::ingest::TickAction;
 using l2flow::ingest::TradingPhase;
+using l2flow::journal::CanonicalFactJournal;
+using l2flow::journal::FactJournalConfig;
+using l2flow::journal::FactJournalStats;
 
 struct Options final {
     std::uint64_t target_rate = 800'000U;
     std::uint32_t seconds = 1U;
     std::size_t actors = 16U;
     std::size_t micro_batch_rows = 256U;
+    std::filesystem::path journal_directory;
     bool unpaced = false;
+};
+
+struct ProcessMemory final {
+    std::uint64_t current_rss_kib = 0U;
+    std::uint64_t peak_rss_kib = 0U;
+    bool available = false;
 };
 
 template <typename Integer>
@@ -63,9 +82,10 @@ void PrintUsage() {
     std::cout
         << "usage: benchmark_event_state [options]\n"
         << "  --rate N              scheduled facts/s; default 800000\n"
-        << "  --seconds N           measured seconds; default 1, max 30\n"
+        << "  --seconds N           measured seconds; default 1, max 600\n"
         << "  --actors N            Event owner actors; default 16\n"
         << "  --micro-batch-rows N  journal-first cut; default 256\n"
+        << "  --journal-dir DIR     journal directory; default system temp\n"
         << "  --unpaced             run the same count as fast as possible\n";
 }
 
@@ -109,6 +129,13 @@ void PrintUsage() {
                 *error = "invalid --micro-batch-rows";
                 return false;
             }
+        } else if (argument == "--journal-dir") {
+            const std::string_view value = next(argument);
+            if (value.empty()) {
+                *error = "invalid --journal-dir";
+                return false;
+            }
+            parsed.journal_directory = value;
         } else if (argument == "--unpaced") {
             parsed.unpaced = true;
         } else {
@@ -120,12 +147,13 @@ void PrintUsage() {
         }
     }
     if (parsed.target_rate == 0U || parsed.target_rate > 10'000'000U ||
-        parsed.seconds == 0U || parsed.seconds > 30U ||
+        parsed.seconds == 0U || parsed.seconds > 600U ||
         parsed.actors == 0U || parsed.actors > 100'000U ||
         parsed.actors >
             static_cast<std::size_t>(
                 std::numeric_limits<std::uint32_t>::max()) ||
         parsed.micro_batch_rows == 0U ||
+        parsed.micro_batch_rows > 1'048'576U ||
         parsed.target_rate >
             std::numeric_limits<std::uint64_t>::max() / parsed.seconds) {
         *error = "invalid rate, duration, actor, or micro-batch bound";
@@ -245,6 +273,88 @@ private:
     return tick;
 }
 
+[[nodiscard]] std::filesystem::path MakeUniqueJournalPath(
+    const std::filesystem::path& directory,
+    std::string* error) {
+    static std::atomic<std::uint64_t> next_id{0U};
+    std::string process = "portable";
+#if defined(__linux__)
+    process = std::to_string(static_cast<std::uint64_t>(::getpid()));
+#endif
+    for (std::size_t attempt = 0U; attempt < 1'024U; ++attempt) {
+        const std::uint64_t id = next_id.fetch_add(
+            1U, std::memory_order_relaxed);
+        const std::filesystem::path candidate = directory /
+            ("l2flow-event-state-" + process + '-' +
+             std::to_string(MonotonicNowNs()) + '-' +
+             std::to_string(id) + ".journal");
+        std::error_code exists_error;
+        const bool exists = std::filesystem::exists(
+            candidate, exists_error);
+        if (!exists_error && !exists) {
+            error->clear();
+            return candidate;
+        }
+        if (exists_error) {
+            *error = "cannot inspect Event journal path: " +
+                exists_error.message();
+            return {};
+        }
+    }
+    *error = "cannot allocate a unique Event journal path";
+    return {};
+}
+
+class JournalFileCleanup final {
+public:
+    explicit JournalFileCleanup(std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~JournalFileCleanup() {
+        if (armed_) {
+            std::error_code ignored;
+            static_cast<void>(std::filesystem::remove(path_, ignored));
+        }
+    }
+
+    JournalFileCleanup(const JournalFileCleanup&) = delete;
+    JournalFileCleanup& operator=(const JournalFileCleanup&) = delete;
+
+    void Disarm() noexcept { armed_ = false; }
+
+private:
+    std::filesystem::path path_;
+    bool armed_ = true;
+};
+
+[[nodiscard]] ProcessMemory ReadProcessMemory() {
+    ProcessMemory result{};
+#if defined(__linux__)
+    std::ifstream status("/proc/self/status");
+    std::string key;
+    while (status >> key) {
+        if (key == "VmRSS:" || key == "VmHWM:") {
+            std::uint64_t value = 0U;
+            std::string unit;
+            if (!(status >> value >> unit) || unit != "kB") {
+                return {};
+            }
+            if (key == "VmRSS:") {
+                result.current_rss_kib = value;
+            } else {
+                result.peak_rss_kib = value;
+            }
+        } else {
+            std::string remainder;
+            std::getline(status, remainder);
+        }
+    }
+    result.available = result.current_rss_kib != 0U &&
+        result.peak_rss_kib != 0U;
+#endif
+    return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -261,6 +371,17 @@ int main(int argc, char** argv) {
 
     const std::uint64_t total =
         options.target_rate * static_cast<std::uint64_t>(options.seconds);
+    if (total >
+        (std::numeric_limits<std::uint64_t>::max() -
+         l2flow::journal::kFactJournalFileHeaderBytes) /
+            l2flow::journal::kFactJournalRecordBytes) {
+        std::cerr << "journal byte size overflows uint64_t\n";
+        return 2;
+    }
+    const std::uint64_t expected_record_bytes = total *
+        l2flow::journal::kFactJournalRecordBytes;
+    const std::uint64_t expected_file_bytes = expected_record_bytes +
+        l2flow::journal::kFactJournalFileHeaderBytes;
     const std::uint64_t maximum_per_actor =
         (total + static_cast<std::uint64_t>(options.actors) - 1U) /
         static_cast<std::uint64_t>(options.actors);
@@ -272,16 +393,58 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    std::error_code filesystem_error;
+    std::filesystem::path journal_directory = options.journal_directory;
+    if (journal_directory.empty()) {
+        journal_directory = std::filesystem::temp_directory_path(
+            filesystem_error);
+    }
+    if (filesystem_error || journal_directory.empty()) {
+        std::cerr << "cannot resolve Event journal directory: "
+                  << filesystem_error.message() << '\n';
+        return 2;
+    }
+    std::filesystem::create_directories(
+        journal_directory, filesystem_error);
+    if (filesystem_error ||
+        !std::filesystem::is_directory(
+            journal_directory, filesystem_error) ||
+        filesystem_error) {
+        std::cerr << "cannot create Event journal directory: "
+                  << filesystem_error.message() << '\n';
+        return 2;
+    }
+    const std::filesystem::path journal_path = MakeUniqueJournalPath(
+        journal_directory, &error);
+    if (journal_path.empty()) {
+        std::cerr << "Event journal path creation failed: " << error
+                  << '\n';
+        return 2;
+    }
+    JournalFileCleanup journal_cleanup(journal_path);
+    FactJournalConfig journal_config{};
+    journal_config.trade_date = 20260807U;
+    journal_config.path = journal_path;
+    journal_config.maximum_records = total;
+    std::unique_ptr<CanonicalFactJournal> created_journal =
+        CanonicalFactJournal::Create(std::move(journal_config), &error);
+    if (created_journal == nullptr) {
+        std::cerr << "FactJournal creation failed: " << error << '\n';
+        return 1;
+    }
+    std::shared_ptr<CanonicalFactJournal> journal(
+        std::move(created_journal));
+
     EventRuntimeConfig config{};
     config.worker.trade_date = 20260807U;
     config.worker.owner_count = static_cast<std::uint32_t>(options.actors);
     config.worker.revision_epoch = 1U;
     config.worker.logic_version = 1U;
     config.worker.calculation_run_id.bytes[0U] = std::byte{1U};
-    config.worker.maximum_facts = static_cast<std::size_t>(
-        maximum_per_actor + options.micro_batch_rows + 1U);
+    config.worker.fact_journal = journal;
     config.worker.maximum_orders = 1U;
-    config.worker.maximum_cached_events = config.worker.maximum_facts;
+    config.worker.maximum_cached_events = static_cast<std::size_t>(
+        maximum_per_actor + options.micro_batch_rows + 1U);
     config.worker.maximum_pending_commits = 1'024U;
     config.worker.maximum_acknowledged_raw_dependencies =
         std::max<std::size_t>(options.micro_batch_rows * 2U, 1'024U);
@@ -293,7 +456,7 @@ int main(int argc, char** argv) {
 
     InMemoryRevisionSink sink(options.actors);
     std::unique_ptr<EventRuntime> runtime =
-        EventRuntime::Create(config, &sink, &error);
+        EventRuntime::Create(std::move(config), &sink, &error);
     if (runtime == nullptr) {
         std::cerr << "Event runtime creation failed: " << error << '\n';
         return 1;
@@ -382,55 +545,173 @@ int main(int argc, char** argv) {
         thread.join();
     }
 
-    const bool drained = runtime->DrainAll();
-    std::uint64_t completed_ns = start_ns;
+    std::uint64_t actors_completed_ns = 0U;
     for (std::size_t actor = 0U; actor < options.actors; ++actor) {
-        completed_ns = std::max(
-            completed_ns,
+        actors_completed_ns = std::max(
+            actors_completed_ns,
             finish_ns[actor].load(std::memory_order_acquire));
     }
+    const std::uint64_t drain_start_ns = MonotonicNowNs();
+    const bool drained = runtime->DrainAll();
+    const std::uint64_t drain_finish_ns = MonotonicNowNs();
+    const std::uint64_t journal_flush_start_ns = MonotonicNowNs();
+    const bool journal_flushed = journal->Flush();
+    const std::uint64_t durable_finish_ns = MonotonicNowNs();
     const EventRuntimeStats stats = runtime->stats();
+    const FactJournalStats journal_stats = journal->stats();
+    const ProcessMemory process_memory = ReadProcessMemory();
+    std::error_code file_size_error;
+    const std::uintmax_t observed_file_bytes =
+        std::filesystem::file_size(journal_path, file_size_error);
     const std::uint64_t first_processing_ns = first_actual_ns.load(
         std::memory_order_acquire);
     const std::uint64_t measurement_origin_ns =
         first_processing_ns == std::numeric_limits<std::uint64_t>::max()
             ? start_ns
             : first_processing_ns;
-    const double elapsed_seconds = completed_ns <= measurement_origin_ns
+    const double actors_elapsed_seconds =
+        actors_completed_ns <= measurement_origin_ns
         ? 0.0
-        : static_cast<double>(completed_ns - measurement_origin_ns) /
+        : static_cast<double>(
+              actors_completed_ns - measurement_origin_ns) /
               1'000'000'000.0;
-    const double effective_rate = elapsed_seconds == 0.0
+    const double preflush_elapsed_seconds =
+        drain_finish_ns <= measurement_origin_ns
+        ? 0.0
+        : static_cast<double>(drain_finish_ns - measurement_origin_ns) /
+              1'000'000'000.0;
+    const double durable_elapsed_seconds =
+        durable_finish_ns <= measurement_origin_ns
+        ? 0.0
+        : static_cast<double>(durable_finish_ns - measurement_origin_ns) /
+              1'000'000'000.0;
+    const double preflush_rate = preflush_elapsed_seconds == 0.0
         ? 0.0
         : static_cast<double>(stats.workers.facts_journaled) /
-              elapsed_seconds;
+              preflush_elapsed_seconds;
+    const double durable_rate = durable_elapsed_seconds == 0.0
+        ? 0.0
+        : static_cast<double>(stats.workers.facts_journaled) /
+              durable_elapsed_seconds;
+    const double drain_ms = drain_finish_ns < drain_start_ns
+        ? 0.0
+        : static_cast<double>(drain_finish_ns - drain_start_ns) /
+              1'000'000.0;
+    const double journal_flush_ms =
+        durable_finish_ns < journal_flush_start_ns
+        ? 0.0
+        : static_cast<double>(
+              durable_finish_ns - journal_flush_start_ns) /
+              1'000'000.0;
     const double required_rate =
         static_cast<double>(options.target_rate) * 0.99;
-    const bool valid = !abort.load(std::memory_order_acquire) && drained &&
-        runtime->healthy() && sink.healthy() &&
+    const bool runtime_healthy = runtime->healthy();
+    const std::string runtime_fatal = runtime->fatal_error();
+    const bool journal_healthy = journal->healthy();
+    const std::string journal_fatal = journal->fatal_error();
+    bool valid = !abort.load(std::memory_order_acquire) && drained &&
+        journal_flushed && runtime_healthy && journal_healthy &&
+        sink.healthy() &&
         stats.normal_ticks_received == total &&
+        stats.late_ticks_received == 0U &&
         stats.raw_tick_acks_received == total &&
+        stats.source_conflicts == 0U && stats.invalid_inputs == 0U &&
         stats.workers.facts_journaled == total &&
+        stats.workers.duplicate_facts == 0U &&
+        stats.workers.source_conflicts == 0U &&
         stats.workers.revisions_created == total &&
-        stats.workers.pending_raw_commits == 0U && sink.rows() == total &&
-        effective_rate >= required_rate;
+        stats.workers.pending_raw_commits == 0U &&
+        stats.workers.acknowledged_raw_dependencies == 0U &&
+        stats.workers.revision_batches_submitted == sink.batches() &&
+        stats.workers.source_only_fast_path ==
+            stats.micro_batches_applied &&
+        stats.workers.unordered_batch_sorts == 0U &&
+        sink.rows() == total && journal_stats.records == total &&
+        journal_stats.record_bytes == expected_record_bytes &&
+        journal_stats.file_bytes == expected_file_bytes &&
+        journal_stats.write_bytes == expected_file_bytes &&
+        journal_stats.partial_writes == 0U &&
+        journal_stats.partial_reads == 0U &&
+        journal_stats.consumer_new == total &&
+        journal_stats.duplicates == 0U &&
+        journal_stats.conflicts == 0U &&
+        journal_stats.active_writes == 0U &&
+        journal_stats.active_reads == 0U &&
+        journal_stats.reserved_records == 0U &&
+        journal_stats.waiting_admissions == 0U &&
+        journal_stats.errors == 0U &&
+        journal_stats.flush_calls >= 1U && !file_size_error &&
+        observed_file_bytes == expected_file_bytes &&
+        durable_rate >= required_rate;
+
+    runtime.reset();
+    journal.reset();
+    std::error_code cleanup_error;
+    const bool journal_removed = std::filesystem::remove(
+        journal_path, cleanup_error);
+    const bool journal_cleanup_ok = journal_removed && !cleanup_error;
+    if (journal_cleanup_ok) {
+        journal_cleanup.Disarm();
+    }
+    valid = valid && journal_cleanup_ok;
 
     std::cout << std::fixed << std::setprecision(3)
+              << "scope event_source_only_projection=true "
+              << "shared_fact_journal=true clickhouse=false\n"
               << "event_state_config actors=" << options.actors
               << " target_msg_s=" << options.target_rate
               << " seconds=" << options.seconds
               << " micro_batch_rows=" << options.micro_batch_rows
               << " pacing=" << (options.unpaced ? "unpaced" : "scheduled")
-              << " storage=bounded_memory wal=false disk_queue=false\n"
+              << " fact_payload_storage=disk_journal"
+              << " journal_recovery=false"
+              << " journal_path=" << journal_path.string()
+              << " journal_cleanup="
+              << (journal_cleanup_ok ? "removed" : "failed") << '\n'
               << "event_state_result expected_facts=" << total
+              << " normal_ticks_received="
+              << stats.normal_ticks_received
+              << " raw_tick_acks_received="
+              << stats.raw_tick_acks_received
               << " facts_journaled=" << stats.workers.facts_journaled
               << " revisions_created=" << stats.workers.revisions_created
+              << " micro_batches=" << stats.micro_batches_applied
               << " revision_batches=" << sink.batches()
               << " revision_rows_acked_in_memory=" << sink.rows()
               << " pending_raw_commits="
-              << stats.workers.pending_raw_commits << '\n'
-              << "event_state_throughput elapsed_s=" << elapsed_seconds
-              << " effective_fact_s=" << effective_rate
+              << stats.workers.pending_raw_commits
+              << " pending_raw_acks="
+              << stats.workers.acknowledged_raw_dependencies << '\n'
+              << "event_state_journal records=" << journal_stats.records
+              << " consumer_new=" << journal_stats.consumer_new
+              << " record_bytes=" << journal_stats.record_bytes
+              << " file_bytes=" << journal_stats.file_bytes
+              << " observed_file_bytes=" << observed_file_bytes
+              << " write_calls=" << journal_stats.write_calls
+              << " write_bytes=" << journal_stats.write_bytes
+              << " partial_writes=" << journal_stats.partial_writes
+              << " read_calls=" << journal_stats.read_calls
+              << " read_bytes=" << journal_stats.read_bytes
+              << " partial_reads=" << journal_stats.partial_reads
+              << " hot_cache_hits=" << journal_stats.hot_cache_hits
+              << " flush_calls=" << journal_stats.flush_calls
+              << " directory_pages=" << journal_stats.directory_pages
+              << " active_writes=" << journal_stats.active_writes
+              << " active_reads=" << journal_stats.active_reads
+              << " reserved_records=" << journal_stats.reserved_records
+              << " waiting_admissions="
+              << journal_stats.waiting_admissions
+              << " conflicts=" << journal_stats.conflicts
+              << " errors=" << journal_stats.errors << '\n'
+              << "event_state_throughput actors_elapsed_s="
+              << actors_elapsed_seconds
+              << " preflush_elapsed_s=" << preflush_elapsed_seconds
+              << " durable_elapsed_s=" << durable_elapsed_seconds
+              << " preflush_fact_s=" << preflush_rate
+              << " durable_fact_s=" << durable_rate
+              << " required_fact_s=" << required_rate
+              << " drain_all_ms=" << drain_ms
+              << " journal_flush_ms=" << journal_flush_ms
               << " maximum_schedule_lag_us="
               << static_cast<double>(maximum_schedule_lag_ns.load(
                      std::memory_order_relaxed)) /
@@ -440,11 +721,29 @@ int main(int argc, char** argv) {
               << " unordered_batch_sorts="
               << stats.workers.unordered_batch_sorts
               << " source_only_fast_path="
-              << stats.workers.source_only_fast_path << '\n'
+              << stats.workers.source_only_fast_path
+              << " runtime_healthy="
+              << (runtime_healthy ? "true" : "false")
+              << " journal_healthy="
+              << (journal_healthy ? "true" : "false")
+              << " sink_healthy="
+              << (sink.healthy() ? "true" : "false") << '\n'
+              << "event_state_memory current_rss_mib="
+              << static_cast<double>(process_memory.current_rss_kib) / 1024.0
+              << " peak_rss_mib="
+              << static_cast<double>(process_memory.peak_rss_kib) / 1024.0
+              << " available="
+              << (process_memory.available ? "true" : "false") << '\n'
               << "status=" << (valid ? "PASS" : "FAIL") << '\n';
-    if (!runtime->healthy()) {
-        std::cerr << "Event runtime fatal: " << runtime->fatal_error()
-                  << '\n';
+    if (!runtime_healthy) {
+        std::cerr << "Event runtime fatal: " << runtime_fatal << '\n';
+    }
+    if (!journal_healthy) {
+        std::cerr << "FactJournal fatal: " << journal_fatal << '\n';
+    }
+    if (!journal_cleanup_ok) {
+        std::cerr << "FactJournal cleanup failed: "
+                  << cleanup_error.message() << '\n';
     }
     return valid ? 0 : 1;
 }

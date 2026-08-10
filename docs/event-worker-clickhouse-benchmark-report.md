@@ -7,6 +7,14 @@
 本次按用户要求测试区间两端（800k/s 与 1M/s）；没有把 800k–1M 之间的每个
 中间速率点都扫一遍，因此报告不声称已建立完整的速率曲线。
 
+> 历史结果边界：本页数值来自 2026-08-08 的旧内存 FactJournal 实现。当前
+> `benchmark_mdl_ingest --event-enable` 已替换为每次运行创建唯一的文件型
+> `CanonicalFactJournal`，并在结束时执行 `fdatasync`、账务核对和文件清理。
+> 因此下表仍是当日旧版本的历史证据，不是当前文件型 journal 路径的性能结果，
+> 也不能与 2026-08-09 的新 Event/FactJournal 长测直接比较。下面的命令模板已
+> 增加当前版本必需的 journal 目录，但执行它会产生一组新的、不可套用本页数值
+> 的结果。
+
 ## 结论先行
 
 这组测试不能支持“当前实现已经能够持续承载 800k–1M callback/s”的结论。
@@ -151,7 +159,8 @@ numactl --physcpubind=64-127,192-255 --membind=1 \
   --event-insert-chunk-rows 65536 \
   --event-queue-revision-batches 4096 \
   --event-queue-revision-rows 16777216 \
-  --event-maximum-raw-ack-backlog 1048576
+  --event-maximum-raw-ack-backlog 1048576 \
+  --event-journal-dir /tmp
 ```
 
 命令中的 `--event` 参数通过 benchmark 内部复制 raw sink 的 endpoint、database
@@ -343,6 +352,11 @@ L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
 便于用 `clickhouse client` 复核。若在受限网络 shell 中直接访问 `127.0.0.1`
 被 HTTP proxy 拦截，需要像上面的集成测试一样设置 `NO_PROXY`，或在允许本机
 回环 socket 的环境执行。
+
+当前 CTest 另有
+`mdl_ingest_event_benchmark_construction_smoke`：它不连接 ClickHouse，只验证
+`benchmark_mdl_ingest` 能创建唯一 journal、把同一实例注入全部 Event owners、
+完成空 journal 的 `fdatasync` 并删除文件。它是调用路径回归测试，不是吞吐测试。
 
 ## 9. 结果边界与未覆盖场景
 

@@ -30,10 +30,13 @@ raw_tick ClickHouse ACK --------------------+ -> Event sink queue
                                       event_recovery_run commit marker
 ```
 
-The worker computes against in-memory journaled facts before the raw ACK, but
-it does not submit a revision batch to the Event sink until every raw
+The worker computes against the shared local disk-backed canonical journal and
+owner-local in-memory projection indexes before the raw ACK, but it does not
+submit a revision batch to the Event sink until every raw
 occurrence on which that projection cut depends has been acknowledged by the
 raw ClickHouse sink. The raw and Event queues are volatile; neither is a WAL.
+The local FactJournal is also not a restart boundary; its exact capacity and
+recovery contract are in [fact-journal.md](fact-journal.md).
 
 This implementation is intraday and process-local. It does not bootstrap
 Event state from `raw_tick` after a restart, expose a general end-of-day
@@ -48,8 +51,8 @@ The business position is the upstream native sequence within one market and
 Channel:
 
 ```text
-Shanghai: (trade_date, instrument_id, channel, BizIndex)
-Shenzhen: (trade_date, instrument_id, channel, ApplSeqNum)
+Shanghai: (trade_date, market, channel, BizIndex)
+Shenzhen: (trade_date, market, channel, ApplSeqNum)
 ```
 
 `SequenceRecovery` maintains one native sequence domain per `(market,
@@ -141,8 +144,9 @@ ordered vector/tree representation:
 
 | Logical index | Current representation and purpose |
 |---|---|
-| FactJournal | `facts_`, keyed by `FactKey` in a bounded hash table, retains the source Tick, normalized projection Tick, source fragment, hash, roles, and late/barrier flags |
-| Instrument fact journal | hash lookup to an append-ordered `FactKey` vector; late inserts stay sorted for Shanghai phase range scans |
+| Canonical FactJournal | one process-wide disk file retains the explicit 344-byte canonical winner; a paged process-wide directory owns duplicate/conflict and independent Event/KLine seen state |
+| Event fact metadata | owner-local `facts_`, keyed by `FactKey`, retains the disk handle, semantic hash, instrument/phase overlay, roles, and late/barrier flags, but not a full source Tick |
+| Instrument fact index | hash lookup to an append-ordered native-sequence vector; late inserts stay sorted for Shanghai phase range scans |
 | Phase/barrier index | phase transitions use an ordered vector; `Ended` barriers retain an ordered map and a direct Instrument/Channel→orders index |
 | OrderUseIndex | `OrderHistory::uses`, keyed by native sequence, records Add/Trade/Cancel/barrier references even when no order state existed |
 | OrderVersionChain | `OrderHistory::versions`, stores the full post-state and semantic input hash after each use |
@@ -450,11 +454,13 @@ does not add a WAL, checkpoint, disk queue, or local staging file.
 
 ## 11. Capacity and failure policy
 
-The FactJournal, order count, current BundleCache row count, pending raw commit
-count, micro-batch, LateRecovery inbox, raw-ACK inbox, acknowledged-raw index,
-Event sink batch queue, and Event sink row queue all have configured bounds.
-Exhaustion fails the relevant worker/runtime/sink closed rather than dropping
-a revision and continuing with an unprovable current view.
+The shared journal has one global physical-record bound for the trading date.
+Order count, current BundleCache row count, pending raw commit count,
+micro-batch, LateRecovery inbox, raw-ACK inbox, acknowledged-raw index, Event
+sink batch queue, and Event sink row queue have their own configured bounds.
+Exhaustion fails the relevant journal/worker/runtime/sink closed rather than
+dropping a revision and continuing with an unprovable current view. There is
+no per-owner `maximum_facts` compatibility bound.
 
 Source-key conflict is deliberately different: the worker retains the first
 fact, increments the source-conflict statistic, and continues. It never guesses

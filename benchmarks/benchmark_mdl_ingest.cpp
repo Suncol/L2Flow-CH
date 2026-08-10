@@ -6,6 +6,7 @@
 #include "l2flow/clickhouse/event_sink.h"
 #include "l2flow/clickhouse/raw_sink.h"
 #include "l2flow/event/runtime.h"
+#include "l2flow/journal/fact_journal.h"
 #endif
 
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -43,6 +44,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -77,10 +79,12 @@ struct Options final {
     l2flow::clickhouse::RawClickHouseConfig clickhouse{};
     l2flow::clickhouse::EventClickHouseConfig clickhouse_event{};
     l2flow::event::EventRuntimeConfig event{};
+    std::filesystem::path event_journal_directory;
     bool clickhouse_enabled = false;
     bool clickhouse_configuration_set = false;
     bool event_enabled = false;
     bool event_configuration_set = false;
+    bool event_construction_smoke = false;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::filesystem::path arrow_ring_directory;
@@ -335,7 +339,9 @@ void PrintUsage() {
         << "  --event-writer-lanes N (1,2,4,8) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
-        << "  --event-maximum-raw-ack-backlog N default 65536\n";
+        << "  --event-maximum-raw-ack-backlog N default 65536\n"
+        << "  --event-journal-dir DIR  unique file directory; default system temp\n"
+        << "  --event-construction-smoke validate Event construction without network I/O\n";
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::cout
@@ -585,6 +591,19 @@ void PrintUsage() {
                 *error = "invalid --event-maximum-raw-ack-backlog";
                 return false;
             }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-journal-dir") {
+            const std::string_view value = next(argument);
+            if (value.empty()) {
+                if (error->empty()) {
+                    *error = "invalid --event-journal-dir";
+                }
+                return false;
+            }
+            parsed.event_journal_directory = value;
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-construction-smoke") {
+            parsed.event_construction_smoke = true;
             parsed.event_configuration_set = true;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -942,7 +961,8 @@ inline void CpuRelax() noexcept {
     }
 }
 
-#if defined(L2FLOW_CH_HAS_ARROW_RING)
+#if defined(L2FLOW_CH_HAS_ARROW_RING) || \
+    defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
 void RecordMaximumElapsed(std::uint64_t start_ns,
                           std::uint64_t finish_ns,
                           std::uint64_t* maximum_ns) noexcept {
@@ -1036,6 +1056,72 @@ void RecordMaximumElapsed(std::uint64_t start_ns,
 #endif
     return result;
 }
+
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+[[nodiscard]] std::filesystem::path MakeUniqueEventJournalPath(
+    const std::filesystem::path& directory,
+    std::string* error) {
+    static std::atomic<std::uint64_t> next_id{0U};
+    std::string process = "portable";
+#if defined(__linux__)
+    process = std::to_string(static_cast<std::uint64_t>(::getpid()));
+#endif
+    for (std::size_t attempt = 0U; attempt < 1'024U; ++attempt) {
+        const std::uint64_t id = next_id.fetch_add(
+            1U, std::memory_order_relaxed);
+        const std::filesystem::path candidate = directory /
+            ("l2flow-mdl-event-" + process + '-' +
+             std::to_string(MonotonicNowNs()) + '-' +
+             std::to_string(id) + ".journal");
+        std::error_code exists_error;
+        const bool exists = std::filesystem::exists(
+            candidate, exists_error);
+        if (!exists_error && !exists) {
+            error->clear();
+            return candidate;
+        }
+        if (exists_error) {
+            *error = "cannot inspect Event journal path: " +
+                exists_error.message();
+            return {};
+        }
+    }
+    *error = "cannot allocate a unique Event journal path";
+    return {};
+}
+
+class EventJournalFileCleanup final {
+public:
+    explicit EventJournalFileCleanup(std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~EventJournalFileCleanup() {
+        if (armed_) {
+            std::error_code ignored;
+            static_cast<void>(std::filesystem::remove(path_, ignored));
+        }
+    }
+
+    EventJournalFileCleanup(const EventJournalFileCleanup&) = delete;
+    EventJournalFileCleanup& operator=(const EventJournalFileCleanup&) = delete;
+
+    [[nodiscard]] bool Remove(std::error_code* error) noexcept {
+        std::error_code local_error;
+        const bool removed = std::filesystem::remove(path_, local_error);
+        if (removed && !local_error) {
+            armed_ = false;
+        }
+        if (error != nullptr) {
+            *error = local_error;
+        }
+        return removed && !local_error;
+    }
+
+private:
+    std::filesystem::path path_;
+    bool armed_ = true;
+};
+#endif
 
 }  // namespace
 
@@ -1132,10 +1218,70 @@ int main(int argc, char** argv) {
     config.enabled_streams = StreamBit(kBenchmarkStream);
 
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    std::filesystem::path event_journal_path;
+    std::unique_ptr<EventJournalFileCleanup> event_journal_cleanup;
+    std::shared_ptr<l2flow::journal::CanonicalFactJournal>
+        event_fact_journal;
     std::unique_ptr<l2flow::clickhouse::EventClickHouseSink>
         clickhouse_event;
     std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
+    bool event_journal_shared_by_all_owners = true;
     if (options.event_enabled) {
+        if (total_count >
+            (std::numeric_limits<std::uint64_t>::max() -
+             l2flow::journal::kFactJournalFileHeaderBytes) /
+                l2flow::journal::kFactJournalRecordBytes) {
+            std::cerr << "Event journal byte size overflows uint64_t\n";
+            return 2;
+        }
+        std::error_code filesystem_error;
+        std::filesystem::path journal_directory =
+            options.event_journal_directory;
+        if (journal_directory.empty()) {
+            journal_directory = std::filesystem::temp_directory_path(
+                filesystem_error);
+        }
+        if (filesystem_error || journal_directory.empty()) {
+            std::cerr << "cannot resolve Event journal directory: "
+                      << filesystem_error.message() << '\n';
+            return 2;
+        }
+        std::filesystem::create_directories(
+            journal_directory, filesystem_error);
+        if (filesystem_error ||
+            !std::filesystem::is_directory(
+                journal_directory, filesystem_error) ||
+            filesystem_error) {
+            std::cerr << "cannot create Event journal directory: "
+                      << filesystem_error.message() << '\n';
+            return 2;
+        }
+        event_journal_path = MakeUniqueEventJournalPath(
+            journal_directory, &error);
+        if (event_journal_path.empty()) {
+            std::cerr << "Event journal path creation failed: " << error
+                      << '\n';
+            return 2;
+        }
+        event_journal_cleanup =
+            std::make_unique<EventJournalFileCleanup>(event_journal_path);
+        l2flow::journal::FactJournalConfig journal_config{};
+        journal_config.trade_date = config.trade_date;
+        journal_config.path = event_journal_path;
+        journal_config.maximum_records = total_count;
+        std::unique_ptr<l2flow::journal::CanonicalFactJournal>
+            created_journal =
+                l2flow::journal::CanonicalFactJournal::Create(
+                    std::move(journal_config), &error);
+        if (created_journal == nullptr) {
+            std::cerr << "Event FactJournal creation failed: " << error
+                      << '\n';
+            return 1;
+        }
+        event_fact_journal = std::shared_ptr<
+            l2flow::journal::CanonicalFactJournal>(
+                std::move(created_journal));
+
         options.event.worker.trade_date = config.trade_date;
         options.event.worker.owner_count =
             static_cast<std::uint32_t>(options.instrument_owners);
@@ -1147,8 +1293,10 @@ int main(int argc, char** argv) {
             std::cerr << "failed to initialize Event calculation run ID\n";
             return 2;
         }
+        l2flow::event::EventRuntimeConfig event_config = options.event;
+        event_config.worker.fact_journal = event_fact_journal;
         if (!l2flow::event::ValidateEventRuntimeConfig(
-                options.event, &error) ||
+                event_config, &error) ||
             !l2flow::clickhouse::ValidateEventClickHouseConfig(
                 options.clickhouse_event, &error)) {
             std::cerr << "Event benchmark configuration invalid: "
@@ -1164,12 +1312,81 @@ int main(int argc, char** argv) {
             return 1;
         }
         event_runtime = l2flow::event::EventRuntime::Create(
-            options.event, clickhouse_event.get(), &error);
+            std::move(event_config), clickhouse_event.get(), &error);
         if (event_runtime == nullptr) {
             std::cerr << "Event runtime creation failed: " << error << '\n';
             return 1;
         }
+        event_journal_shared_by_all_owners =
+            event_runtime->config().worker.fact_journal ==
+            event_fact_journal;
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            const l2flow::event::EventWorker* const worker =
+                event_runtime->worker(owner);
+            event_journal_shared_by_all_owners =
+                event_journal_shared_by_all_owners && worker != nullptr &&
+                worker->config().fact_journal == event_fact_journal;
+        }
         options.clickhouse.tick_ack_listener = event_runtime.get();
+
+        if (options.event_construction_smoke) {
+            const bool runtime_healthy = event_runtime->healthy();
+            const bool sink_healthy = clickhouse_event->healthy();
+            const bool journal_flushed = event_fact_journal->Flush();
+            const l2flow::journal::FactJournalStats journal_stats =
+                event_fact_journal->stats();
+            const bool journal_healthy = event_fact_journal->healthy();
+            std::error_code file_size_error;
+            const std::uintmax_t observed_file_bytes =
+                std::filesystem::file_size(
+                    event_journal_path, file_size_error);
+            event_runtime.reset();
+            clickhouse_event.reset();
+            event_fact_journal.reset();
+            std::error_code cleanup_error;
+            const bool cleanup_ok =
+                event_journal_cleanup->Remove(&cleanup_error);
+            const bool valid = runtime_healthy && sink_healthy &&
+                event_journal_shared_by_all_owners && journal_flushed &&
+                journal_healthy && journal_stats.records == 0U &&
+                journal_stats.file_bytes ==
+                    l2flow::journal::kFactJournalFileHeaderBytes &&
+                journal_stats.write_bytes ==
+                    l2flow::journal::kFactJournalFileHeaderBytes &&
+                journal_stats.partial_writes == 0U &&
+                journal_stats.partial_reads == 0U &&
+                journal_stats.active_writes == 0U &&
+                journal_stats.active_reads == 0U &&
+                journal_stats.reserved_records == 0U &&
+                journal_stats.waiting_admissions == 0U &&
+                journal_stats.errors == 0U &&
+                journal_stats.flush_calls == 1U && !file_size_error &&
+                observed_file_bytes ==
+                    l2flow::journal::kFactJournalFileHeaderBytes &&
+                cleanup_ok;
+            std::cout
+                << "event_construction_smoke shared_journal="
+                << (event_journal_shared_by_all_owners ? "true" : "false")
+                << " records=" << journal_stats.records
+                << " file_bytes=" << journal_stats.file_bytes
+                << " observed_file_bytes=" << observed_file_bytes
+                << " partial_writes=" << journal_stats.partial_writes
+                << " partial_reads=" << journal_stats.partial_reads
+                << " flush_calls=" << journal_stats.flush_calls
+                << " runtime_healthy="
+                << (runtime_healthy ? "true" : "false")
+                << " journal_healthy="
+                << (journal_healthy ? "true" : "false")
+                << " sink_healthy=" << (sink_healthy ? "true" : "false")
+                << " cleanup=" << (cleanup_ok ? "removed" : "failed")
+                << " status=" << (valid ? "PASS" : "FAIL") << '\n';
+            if (!cleanup_ok) {
+                std::cerr << "Event FactJournal cleanup failed: "
+                          << cleanup_error.message() << '\n';
+            }
+            return valid ? 0 : 1;
+        }
     }
     std::unique_ptr<l2flow::clickhouse::RawClickHouseSink> clickhouse_raw;
     if (options.clickhouse_enabled) {
@@ -1823,6 +2040,19 @@ int main(int argc, char** argv) {
     std::uint64_t event_stop_finish_ns = 0U;
     l2flow::event::EventRuntimeStats event_final_runtime_stats{};
     l2flow::clickhouse::EventClickHouseStats event_final_stats{};
+    const bool event_runtime_created = event_runtime != nullptr;
+    bool event_runtime_healthy = true;
+    std::string event_runtime_fatal;
+    bool event_journal_flush_ok = true;
+    std::uint64_t event_journal_flush_start_ns = 0U;
+    std::uint64_t event_journal_flush_finish_ns = 0U;
+    l2flow::journal::FactJournalStats event_journal_stats{};
+    bool event_journal_healthy = true;
+    std::string event_journal_fatal;
+    std::uintmax_t event_journal_observed_file_bytes = 0U;
+    std::error_code event_journal_file_size_error;
+    bool event_journal_cleanup_ok = true;
+    std::error_code event_journal_cleanup_error;
     if (event_runtime != nullptr) {
         // Keep calculation batches pending until the raw sink has ACKed their
         // exact source occurrences.  Flush before stopping raw so the final
@@ -1845,6 +2075,28 @@ int main(int argc, char** argv) {
         event_stop_ok = clickhouse_event->Stop(&event_stop_error);
         event_stop_finish_ns = MonotonicNowNs();
         event_final_stats = clickhouse_event->stats();
+    }
+    if (event_runtime != nullptr) {
+        event_runtime_healthy = event_runtime->healthy();
+        event_runtime_fatal = event_runtime->fatal_error();
+        event_runtime.reset();
+    }
+    if (event_fact_journal != nullptr) {
+        event_journal_flush_start_ns = MonotonicNowNs();
+        event_journal_flush_ok = event_fact_journal->Flush();
+        event_journal_flush_finish_ns = MonotonicNowNs();
+        event_journal_stats = event_fact_journal->stats();
+        event_journal_healthy = event_fact_journal->healthy();
+        event_journal_fatal = event_fact_journal->fatal_error();
+        event_journal_observed_file_bytes = std::filesystem::file_size(
+            event_journal_path, event_journal_file_size_error);
+        event_fact_journal.reset();
+        event_journal_cleanup_ok = event_journal_cleanup != nullptr &&
+            event_journal_cleanup->Remove(&event_journal_cleanup_error);
+    } else if (options.event_enabled) {
+        event_journal_flush_ok = false;
+        event_journal_healthy = false;
+        event_journal_cleanup_ok = false;
     }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -2071,11 +2323,40 @@ int main(int argc, char** argv) {
             ? event_measurement_event_stats.revision_rows_queued -
                   event_measurement_event_stats.revision_rows_acked
             : 0U;
+    const std::uint64_t expected_event_journal_record_bytes = total_count *
+        static_cast<std::uint64_t>(
+            l2flow::journal::kFactJournalRecordBytes);
+    const std::uint64_t expected_event_journal_file_bytes =
+        expected_event_journal_record_bytes +
+        l2flow::journal::kFactJournalFileHeaderBytes;
     bool event_valid = true;
     if (options.event_enabled) {
         event_valid = event_flush_ok && event_drain_ok && event_stop_ok &&
-            event_runtime != nullptr && event_runtime->healthy() &&
+            event_runtime_created && event_runtime_healthy &&
             clickhouse_event != nullptr && clickhouse_event->healthy() &&
+            event_journal_shared_by_all_owners && event_journal_flush_ok &&
+            event_journal_healthy && event_journal_cleanup_ok &&
+            !event_journal_file_size_error &&
+            event_journal_stats.records == total_count &&
+            event_journal_stats.record_bytes ==
+                expected_event_journal_record_bytes &&
+            event_journal_stats.file_bytes ==
+                expected_event_journal_file_bytes &&
+            event_journal_stats.write_bytes ==
+                expected_event_journal_file_bytes &&
+            event_journal_observed_file_bytes ==
+                expected_event_journal_file_bytes &&
+            event_journal_stats.consumer_new == total_count &&
+            event_journal_stats.duplicates == 0U &&
+            event_journal_stats.conflicts == 0U &&
+            event_journal_stats.partial_writes == 0U &&
+            event_journal_stats.partial_reads == 0U &&
+            event_journal_stats.active_writes == 0U &&
+            event_journal_stats.active_reads == 0U &&
+            event_journal_stats.reserved_records == 0U &&
+            event_journal_stats.waiting_admissions == 0U &&
+            event_journal_stats.errors == 0U &&
+            event_journal_stats.flush_calls >= 1U &&
             event_final_runtime_stats.normal_ticks_received == total_count &&
             event_final_runtime_stats.workers.facts_journaled == total_count &&
             event_final_runtime_stats.raw_tick_acks_received == total_count &&
@@ -2408,7 +2689,42 @@ int main(int argc, char** argv) {
                          : 0U) /
                    1'000.0
             << " healthy="
-            << (clickhouse_event->healthy() ? "true" : "false") << '\n';
+            << (clickhouse_event->healthy() ? "true" : "false") << '\n'
+            << "event_journal path=" << event_journal_path.string()
+            << " shared_by_all_owners="
+            << (event_journal_shared_by_all_owners ? "true" : "false")
+            << " records=" << event_journal_stats.records
+            << " consumer_new=" << event_journal_stats.consumer_new
+            << " record_bytes=" << event_journal_stats.record_bytes
+            << " file_bytes=" << event_journal_stats.file_bytes
+            << " observed_file_bytes="
+            << event_journal_observed_file_bytes
+            << " write_calls=" << event_journal_stats.write_calls
+            << " write_bytes=" << event_journal_stats.write_bytes
+            << " partial_writes=" << event_journal_stats.partial_writes
+            << " read_calls=" << event_journal_stats.read_calls
+            << " read_bytes=" << event_journal_stats.read_bytes
+            << " partial_reads=" << event_journal_stats.partial_reads
+            << " directory_pages=" << event_journal_stats.directory_pages
+            << " active_writes=" << event_journal_stats.active_writes
+            << " active_reads=" << event_journal_stats.active_reads
+            << " reserved_records=" << event_journal_stats.reserved_records
+            << " waiting_admissions="
+            << event_journal_stats.waiting_admissions
+            << " errors=" << event_journal_stats.errors
+            << " flush_ms="
+            << to_us(event_journal_flush_finish_ns >=
+                             event_journal_flush_start_ns
+                         ? event_journal_flush_finish_ns -
+                               event_journal_flush_start_ns
+                         : 0U) /
+                   1'000.0
+            << " runtime_healthy="
+            << (event_runtime_healthy ? "true" : "false")
+            << " journal_healthy="
+            << (event_journal_healthy ? "true" : "false")
+            << " cleanup="
+            << (event_journal_cleanup_ok ? "removed" : "failed") << '\n';
     }
 #endif
     std::cout << "status=" << (valid ? "PASS" : "FAIL") << '\n';
@@ -2430,17 +2746,29 @@ int main(int argc, char** argv) {
     }
     if (options.event_enabled &&
         (!event_flush_ok || !event_drain_ok || !event_stop_ok ||
-         event_runtime == nullptr || !event_runtime->healthy() ||
-         clickhouse_event == nullptr || !clickhouse_event->healthy())) {
-        std::cerr << "Event path fatal: "
-                  << (!event_stop_error.empty()
-                          ? event_stop_error
-                          : (event_runtime == nullptr
-                                 ? std::string("runtime unavailable")
-                                 : (!event_runtime->fatal_error().empty()
-                                        ? event_runtime->fatal_error()
-                                        : clickhouse_event->fatal_error())))
-                  << '\n';
+         !event_runtime_created || !event_runtime_healthy ||
+         !event_journal_shared_by_all_owners ||
+         !event_journal_flush_ok || !event_journal_healthy ||
+         !event_journal_cleanup_ok || clickhouse_event == nullptr ||
+         !clickhouse_event->healthy())) {
+        std::cerr << "Event path fatal: ";
+        if (!event_stop_error.empty()) {
+            std::cerr << event_stop_error;
+        } else if (!event_runtime_created) {
+            std::cerr << "runtime unavailable";
+        } else if (!event_runtime_fatal.empty()) {
+            std::cerr << event_runtime_fatal;
+        } else if (!event_journal_fatal.empty()) {
+            std::cerr << event_journal_fatal;
+        } else if (!event_journal_shared_by_all_owners) {
+            std::cerr << "Event owners do not share one FactJournal";
+        } else if (!event_journal_cleanup_ok) {
+            std::cerr << "FactJournal cleanup failed: "
+                      << event_journal_cleanup_error.message();
+        } else {
+            std::cerr << clickhouse_event->fatal_error();
+        }
+        std::cerr << '\n';
     }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)

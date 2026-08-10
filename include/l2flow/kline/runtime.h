@@ -22,6 +22,8 @@ struct KLineRuntimeStats final {
     std::uint64_t normal_ticks_received = 0U;
     std::uint64_t late_ticks_received = 0U;
     std::uint64_t raw_tick_acks_received = 0U;
+    std::uint64_t late_inbox_backlog = 0U;
+    std::uint64_t raw_ack_inbox_backlog = 0U;
     std::uint64_t micro_batches_applied = 0U;
     std::uint64_t source_conflicts = 0U;
     std::uint64_t invalid_inputs = 0U;
