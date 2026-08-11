@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -66,7 +67,7 @@ EventRevision Revision(std::uint64_t version,
     revision.operation = operation;
     revision.reason = operation == RevisionOperation::kInsert
         ? RevisionReason::kLiveProjection
-        : RevisionReason::kLateRecovery;
+        : RevisionReason::kHoleFill;
     revision.calculation_run_id = Identifier(1U);
     revision.logic_version = 3U;
     revision.input_set_hash = Identifier(
@@ -96,6 +97,14 @@ std::shared_ptr<const EventRevisionBatch> Batch(
     return batch;
 }
 
+bool AppendBatch(
+    EventClickHouseSink* sink,
+    std::shared_ptr<const EventRevisionBatch> batch) noexcept {
+    std::vector<std::shared_ptr<const EventRevisionBatch>> group;
+    group.push_back(std::move(batch));
+    return sink->AppendRevisionGroup(std::move(group));
+}
+
 void TestConfigValidation() {
     EventClickHouseConfig config{};
     std::string error;
@@ -103,9 +112,9 @@ void TestConfigValidation() {
     config.endpoint = "http://127.0.0.1:8123/?bad=1";
     CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
     config.endpoint = "http://127.0.0.1:8123";
-    config.insert_chunk_rows = 0U;
+    config.insert_request_max_rows = 0U;
     CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
-    config.insert_chunk_rows = 16'384U;
+    config.insert_request_max_rows = 65'536U;
     config.writer_lanes = 3U;
     CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
     config.writer_lanes = 8U;
@@ -118,14 +127,23 @@ struct CapturedRequest final {
     std::string body;
 };
 
+enum class ResponseAction : std::uint8_t {
+    kSuccess = 0U,
+    kDropConnection,
+    kRetryable,
+    kPermanent,
+};
+
 class RetryHttpServer final {
 public:
     explicit RetryHttpServer(
         std::chrono::milliseconds first_insert_delay =
             std::chrono::milliseconds{5},
-        bool drop_first_insert = true)
+        bool drop_first_insert = true,
+        std::vector<ResponseAction> response_script = {})
         : first_insert_delay_(first_insert_delay),
-          drop_first_insert_(drop_first_insert) {
+          drop_first_insert_(drop_first_insert),
+          response_script_(std::move(response_script)) {
         listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (listener_ < 0) {
             return;
@@ -261,9 +279,19 @@ private:
         return true;
     }
 
-    static void SendSuccess(int connection) noexcept {
-        constexpr std::string_view response =
+    static void SendResponse(int connection,
+                             ResponseAction action) noexcept {
+        constexpr std::string_view success =
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        constexpr std::string_view retryable =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n"
+            "Connection: close\r\n\r\nretry";
+        constexpr std::string_view permanent =
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 9\r\n"
+            "Connection: close\r\n\r\npermanent";
+        const std::string_view response = action == ResponseAction::kRetryable
+            ? retryable
+            : action == ResponseAction::kPermanent ? permanent : success;
         std::size_t sent = 0U;
         while (sent < response.size()) {
             const ssize_t count = ::send(
@@ -303,8 +331,15 @@ private:
             if (insert && insert_requests == 1U) {
                 std::this_thread::sleep_for(first_insert_delay_);
             }
-            if (!insert || insert_requests != 1U || !drop_first_insert_) {
-                SendSuccess(connection);
+            ResponseAction action = ResponseAction::kSuccess;
+            if (insert && insert_requests <= response_script_.size()) {
+                action = response_script_[insert_requests - 1U];
+            } else if (insert && insert_requests == 1U &&
+                       drop_first_insert_) {
+                action = ResponseAction::kDropConnection;
+            }
+            if (action != ResponseAction::kDropConnection) {
+                SendResponse(connection, action);
             }
             static_cast<void>(::shutdown(connection, SHUT_RDWR));
             static_cast<void>(::close(connection));
@@ -313,6 +348,7 @@ private:
 
     std::chrono::milliseconds first_insert_delay_{};
     bool drop_first_insert_ = true;
+    std::vector<ResponseAction> response_script_;
     int listener_ = -1;
     std::uint16_t port_ = 0U;
     bool valid_ = false;
@@ -326,7 +362,7 @@ EventClickHouseConfig HttpConfig(const RetryHttpServer& server) {
     EventClickHouseConfig config{};
     config.endpoint = server.endpoint();
     config.database = "event_retry_contract";
-    config.insert_chunk_rows = 1U;
+    config.insert_request_max_rows = 1U;
     config.queue_revision_batches = 2U;
     config.queue_revision_rows = 8U;
     config.connect_timeout_ms = 500U;
@@ -337,6 +373,34 @@ EventClickHouseConfig HttpConfig(const RetryHttpServer& server) {
     config.shutdown_timeout_ms = 3'000U;
     config.ensure_local_tables = false;
     return config;
+}
+
+std::vector<CapturedRequest> InsertRequests(const RetryHttpServer& server) {
+    std::vector<CapturedRequest> inserts;
+    for (const CapturedRequest& request : server.requests()) {
+        if (request.target.find("INSERT") != std::string::npos) {
+            inserts.push_back(request);
+        }
+    }
+    return inserts;
+}
+
+std::uint32_t ReadUInt32(const std::string& body,
+                         std::size_t offset) {
+    CHECK(offset <= body.size());
+    CHECK(sizeof(std::uint32_t) <= body.size() - offset);
+    std::uint32_t value = 0U;
+    std::memcpy(&value, body.data() + offset, sizeof(value));
+    return value;
+}
+
+void CheckIdentifier(const std::string& body,
+                     std::size_t offset,
+                     Identifier128 expected) {
+    CHECK(offset <= body.size());
+    CHECK(expected.bytes.size() <= body.size() - offset);
+    CHECK(std::memcmp(body.data() + offset, expected.bytes.data(),
+                      expected.bytes.size()) == 0);
 }
 
 void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
@@ -359,17 +423,12 @@ void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
         101U, 101U, RevisionOperation::kInsert, 10, recovery));
     revisions.push_back(Revision(
         102U, 102U, RevisionOperation::kInsert, 20, recovery));
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(
         1U, recovery, std::move(revisions))));
     CHECK(sink->Stop(&error));
     server.Stop();
 
-    std::vector<CapturedRequest> inserts;
-    for (const CapturedRequest& request : server.requests()) {
-        if (request.target.find("INSERT") != std::string::npos) {
-            inserts.push_back(request);
-        }
-    }
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
     CHECK(inserts.size() == 4U);
     CHECK(inserts[0U].target == inserts[1U].target);
     CHECK(inserts[0U].body == inserts[1U].body);
@@ -385,10 +444,185 @@ void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
     CHECK(stats.revision_batches_acked == 1U);
     CHECK(stats.revision_batches_released == 1U);
     CHECK(stats.revision_rows_acked == 2U);
-    CHECK(stats.revision_chunks_acked == 2U);
+    CHECK(stats.revision_insert_requests_acked == 2U);
     CHECK(stats.recovery_runs_committed == 1U);
     CHECK(stats.retry_attempts == 1U);
     CHECK(stats.unknown_outcomes == 1U);
+}
+
+void TestOneSubmissionPreservesIndependentLogicalMarkers() {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "Event grouped-marker fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    EventClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.queue_revision_rows = 64U;
+    config.queue_revision_batches = 8U;
+    config.physical_group_max_delay_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<EventClickHouseSink> sink =
+        EventClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+
+    const Identifier128 recovery0 = Identifier(20U);
+    const Identifier128 recovery1 = Identifier(21U);
+    std::vector<std::shared_ptr<const EventRevisionBatch>> group;
+    group.push_back(Batch(
+        1U, recovery0,
+        {Revision(401U, 401U, RevisionOperation::kInsert, 1, recovery0)}));
+    group.push_back(Batch(
+        2U, recovery1,
+        {Revision(402U, 402U, RevisionOperation::kInsert, 2, recovery1)}));
+    const auto stop_started = std::chrono::steady_clock::now();
+    CHECK(sink->AppendRevisionGroup(std::move(group)));
+    CHECK(sink->Stop(&error));
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+    server.Stop();
+    CHECK(stop_elapsed < std::chrono::milliseconds{500});
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 2U);
+    CHECK(inserts[0U].target.find("event_revision_log") != std::string::npos);
+    CHECK(inserts[0U].body.size() == 2U * 665U);
+    CHECK(inserts[1U].target.find("event_recovery_run") != std::string::npos);
+    CHECK(inserts[1U].body.size() == 2U * 120U);
+    CheckIdentifier(inserts[1U].body, 18U, recovery0);
+    CheckIdentifier(inserts[1U].body, 120U + 18U, recovery1);
+    CHECK(ReadUInt32(inserts[1U].body, 71U) == 1U);
+    CHECK(ReadUInt32(inserts[1U].body, 120U + 71U) == 1U);
+
+    const auto stats = sink->stats();
+    CHECK(stats.submission_groups_queued == 1U);
+    CHECK(stats.submission_groups_released == 1U);
+    CHECK(stats.revision_batches_queued == 2U);
+    CHECK(stats.revision_batches_acked == 2U);
+    CHECK(stats.revision_batches_released == 2U);
+    CHECK(stats.physical_groups_committed == 1U);
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.recovery_runs_committed == 2U);
+    CHECK(stats.queued_submission_groups == 0U);
+    CHECK(stats.queued_revision_batches == 0U);
+    CHECK(stats.queued_revision_rows == 0U);
+}
+
+void TestUnknownMarkerOutcomeDoesNotReplayRevisions() {
+    RetryHttpServer server(
+        std::chrono::milliseconds{0}, false,
+        {ResponseAction::kSuccess, ResponseAction::kDropConnection,
+         ResponseAction::kSuccess});
+    if (!server.valid()) {
+        std::cout << "Event marker-retry fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    EventClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.queue_revision_rows = 64U;
+    std::string error;
+    std::unique_ptr<EventClickHouseSink> sink =
+        EventClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(30U);
+    CHECK(AppendBatch(sink.get(), Batch(
+        1U, recovery,
+        {Revision(501U, 501U, RevisionOperation::kInsert, 1, recovery)})));
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 3U);
+    CHECK(inserts[0U].target.find("event_revision_log") != std::string::npos);
+    CHECK(inserts[1U].target.find("event_recovery_run") != std::string::npos);
+    CHECK(inserts[1U].target == inserts[2U].target);
+    CHECK(inserts[1U].body == inserts[2U].body);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.retry_attempts == 1U);
+    CHECK(stats.unknown_outcomes == 1U);
+    CHECK(stats.revision_batches_acked == 1U);
+    CHECK(stats.revision_batches_released == 1U);
+}
+
+void TestPermanentMarkerFailureRetainsLogicalQueue() {
+    RetryHttpServer server(
+        std::chrono::milliseconds{0}, false,
+        {ResponseAction::kSuccess, ResponseAction::kPermanent});
+    if (!server.valid()) {
+        std::cout << "Event permanent-marker fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    EventClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.queue_revision_rows = 64U;
+    std::string error;
+    std::unique_ptr<EventClickHouseSink> sink =
+        EventClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(31U);
+    CHECK(AppendBatch(sink.get(), Batch(
+        1U, recovery,
+        {Revision(601U, 601U, RevisionOperation::kInsert, 1, recovery)})));
+    CHECK(!sink->Stop(&error));
+    server.Stop();
+
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 0U);
+    CHECK(stats.physical_groups_committed == 0U);
+    CHECK(stats.recovery_runs_committed == 0U);
+    CHECK(stats.revision_batches_acked == 0U);
+    CHECK(stats.revision_batches_released == 0U);
+    CHECK(stats.submission_groups_released == 0U);
+    CHECK(stats.queued_submission_groups == 1U);
+    CHECK(stats.queued_revision_batches == 1U);
+    CHECK(stats.queued_revision_rows == 1U);
+    CHECK(error.find("failed permanently") != std::string::npos);
+}
+
+void TestByteBoundSplitsOneLogicalBatch() {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "Event byte-bound fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    EventClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.insert_request_max_bytes = 665U;
+    config.queue_revision_rows = 64U;
+    std::string error;
+    std::unique_ptr<EventClickHouseSink> sink =
+        EventClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(32U);
+    CHECK(AppendBatch(sink.get(), Batch(
+        1U, recovery,
+        {Revision(701U, 701U, RevisionOperation::kInsert, 1, recovery),
+         Revision(702U, 702U, RevisionOperation::kInsert, 2, recovery)})));
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 3U);
+    CHECK(inserts[0U].body.size() == 665U);
+    CHECK(inserts[1U].body.size() == 665U);
+    CHECK(inserts[2U].body.size() == 120U);
+    CHECK(ReadUInt32(inserts[2U].body, 71U) == 2U);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 2U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.revision_request_rows_max == 1U);
+    CHECK(stats.revision_request_bytes_max == 665U);
 }
 
 void TestOrderedWriterLanesKeepOwnerAffinity() {
@@ -399,6 +633,7 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
         return;
     }
     EventClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 8U;
     config.writer_lanes = 2U;
     config.queue_revision_batches = 8U;
     config.queue_revision_rows = 32U;
@@ -410,17 +645,17 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
 
     const Identifier128 recovery0 = Identifier(10U);
     const Identifier128 recovery1 = Identifier(11U);
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(
         1U, recovery0,
         {Revision(201U, 201U, RevisionOperation::kInsert, 1,
                   recovery0)},
         0U)));
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(
         2U, recovery0,
         {Revision(202U, 202U, RevisionOperation::kInsert, 2,
                   recovery0)},
         0U)));
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(
         1U, recovery1,
         {Revision(301U, 301U, RevisionOperation::kInsert, 3,
                   recovery1)},
@@ -428,14 +663,9 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
     CHECK(sink->Stop(&error));
     server.Stop();
 
-    std::vector<CapturedRequest> inserts;
-    for (const CapturedRequest& request : server.requests()) {
-        if (request.target.find("INSERT") != std::string::npos) {
-            inserts.push_back(request);
-        }
-    }
-    // Every one-row batch has one revision INSERT followed by its marker.
-    CHECK(inserts.size() == 6U);
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    // Lane 0 combines two logical batches while lane 1 commits independently.
+    CHECK(inserts.size() == 4U);
     bool saw_lane0 = false;
     bool saw_lane1 = false;
     for (const CapturedRequest& request : inserts) {
@@ -524,7 +754,7 @@ void TestClickHouseIntegration(std::string endpoint) {
     EventClickHouseConfig config{};
     config.endpoint = std::move(endpoint);
     config.database = database;
-    config.insert_chunk_rows = 2U;
+    config.insert_request_max_rows = 2U;
     config.queue_revision_batches = 8U;
     config.queue_revision_rows = 32U;
     config.maximum_retry_elapsed_ms = 2'000U;
@@ -540,22 +770,22 @@ void TestClickHouseIntegration(std::string endpoint) {
     const Identifier128 run2 = Identifier(3U);
     const Identifier128 run3 = Identifier(4U);
     const Identifier128 run4 = Identifier(5U);
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(
         1U, run1,
         {Revision(101U, 101U, RevisionOperation::kInsert, 10, run1)})));
     EventRevision update = Revision(
         102U, 101U, RevisionOperation::kUpdate, 20, run2);
     update.supersedes_revision_id = Identifier(117U);
     update.supersedes_revision_id_valid = true;
-    CHECK(sink->AppendRevisionBatch(Batch(2U, run2, {update})));
-    CHECK(sink->AppendRevisionBatch(Batch(
+    CHECK(AppendBatch(sink.get(), Batch(2U, run2, {update})));
+    CHECK(AppendBatch(sink.get(), Batch(
         3U, run3,
         {Revision(103U, 102U, RevisionOperation::kInsert, 30, run3)})));
     EventRevision tombstone = Revision(
         104U, 102U, RevisionOperation::kTombstone, 30, run4);
     tombstone.supersedes_revision_id = Identifier(119U);
     tombstone.supersedes_revision_id_valid = true;
-    CHECK(sink->AppendRevisionBatch(Batch(4U, run4, {tombstone})));
+    CHECK(AppendBatch(sink.get(), Batch(4U, run4, {tombstone})));
     CHECK(sink->Stop(&error));
 
     CHECK(Query(config.endpoint,
@@ -640,6 +870,10 @@ int main() {
     TestConfigValidation();
 #if defined(__linux__)
     TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit();
+    TestOneSubmissionPreservesIndependentLogicalMarkers();
+    TestUnknownMarkerOutcomeDoesNotReplayRevisions();
+    TestPermanentMarkerFailureRetainsLogicalQueue();
+    TestByteBoundSplitsOneLogicalBatch();
     TestOrderedWriterLanesKeepOwnerAffinity();
 #endif
     const char* const endpoint = std::getenv("L2FLOW_CH_TEST_URL");

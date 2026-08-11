@@ -548,6 +548,15 @@ void TestValidationAndConsumerCapacity() {
     CHECK(invalid_kind_error.find("invalid Arrow ring") != std::string::npos);
     CHECK(!std::filesystem::exists(invalid_kind.location.data_path));
 
+    invalid_kind = MakeConfig(directory, "removed-late-kind");
+    invalid_kind.stream_kind = static_cast<RingStreamKind>(3U);
+    invalid_kind_error.clear();
+    invalid_kind_writer = SharedArrowRingWriter::Create(
+        invalid_kind, ScalarSchema(), &invalid_kind_error);
+    CHECK(invalid_kind_writer == nullptr);
+    CHECK(invalid_kind_error.find("invalid Arrow ring") != std::string::npos);
+    CHECK(!std::filesystem::exists(invalid_kind.location.data_path));
+
     auto invalid_start = SharedArrowRingReader::Open(
         config.location, static_cast<ReaderStart>(99U), &error);
     CHECK(invalid_start == nullptr);
@@ -738,13 +747,17 @@ void TestCanonicalSchemas() {
     tick.quantity = {100, 0U, true};
     tick.action = TickAction::kTrade;
     CHECK(ticks->AppendOrdered(tick, &error));
-    LateRecoveryTick late{};
-    late.tick = tick;
-    FillCommon(&late.tick.common, 10U, 100U);
-    late.committed_next_sequence = 15U;
-    late.observed_gap_epoch = 2U;
-    late.catalog_match = true;
-    CHECK(ticks->AppendLateRecovery(late, &error));
+    TickDispatch fill{};
+    fill.tick = tick;
+    FillCommon(&fill.tick.common, 10U, 100U);
+    fill.feed_session_epoch = 23U;
+    fill.expected_sequence = 215U;
+    fill.admission_floor = 200U;
+    fill.generation = 2U;
+    fill.evict_before = 211U;
+    fill.kind = TickDispatchKind::kProjectHoleFill;
+    fill.catalog_match = true;
+    CHECK(ticks->AppendHoleFill(fill, &error));
     BuiltRecordBatch tick_batch = ticks->Finish(&error);
     CHECK(tick_batch.batch != nullptr);
     CHECK(tick_batch.batch->num_rows() == 2);
@@ -753,6 +766,17 @@ void TestCanonicalSchemas() {
     CHECK(tick_batch.metadata.last_ingress_sequence == 10U);
     CHECK(tick_batch.metadata.minimum_exchange_time_ns == 0U);
     CHECK(tick_batch.metadata.maximum_exchange_time_ns == 100U);
+    const auto stream_roles = std::static_pointer_cast<arrow::UInt8Array>(
+        tick_batch.batch->GetColumnByName("stream_role"));
+    const auto expected_sequences =
+        std::static_pointer_cast<arrow::UInt64Array>(
+            tick_batch.batch->GetColumnByName("expected_sequence"));
+    CHECK(stream_roles->Value(0) ==
+          static_cast<std::uint8_t>(TickStreamRole::kRealtimeOrdered));
+    CHECK(stream_roles->Value(1) ==
+          static_cast<std::uint8_t>(TickStreamRole::kHoleFill));
+    CHECK(expected_sequences->IsNull(0));
+    CHECK(expected_sequences->Value(1) == 215U);
 
     auto snapshots = SnapshotRecordBatchBuilder::Create(2U, 23U, &error);
     CHECK(snapshots != nullptr);
@@ -860,17 +884,32 @@ void TestHotEgressFanoutSink() {
 
     CanonicalTick tick{};
     FillCommon(&tick.common, 100U, 1U);
-    CHECK(egress->AppendTick(1U, tick));
+    TickDispatch ordered{};
+    ordered.tick = tick;
+    ordered.feed_session_epoch = 77U;
+    ordered.expected_sequence = tick.common.native_sequence;
+    ordered.admission_floor = tick.common.native_sequence;
+    ordered.evict_before = tick.common.native_sequence + 1U;
+    ordered.channel = tick.common.channel;
+    ordered.market = tick.common.identity.market;
+    ordered.owner = 1U;
+    ordered.kind = TickDispatchKind::kProjectOrdered;
+    ordered.catalog_match = true;
+    CHECK(egress->AppendTickDispatch(1U, ordered));
     egress->FlushDue(1U, std::numeric_limits<std::uint64_t>::max());
 
     CanonicalSnapshot snapshot{};
     FillCommon(&snapshot.common, 101U, 2U);
     CHECK(egress->AppendSnapshot(0U, snapshot));
 
-    LateRecoveryTick late{};
-    late.tick = tick;
-    late.tick.common.ingress_sequence = 102U;
-    CHECK(egress->AppendLateRecovery(late));
+    TickDispatch fill = ordered;
+    FillCommon(&fill.tick.common, 102U, 3U);
+    fill.expected_sequence = fill.tick.common.native_sequence + 5U;
+    fill.admission_floor = fill.tick.common.native_sequence - 2U;
+    fill.evict_before = fill.tick.common.native_sequence + 1U;
+    fill.generation = 1U;
+    fill.kind = TickDispatchKind::kProjectHoleFill;
+    CHECK(egress->AppendTickDispatch(1U, fill));
 
     ChannelGap gap{};
     gap.market = Market::kShanghai;
@@ -899,6 +938,9 @@ void TestHotEgressFanoutSink() {
         tick_reader->Decode(tick_result.lease, &error);
     CHECK(decoded_tick != nullptr);
     CHECK(decoded_tick->schema()->Equals(*TickArrowSchema(), true));
+    ReadResult fill_result = tick_reader->TryRead();
+    CHECK(fill_result.code == ReadCode::kBatch);
+    CHECK(fill_result.metadata.row_count == 1U);
 
     const RingLocation snapshot_location = {
         egress->run_directory() / "snapshot-owner-0.arrow",
@@ -906,13 +948,6 @@ void TestHotEgressFanoutSink() {
     auto snapshot_reader = OpenReader(
         snapshot_location, ReaderStart::kEarliestAvailable);
     CHECK(snapshot_reader->TryRead().code == ReadCode::kBatch);
-
-    const RingLocation late_location = {
-        egress->run_directory() / "late-recovery.arrow",
-        egress->run_directory() / "late-recovery.ctl"};
-    auto late_reader = OpenReader(
-        late_location, ReaderStart::kEarliestAvailable);
-    CHECK(late_reader->TryRead().code == ReadCode::kBatch);
 
     const RingLocation control_location = {
         egress->run_directory() / "control.arrow",
@@ -930,9 +965,9 @@ void TestHotEgressFanoutSink() {
     }
     CHECK(control_rows == 4U);
     const ArrowHotEgressStats stats = egress->stats();
-    CHECK(stats.tick_rows_received == 1U);
+    CHECK(stats.tick_rows_received == 2U);
     CHECK(stats.snapshot_rows_received == 1U);
-    CHECK(stats.late_recovery_rows_received == 1U);
+    CHECK(stats.hole_fill_rows_received == 1U);
     CHECK(stats.control_rows_received == 4U);
     CHECK(stats.internal_errors == 0U);
 }
@@ -1058,7 +1093,17 @@ void TestOversizedBatchSplitting() {
     for (std::uint64_t row = 1U; row <= 8U; ++row) {
         CanonicalTick tick = sample;
         FillCommon(&tick.common, row, row - 1U);
-        CHECK(egress->AppendTick(0U, tick));
+        TickDispatch dispatch{};
+        dispatch.tick = tick;
+        dispatch.feed_session_epoch = 88U;
+        dispatch.expected_sequence = tick.common.native_sequence;
+        dispatch.admission_floor = tick.common.native_sequence;
+        dispatch.evict_before = tick.common.native_sequence + 1U;
+        dispatch.channel = tick.common.channel;
+        dispatch.market = tick.common.identity.market;
+        dispatch.kind = TickDispatchKind::kProjectOrdered;
+        dispatch.catalog_match = true;
+        CHECK(egress->AppendTickDispatch(0U, dispatch));
     }
     egress->Seal(100U);
     CHECK(egress->healthy());

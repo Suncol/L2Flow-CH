@@ -67,7 +67,7 @@ KLineRevision Revision(std::uint64_t version,
     revision.operation = operation;
     revision.reason = operation == RevisionOperation::kInsert
         ? RevisionReason::kLiveProjection
-        : RevisionReason::kLateRecovery;
+        : RevisionReason::kHoleFill;
     revision.calculation_run_id = Identifier(1U);
     revision.logic_version = 3U;
     revision.input_set_hash = Identifier(
@@ -121,6 +121,10 @@ void TestConfigValidation() {
     config.writer_lanes = 3U;
     CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
     config.writer_lanes = 8U;
+    CHECK(l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
+    config.writer_lanes = 16U;
+    CHECK(l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
+    config.writer_lanes = 32U;
     CHECK(l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
 }
 

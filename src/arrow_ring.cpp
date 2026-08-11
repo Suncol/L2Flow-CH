@@ -170,6 +170,19 @@ static_assert(std::is_trivially_copyable_v<ControlHeader>);
 static_assert(std::is_trivially_copyable_v<ConsumerEntry>);
 static_assert(std::is_trivially_copyable_v<SegmentControl>);
 
+[[nodiscard]] constexpr bool IsRingStreamKind(
+    RingStreamKind kind) noexcept {
+    switch (kind) {
+        case RingStreamKind::kOrderedTick:
+        case RingStreamKind::kSnapshot:
+        case RingStreamKind::kControl:
+        case RingStreamKind::kEvent:
+        case RingStreamKind::kKline:
+            return true;
+    }
+    return false;
+}
+
 [[nodiscard]] std::uint64_t AtomicLoadAcquire(
     const std::uint64_t* value) noexcept {
     return __atomic_load_n(value, __ATOMIC_ACQUIRE);
@@ -810,10 +823,7 @@ private:
         SetError(error, "data file is not a supported L2Flow Arrow ring");
         return false;
     }
-    if (header.stream_kind <
-            static_cast<std::uint32_t>(RingStreamKind::kOrderedTick) ||
-        header.stream_kind >
-            static_cast<std::uint32_t>(RingStreamKind::kKline) ||
+    if (!IsRingStreamKind(static_cast<RingStreamKind>(header.stream_kind)) ||
         !IsPowerOfTwo(header.descriptor_capacity) ||
         header.descriptor_capacity < 2U ||
         header.segment_count < header.descriptor_capacity ||
@@ -1574,8 +1584,7 @@ std::unique_ptr<SharedArrowRingWriter> SharedArrowRingWriter::Create(
     if (config.location.data_path.empty() ||
         config.location.control_path.empty() ||
         config.location.data_path == config.location.control_path ||
-        config.stream_kind < RingStreamKind::kOrderedTick ||
-        config.stream_kind > RingStreamKind::kKline ||
+        !IsRingStreamKind(config.stream_kind) ||
         !IsPowerOfTwo(config.descriptor_capacity) ||
         config.descriptor_capacity < 2U ||
         config.descriptor_capacity >

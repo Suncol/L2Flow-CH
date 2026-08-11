@@ -12,18 +12,30 @@ namespace l2flow::kline {
 
 struct KLineRuntimeConfig final {
     KLineWorkerConfig worker{};
+    std::uint64_t feed_session_epoch = 0U;
     std::size_t micro_batch_rows = 256U;
     std::uint64_t micro_batch_max_delay_ns = 1'000'000U;
+    // The worker raw-ACK index must cover the largest forwarding cut formed
+    // by the inbox, occurrence join, and micro-batch limits.
     std::size_t maximum_raw_ack_backlog_per_owner = 65'536U;
-    std::size_t maximum_late_backlog_per_owner = 4'096U;
+    std::size_t maximum_occurrence_join_entries_per_owner = 65'536U;
 };
 
 struct KLineRuntimeStats final {
-    std::uint64_t normal_ticks_received = 0U;
-    std::uint64_t late_ticks_received = 0U;
+    std::uint64_t ordered_dispositions_received = 0U;
+    std::uint64_t hole_fill_dispositions_received = 0U;
+    std::uint64_t rejected_dispositions_received = 0U;
+    std::uint64_t gap_open_controls_received = 0U;
+    std::uint64_t channel_seal_controls_received = 0U;
     std::uint64_t raw_tick_acks_received = 0U;
-    std::uint64_t late_inbox_backlog = 0U;
     std::uint64_t raw_ack_inbox_backlog = 0U;
+    std::uint64_t occurrence_join_entries = 0U;
+    std::uint64_t occurrence_join_high_water = 0U;
+    std::uint64_t occurrence_ack_first = 0U;
+    std::uint64_t occurrence_disposition_first = 0U;
+    std::uint64_t occurrence_projects_resolved = 0U;
+    std::uint64_t occurrence_rejections_resolved = 0U;
+    std::uint64_t occurrence_duplicate_sides = 0U;
     std::uint64_t micro_batches_applied = 0U;
     std::uint64_t source_conflicts = 0U;
     std::uint64_t invalid_inputs = 0U;
@@ -45,11 +57,9 @@ public:
         KLineRevisionSink* sink,
         std::string* error);
 
-    [[nodiscard]] bool AppendTick(
+    [[nodiscard]] bool AppendDispatch(
         std::size_t owner,
-        const ingest::CanonicalTick& tick) noexcept;
-    [[nodiscard]] bool AppendLateRecovery(
-        const ingest::LateRecoveryTick& late) noexcept;
+        const ingest::TickDispatch& dispatch) noexcept;
     [[nodiscard]] bool FlushDue(
         std::size_t owner,
         std::uint64_t monotonic_ns) noexcept;

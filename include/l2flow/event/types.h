@@ -257,7 +257,7 @@ enum class RevisionOperation : std::uint8_t {
 
 enum class RevisionReason : std::uint8_t {
     kLiveProjection = 0U,
-    kLateRecovery,
+    kHoleFill,
     kSessionFinalize,
 };
 
@@ -294,10 +294,13 @@ class EventRevisionSink {
 public:
     virtual ~EventRevisionSink() = default;
 
-    // The sink must retain the immutable object through acknowledgement or a
-    // terminal failure. A retry must reuse its versions, IDs, rows and order.
-    [[nodiscard]] virtual bool AppendRevisionBatch(
-        std::shared_ptr<const EventRevisionBatch> batch) noexcept = 0;
+    // One owner submits a consecutive FIFO group. Every contained batch stays
+    // an independent recovery/commit boundary; the sink may combine their rows
+    // physically but must retain all immutable objects until the whole group
+    // is acknowledged or terminally failed.
+    [[nodiscard]] virtual bool AppendRevisionGroup(
+        std::vector<std::shared_ptr<const EventRevisionBatch>> batches)
+        noexcept = 0;
 };
 
 struct RawTickDependency final {

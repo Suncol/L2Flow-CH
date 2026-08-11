@@ -324,7 +324,7 @@ void TestBusinessEqualityAndConflict() {
     provenance.common.exchange_time_ns_from_midnight += 4U;
     provenance.common.vendor_local_time_ns_from_midnight += 5U;
     provenance.common.vendor_local_time_raw += 6U;
-    provenance.common.quality_flags ^= kQualityLateRecovery;
+    provenance.common.quality_flags ^= kQualityHoleFill;
     provenance.common.gap_epoch += 7U;
     provenance.common.gap_before_first += 8U;
     provenance.common.gap_before_last += 9U;

@@ -340,23 +340,48 @@ public:
         }
     }
 
-    [[nodiscard]] bool AppendTick(std::size_t owner,
-                                  const ingest::CanonicalTick& tick) noexcept {
+    [[nodiscard]] bool AppendTickDispatch(
+        std::size_t owner,
+        const ingest::TickDispatch& dispatch) noexcept {
         if (!CanAppend(owner)) {
+            return false;
+        }
+        if (dispatch.owner != owner ||
+            dispatch.feed_session_epoch != config_.feed_session_epoch ||
+            (dispatch.kind != ingest::TickDispatchKind::kProjectOrdered &&
+             dispatch.kind != ingest::TickDispatchKind::kProjectHoleFill)) {
+            Fail("Tick Arrow dispatch owner, epoch, or kind is invalid");
             return false;
         }
         OwnerState& state = *owners_[owner];
         std::string error;
-        if (!state.tick_builder->AppendOrdered(tick, &error)) {
+        const bool hole_fill =
+            dispatch.kind == ingest::TickDispatchKind::kProjectHoleFill;
+        const bool appended =
+            dispatch.kind == ingest::TickDispatchKind::kProjectOrdered
+                ? state.tick_builder->AppendOrdered(dispatch.tick, &error)
+                : hole_fill
+                      ? state.tick_builder->AppendHoleFill(dispatch, &error)
+                      : false;
+        if (!appended) {
+            if (!hole_fill && dispatch.kind !=
+                    ingest::TickDispatchKind::kProjectOrdered) {
+                error = "dispatch is not projectable";
+            }
             Fail("Tick Arrow builder failed: ", error);
             return false;
         }
         tick_rows_received_.fetch_add(1U, std::memory_order_relaxed);
-        MaybeTouchOwner(owner, tick.common.receive_monotonic_ns);
+        if (hole_fill) {
+            hole_fill_rows_received_.fetch_add(
+                1U, std::memory_order_relaxed);
+        }
+        const std::uint64_t receive_ns =
+            dispatch.tick.common.receive_monotonic_ns;
+        MaybeTouchOwner(owner, receive_ns);
         if (state.tick_builder->rows() == 1U) {
             state.tick_deadline_ns = AddSaturated(
-                tick.common.receive_monotonic_ns,
-                config_.maximum_batch_delay_ns);
+                receive_ns, config_.maximum_batch_delay_ns);
         }
         if (state.tick_builder->rows() >= config_.tick_batch_rows) {
             FlushTick(owner);
@@ -385,30 +410,6 @@ public:
         }
         if (state.snapshot_builder->rows() >= config_.snapshot_batch_rows) {
             FlushSnapshot(owner);
-        }
-        return healthy();
-    }
-
-    [[nodiscard]] bool AppendLateRecovery(
-        const ingest::LateRecoveryTick& record) noexcept {
-        if (!healthy() || sealed_.load(std::memory_order_acquire)) {
-            return false;
-        }
-        std::string error;
-        if (!late_builder_->AppendLateRecovery(record, &error)) {
-            Fail("LateRecovery Arrow builder failed: ", error);
-            return false;
-        }
-        late_recovery_rows_received_.fetch_add(1U,
-                                                std::memory_order_relaxed);
-        MaybeTouchDiagnostics(record.tick.common.receive_monotonic_ns);
-        if (late_builder_->rows() == 1U) {
-            late_deadline_ns_ = AddSaturated(
-                record.tick.common.receive_monotonic_ns,
-                config_.maximum_batch_delay_ns);
-        }
-        if (late_builder_->rows() >= config_.diagnostic_batch_rows) {
-            FlushLate();
         }
         return healthy();
     }
@@ -496,11 +497,7 @@ public:
             FlushSnapshot(owner);
         }
         if (owner == 0U) {
-            MaybeTouchDiagnostics(now_monotonic_ns);
-            if (late_builder_->rows() != 0U &&
-                now_monotonic_ns >= late_deadline_ns_) {
-                FlushLate();
-            }
+            MaybeTouchControl(now_monotonic_ns);
             std::lock_guard<std::mutex> lock(control_mutex_);
             if (control_builder_->rows() != 0U &&
                 now_monotonic_ns >= control_deadline_ns_) {
@@ -517,7 +514,6 @@ public:
             FlushTick(owner);
             FlushSnapshot(owner);
         }
-        FlushLate();
         std::lock_guard<std::mutex> lock(control_mutex_);
         FlushControlLocked();
     }
@@ -551,7 +547,6 @@ public:
             owner->tick_writer->Seal(observed_monotonic_ns);
             owner->snapshot_writer->Seal(observed_monotonic_ns);
         }
-        late_writer_->Seal(observed_monotonic_ns);
         control_writer_->Seal(observed_monotonic_ns);
     }
 
@@ -570,8 +565,8 @@ public:
             std::memory_order_relaxed);
         output.snapshot_rows_received = snapshot_rows_received_.load(
             std::memory_order_relaxed);
-        output.late_recovery_rows_received =
-            late_recovery_rows_received_.load(std::memory_order_relaxed);
+        output.hole_fill_rows_received =
+            hole_fill_rows_received_.load(std::memory_order_relaxed);
         output.control_rows_received = control_rows_received_.load(
             std::memory_order_relaxed);
         output.published_batches = published_batches_.load(
@@ -823,22 +818,6 @@ public:
             static_cast<std::uint32_t>(owner), true));
     }
 
-    void FlushLate() noexcept {
-        if (late_builder_->rows() == 0U || !healthy()) {
-            return;
-        }
-        std::string error;
-        BuiltRecordBatch built = late_builder_->Finish(&error);
-        late_deadline_ns_ = 0U;
-        if (built.batch == nullptr) {
-            Fail("LateRecovery Arrow batch finish failed: ", error);
-            return;
-        }
-        static_cast<void>(Publish(
-            late_writer_.get(), built, RingStreamKind::kLateRecoveryTick,
-            0U, true));
-    }
-
     void FlushControlLocked() noexcept {
         if (control_builder_->rows() == 0U || !healthy()) {
             return;
@@ -860,7 +839,6 @@ public:
             FlushTick(owner);
             FlushSnapshot(owner);
         }
-        FlushLate();
         std::lock_guard<std::mutex> lock(control_mutex_);
         FlushControlLocked();
     }
@@ -888,11 +866,10 @@ public:
             now_monotonic_ns, config_.heartbeat_interval_ns);
     }
 
-    void MaybeTouchDiagnostics(std::uint64_t now_monotonic_ns) noexcept {
+    void MaybeTouchControl(std::uint64_t now_monotonic_ns) noexcept {
         if (now_monotonic_ns < diagnostic_heartbeat_deadline_ns_) {
             return;
         }
-        late_writer_->TouchHeartbeat(now_monotonic_ns);
         control_writer_->TouchHeartbeat(now_monotonic_ns);
         diagnostic_heartbeat_deadline_ns_ = AddSaturated(
             now_monotonic_ns, config_.heartbeat_interval_ns);
@@ -929,9 +906,6 @@ public:
     std::filesystem::path manifest_path_;
     int root_lock_fd_ = -1;
     std::vector<std::unique_ptr<OwnerState>> owners_;
-    std::unique_ptr<SharedArrowRingWriter> late_writer_;
-    std::unique_ptr<TickRecordBatchBuilder> late_builder_;
-    std::uint64_t late_deadline_ns_ = 0U;
     std::unique_ptr<SharedArrowRingWriter> control_writer_;
     std::unique_ptr<ControlRecordBatchBuilder> control_builder_;
     std::uint64_t control_deadline_ns_ = 0U;
@@ -944,7 +918,7 @@ public:
     bool initialized_ = false;
     std::atomic<std::uint64_t> tick_rows_received_{0U};
     std::atomic<std::uint64_t> snapshot_rows_received_{0U};
-    std::atomic<std::uint64_t> late_recovery_rows_received_{0U};
+    std::atomic<std::uint64_t> hole_fill_rows_received_{0U};
     std::atomic<std::uint64_t> control_rows_received_{0U};
     std::atomic<std::uint64_t> published_batches_{0U};
     std::atomic<std::uint64_t> published_rows_{0U};
@@ -1045,15 +1019,6 @@ std::unique_ptr<ArrowHotEgress> ArrowHotEgress::Create(
             impl->owners_.push_back(std::move(state));
         }
 
-        impl->late_writer_ = SharedArrowRingWriter::Create(
-            RingConfig(impl->config_, run_directory, producer_instance,
-                       RingStreamKind::kLateRecoveryTick, 0U,
-                       "late-recovery",
-                       impl->config_.diagnostic_segment_payload_bytes),
-            TickArrowSchema(), error);
-        impl->late_builder_ = TickRecordBatchBuilder::Create(
-            impl->config_.diagnostic_batch_rows,
-            impl->config_.feed_session_epoch, error);
         impl->control_writer_ = SharedArrowRingWriter::Create(
             RingConfig(impl->config_, run_directory, producer_instance,
                        RingStreamKind::kControl, 0U, "control",
@@ -1062,8 +1027,7 @@ std::unique_ptr<ArrowHotEgress> ArrowHotEgress::Create(
         impl->control_builder_ = ControlRecordBatchBuilder::Create(
             impl->config_.diagnostic_batch_rows,
             impl->config_.feed_session_epoch, producer_instance, error);
-        if (impl->late_writer_ == nullptr || impl->late_builder_ == nullptr ||
-            impl->control_writer_ == nullptr ||
+        if (impl->control_writer_ == nullptr ||
             impl->control_builder_ == nullptr) {
             return nullptr;
         }
@@ -1109,9 +1073,7 @@ std::unique_ptr<ArrowHotEgress> ArrowHotEgress::Create(
                      << "snapshot_control." << owner << '='
                      << OwnerName("snapshot", owner) << ".ctl\n";
         }
-        manifest << "late_recovery=late-recovery.arrow\n"
-                 << "late_recovery_control=late-recovery.ctl\n"
-                 << "control=control.arrow\n"
+        manifest << "control=control.arrow\n"
                  << "control_control=control.ctl\n";
         if (!WriteTextFile(impl->manifest_path_, manifest.str(), error)) {
             return nullptr;
@@ -1146,21 +1108,16 @@ ArrowHotEgress::ArrowHotEgress(std::unique_ptr<Impl> impl) noexcept
 
 ArrowHotEgress::~ArrowHotEgress() = default;
 
-bool ArrowHotEgress::AppendTick(
+bool ArrowHotEgress::AppendTickDispatch(
     std::size_t owner,
-    const ingest::CanonicalTick& tick) noexcept {
-    return impl_->AppendTick(owner, tick);
+    const ingest::TickDispatch& dispatch) noexcept {
+    return impl_->AppendTickDispatch(owner, dispatch);
 }
 
 bool ArrowHotEgress::AppendSnapshot(
     std::size_t owner,
     const ingest::CanonicalSnapshot& snapshot) noexcept {
     return impl_->AppendSnapshot(owner, snapshot);
-}
-
-bool ArrowHotEgress::AppendLateRecovery(
-    const ingest::LateRecoveryTick& record) noexcept {
-    return impl_->AppendLateRecovery(record);
 }
 
 bool ArrowHotEgress::AppendGap(const ingest::ChannelGap& record) noexcept {

@@ -38,7 +38,7 @@ struct ArrowHotEgressConfig final {
 struct ArrowHotEgressStats final {
     std::uint64_t tick_rows_received = 0U;
     std::uint64_t snapshot_rows_received = 0U;
-    std::uint64_t late_recovery_rows_received = 0U;
+    std::uint64_t hole_fill_rows_received = 0U;
     std::uint64_t control_rows_received = 0U;
     std::uint64_t published_batches = 0U;
     std::uint64_t published_rows = 0U;
@@ -62,14 +62,12 @@ public:
         ArrowHotEgressConfig config,
         std::string* error);
 
-    [[nodiscard]] bool AppendTick(
+    [[nodiscard]] bool AppendTickDispatch(
         std::size_t owner,
-        const ingest::CanonicalTick& tick) noexcept;
+        const ingest::TickDispatch& dispatch) noexcept;
     [[nodiscard]] bool AppendSnapshot(
         std::size_t owner,
         const ingest::CanonicalSnapshot& snapshot) noexcept;
-    [[nodiscard]] bool AppendLateRecovery(
-        const ingest::LateRecoveryTick& record) noexcept;
     [[nodiscard]] bool AppendGap(
         const ingest::ChannelGap& record) noexcept;
     [[nodiscard]] bool AppendFault(

@@ -12,12 +12,24 @@
 
 namespace l2flow::kline {
 
+enum class KLineSequenceClass : std::uint8_t {
+    kOrdered = 0U,
+    kHoleFill,
+};
+
+struct KLineAdmissionToken final {
+    std::uint64_t feed_session_epoch = 0U;
+    std::uint64_t expected_sequence = 0U;
+    std::uint64_t admission_floor = 0U;
+    std::uint64_t retention_floor = 0U;
+    std::uint64_t generation = 0U;
+    std::uint64_t dispatch_fence = 0U;
+    KLineSequenceClass sequence_class = KLineSequenceClass::kOrdered;
+};
+
 struct KLineInput final {
     ingest::CanonicalTick tick{};
-    std::uint64_t committed_next_sequence = 0U;
-    std::uint64_t observed_gap_epoch = 0U;
-    bool late_recovery = false;
-    bool upstream_conflict = false;
+    KLineAdmissionToken admission{};
     bool catalog_match = true;
 };
 
@@ -27,6 +39,7 @@ struct KLineWorkerConfig final {
     std::uint32_t owner_count = 0U;
     std::uint32_t revision_epoch = 0U;
     std::uint32_t logic_version = 1U;
+    std::uint64_t feed_session_epoch = 0U;
     Identifier128 calculation_run_id{};
     // Intervals are immutable for one calculation run and must be sorted,
     // unique, nonzero intraday second counts.

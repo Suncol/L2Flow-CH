@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS l2flow.kline_revision_log
             native_sequence UInt64,
             ingress_sequence UInt64),
         source_quality_flags UInt64,
-        has_late_recovery Bool,
+        has_hole_fill Bool,
         provisional Bool),
     writer_instance_id FixedString(16),
     batch_id FixedString(16),

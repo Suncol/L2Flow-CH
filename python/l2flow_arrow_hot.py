@@ -26,7 +26,6 @@ READ_API_ERROR: Final = 6
 
 STREAM_ORDERED_TICK: Final = 1
 STREAM_SNAPSHOT: Final = 2
-STREAM_LATE_RECOVERY: Final = 3
 STREAM_CONTROL: Final = 4
 
 PRODUCER_INITIALIZING: Final = 0
@@ -36,7 +35,7 @@ RING_PROTOCOL_VERSION: Final = 2
 LIBRARY_ABI_VERSION: Final = b"l2flow-arrow-hot/2 arrow-ipc-v5"
 
 _ERROR_BYTES: Final = 2048
-_StreamName = Literal["tick", "snapshot", "late_recovery", "control"]
+_StreamName = Literal["tick", "snapshot", "control"]
 _StartName = Literal["latest", "earliest"]
 
 
@@ -178,9 +177,11 @@ class RingManifest:
         if stream in {"tick", "snapshot"}:
             key = f"{stream}.{owner}"
             control_key = f"{stream}_control.{owner}"
-        else:
+        elif stream == "control":
             key = stream
-            control_key = f"{stream}_control" if stream == "late_recovery" else "control_control"
+            control_key = "control_control"
+        else:
+            raise ArrowHotError(f"unknown stream {stream!r}")
         try:
             data_name = self.values[key]
             control_name = self.values[control_key]
@@ -363,8 +364,8 @@ class RingReader:
         start: _StartName = "latest",
         library_path: os.PathLike[str] | str | None = None,
     ) -> RingReader:
-        if stream not in {"tick", "snapshot", "late_recovery", "control"}:
-            raise ValueError("stream must be tick, snapshot, late_recovery, or control")
+        if stream not in {"tick", "snapshot", "control"}:
+            raise ValueError("stream must be tick, snapshot, or control")
         manifest = RingManifest.open_current(root)
         data_path, control_path = manifest.ring_paths(stream, owner)
         reader = cls(
@@ -376,7 +377,6 @@ class RingReader:
         expected_kind = {
             "tick": STREAM_ORDERED_TICK,
             "snapshot": STREAM_SNAPSHOT,
-            "late_recovery": STREAM_LATE_RECOVERY,
             "control": STREAM_CONTROL,
         }[stream]
         expected_shard = owner if stream in {"tick", "snapshot"} else 0

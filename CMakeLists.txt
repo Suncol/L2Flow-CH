@@ -169,6 +169,21 @@ if(L2FLOW_CH_BUILD_TESTS)
             -Wl,--wrap=pwrite -Wl,--wrap=pread -Wl,--wrap=fdatasync)
     endif()
     add_test(NAME fact_journal COMMAND test_fact_journal)
+
+    add_executable(test_event_lazy_paged_hash
+        tests/test_event_lazy_paged_hash.cpp)
+    l2flow_ch_configure(test_event_lazy_paged_hash)
+    target_include_directories(test_event_lazy_paged_hash PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME event_lazy_paged_hash COMMAND test_event_lazy_paged_hash)
+
+    add_executable(test_event_exact_list
+        tests/test_event_exact_list.cpp)
+    l2flow_ch_configure(test_event_exact_list)
+    target_include_directories(test_event_exact_list PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME event_exact_list COMMAND test_event_exact_list)
+
     if(L2FLOW_CH_ENABLE_ARROW_RING)
         add_executable(test_arrow_ring tests/test_arrow_ring.cpp)
         l2flow_ch_configure(test_arrow_ring)
@@ -371,12 +386,31 @@ if(L2FLOW_CH_BUILD_TESTS)
             --dispatch-queue-capacity 65536
             --validate-only)
     add_test(
-        NAME mdl_ingest_late_recovery_queue_capacity
+        NAME mdl_ingest_reorder_window_boundary
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
-            --late-recovery-queue-capacity 65536
+            --reorder-entries-per-channel 8
+            --maximum-reorder-span 8
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_rejects_reorder_span_over_capacity
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --reorder-entries-per-channel 8
+            --maximum-reorder-span 9
+            --validate-only)
+    add_test(
+        NAME mdl_ingest_rejects_non_power_of_two_reorder_capacity
+        COMMAND mdl_ingestd
+            --mode partial
+            --trade-date 20260806
+            --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
+            --reorder-entries-per-channel 7
+            --maximum-reorder-span 7
             --validate-only)
     add_test(
         NAME mdl_ingest_rejects_zero_ready_timeout
@@ -483,7 +517,6 @@ if(L2FLOW_CH_BUILD_TESTS)
                 L2FLOW_FACT_JOURNAL_PATH=/tmp/l2flow-production-config.fjn
                 L2FLOW_SOURCE_INSTANCE_HEX32=000102030405060708090a0b0c0d0e0f
                 L2FLOW_RAW_FEED_EPOCH=42
-                L2FLOW_ARROW_FEED_EPOCH=43
                 L2FLOW_EVENT_REVISION_EPOCH=9
                 L2FLOW_EVENT_RUN_HEX32=101112131415161718191a1b1c1d1e1f
                 L2FLOW_KLINE_INTERVAL_SECONDS=5
@@ -497,6 +530,8 @@ if(L2FLOW_CH_BUILD_TESTS)
     set_tests_properties(
         mdl_ingest_live_rejects_run_seconds
         mdl_ingest_rejects_zero_ready_timeout
+        mdl_ingest_rejects_reorder_span_over_capacity
+        mdl_ingest_rejects_non_power_of_two_reorder_capacity
         mdl_ingest_config_missing_environment
         mdl_ingest_config_rejects_malformed_line
         mdl_ingest_config_rejects_malformed_environment
@@ -509,7 +544,9 @@ if(L2FLOW_CH_BUILD_TESTS)
         mdl_ingest_test_operation_mode
         mdl_ingest_custom_ready_timeout
         mdl_ingest_dispatch_queue_capacity
-        mdl_ingest_late_recovery_queue_capacity
+        mdl_ingest_reorder_window_boundary
+        mdl_ingest_rejects_reorder_span_over_capacity
+        mdl_ingest_rejects_non_power_of_two_reorder_capacity
         mdl_ingest_config_file
         mdl_ingest_process_cpu_list
         PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -570,6 +607,12 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
             benchmarks/benchmark_event_state.cpp)
         l2flow_ch_configure(benchmark_event_state)
         target_link_libraries(benchmark_event_state PRIVATE
+            L2FlowCH::clickhouse)
+
+        add_executable(benchmark_event_sink
+            benchmarks/benchmark_event_sink.cpp)
+        l2flow_ch_configure(benchmark_event_sink)
+        target_link_libraries(benchmark_event_sink PRIVATE
             L2FlowCH::clickhouse)
         if(L2FLOW_CH_BUILD_TESTS)
             add_test(

@@ -25,6 +25,24 @@ void FillCommon(l2flow::ingest::CanonicalCommon* common,
     common->identity.market = l2flow::ingest::Market::kShanghai;
 }
 
+[[nodiscard]] l2flow::ingest::TickDispatch MakeOrderedDispatch(
+    l2flow::ingest::CanonicalTick tick,
+    std::uint64_t fence) {
+    l2flow::ingest::TickDispatch dispatch{};
+    dispatch.tick = tick;
+    dispatch.feed_session_epoch = 9'001U;
+    dispatch.expected_sequence = tick.common.native_sequence;
+    dispatch.admission_floor = 1U;
+    dispatch.evict_before = tick.common.native_sequence + 1U;
+    dispatch.dispatch_fence = fence;
+    dispatch.channel = tick.common.channel;
+    dispatch.owner = 0U;
+    dispatch.market = tick.common.identity.market;
+    dispatch.kind = l2flow::ingest::TickDispatchKind::kProjectOrdered;
+    dispatch.catalog_match = true;
+    return dispatch;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -60,7 +78,7 @@ int main(int argc, char** argv) {
     first.price = {12'345, 12'345'000, 3U, true, true};
     first.quantity = {100, 0U, true};
     first.action = l2flow::ingest::TickAction::kTrade;
-    if (!egress->AppendTick(0U, first)) {
+    if (!egress->AppendTickDispatch(0U, MakeOrderedDispatch(first, 1U))) {
         std::cerr << egress->fatal_error() << '\n';
         return 1;
     }
@@ -68,7 +86,7 @@ int main(int argc, char** argv) {
     FillCommon(&second.common, 2U, 500U);
     second.price.raw = 12'346;
     second.price.p6 = 12'346'000;
-    if (!egress->AppendTick(0U, second)) {
+    if (!egress->AppendTickDispatch(0U, MakeOrderedDispatch(second, 2U))) {
         std::cerr << egress->fatal_error() << '\n';
         return 1;
     }

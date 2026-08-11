@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS l2flow.kline_revision_log
             native_sequence UInt64,
             ingress_sequence UInt64),
         source_quality_flags UInt64,
-        has_late_recovery Bool,
+        has_hole_fill Bool,
         provisional Bool),
     writer_instance_id FixedString(16),
     batch_id FixedString(16),
@@ -103,7 +103,7 @@ SETTINGS non_replicated_deduplication_window = 10000;
 
 -- Replacement must happen before tombstones are filtered. Realtime rows stay
 -- provisional because process-local or exchange-sequence progress cannot prove
--- that an older late-recovery trade will never arrive.
+-- that an older hole-fill trade will never arrive.
 --
 -- SELECT * FROM l2flow.kline FINAL
 -- WHERE is_deleted = false;

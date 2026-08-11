@@ -40,6 +40,8 @@ using l2flow::ingest::CanonicalTick;
 using l2flow::ingest::Market;
 using l2flow::ingest::MessageKey;
 using l2flow::ingest::MonotonicNowNs;
+using l2flow::ingest::TickDispatch;
+using l2flow::ingest::TickDispatchKind;
 using l2flow::ingest::TickAction;
 using l2flow::ingest::TradingPhase;
 using l2flow::journal::CanonicalFactJournal;
@@ -50,7 +52,9 @@ struct Options final {
     std::uint64_t target_rate = 800'000U;
     std::uint32_t seconds = 1U;
     std::size_t actors = 16U;
-    std::size_t micro_batch_rows = 256U;
+    std::size_t micro_batch_rows = 512U;
+    std::uint64_t latency_sample_every = 100U;
+    std::size_t pacing_burst = 64U;
     std::filesystem::path journal_directory;
     bool unpaced = false;
 };
@@ -84,7 +88,9 @@ void PrintUsage() {
         << "  --rate N              scheduled facts/s; default 800000\n"
         << "  --seconds N           measured seconds; default 1, max 600\n"
         << "  --actors N            Event owner actors; default 16\n"
-        << "  --micro-batch-rows N  journal-first cut; default 256\n"
+        << "  --micro-batch-rows N  journal-first cut; default 512\n"
+        << "  --sample-every N       projection latency stride; default 100\n"
+        << "  --pacing-burst N       owner drain burst; default 64\n"
         << "  --journal-dir DIR     journal directory; default system temp\n"
         << "  --unpaced             run the same count as fast as possible\n";
 }
@@ -129,6 +135,17 @@ void PrintUsage() {
                 *error = "invalid --micro-batch-rows";
                 return false;
             }
+        } else if (argument == "--sample-every") {
+            if (!ParseInteger(next(argument),
+                              &parsed.latency_sample_every)) {
+                *error = "invalid --sample-every";
+                return false;
+            }
+        } else if (argument == "--pacing-burst") {
+            if (!ParseInteger(next(argument), &parsed.pacing_burst)) {
+                *error = "invalid --pacing-burst";
+                return false;
+            }
         } else if (argument == "--journal-dir") {
             const std::string_view value = next(argument);
             if (value.empty()) {
@@ -154,6 +171,8 @@ void PrintUsage() {
                 std::numeric_limits<std::uint32_t>::max()) ||
         parsed.micro_batch_rows == 0U ||
         parsed.micro_batch_rows > 1'048'576U ||
+        parsed.latency_sample_every == 0U ||
+        parsed.pacing_burst == 0U || parsed.pacing_burst > 256U ||
         parsed.target_rate >
             std::numeric_limits<std::uint64_t>::max() / parsed.seconds) {
         *error = "invalid rate, duration, actor, or micro-batch bound";
@@ -164,6 +183,17 @@ void PrintUsage() {
     return true;
 }
 
+[[nodiscard]] std::uint64_t Percentile(
+    const std::vector<std::uint64_t>& sorted,
+    long double fraction) noexcept {
+    if (sorted.empty()) {
+        return 0U;
+    }
+    const long double position = fraction *
+        static_cast<long double>(sorted.size() - 1U);
+    return sorted[static_cast<std::size_t>(position)];
+}
+
 class InMemoryRevisionSink final : public EventRevisionSink {
 public:
     explicit InMemoryRevisionSink(std::size_t actors)
@@ -171,27 +201,37 @@ public:
           last_sequence_(
               std::make_unique<std::atomic<std::uint64_t>[]>(actors)) {}
 
-    [[nodiscard]] bool AppendRevisionBatch(
-        std::shared_ptr<const EventRevisionBatch> batch) noexcept override {
-        if (batch == nullptr || batch->revisions.empty() ||
-            static_cast<std::size_t>(batch->owner) >= actors_ ||
-            !healthy_.load(std::memory_order_acquire)) {
+    [[nodiscard]] bool AppendRevisionGroup(
+        std::vector<std::shared_ptr<const EventRevisionBatch>> group)
+        noexcept override {
+        if (group.empty() || !healthy_.load(std::memory_order_acquire)) {
             healthy_.store(false, std::memory_order_release);
             return false;
         }
-        std::atomic<std::uint64_t>& last = last_sequence_[batch->owner];
-        std::uint64_t previous = last.load(std::memory_order_relaxed);
-        if (batch->batch_sequence <= previous ||
-            !last.compare_exchange_strong(
-                previous, batch->batch_sequence,
-                std::memory_order_release, std::memory_order_relaxed)) {
-            healthy_.store(false, std::memory_order_release);
-            return false;
+        std::uint64_t rows = 0U;
+        std::uint32_t owner = std::numeric_limits<std::uint32_t>::max();
+        for (const auto& batch : group) {
+            if (batch == nullptr || batch->revisions.empty() ||
+                static_cast<std::size_t>(batch->owner) >= actors_ ||
+                (owner != std::numeric_limits<std::uint32_t>::max() &&
+                 batch->owner != owner)) {
+                healthy_.store(false, std::memory_order_release);
+                return false;
+            }
+            owner = batch->owner;
+            std::atomic<std::uint64_t>& last = last_sequence_[owner];
+            const std::uint64_t previous = last.load(
+                std::memory_order_relaxed);
+            if (batch->batch_sequence <= previous) {
+                healthy_.store(false, std::memory_order_release);
+                return false;
+            }
+            last.store(batch->batch_sequence, std::memory_order_release);
+            rows += batch->revisions.size();
         }
-        rows_.fetch_add(
-            static_cast<std::uint64_t>(batch->revisions.size()),
-            std::memory_order_relaxed);
-        batches_.fetch_add(1U, std::memory_order_relaxed);
+        rows_.fetch_add(rows, std::memory_order_relaxed);
+        batches_.fetch_add(group.size(), std::memory_order_relaxed);
+        groups_.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
 
@@ -204,12 +244,16 @@ public:
     [[nodiscard]] std::uint64_t batches() const noexcept {
         return batches_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] std::uint64_t groups() const noexcept {
+        return groups_.load(std::memory_order_relaxed);
+    }
 
 private:
     std::size_t actors_ = 0U;
     std::unique_ptr<std::atomic<std::uint64_t>[]> last_sequence_;
     std::atomic<std::uint64_t> rows_{0U};
     std::atomic<std::uint64_t> batches_{0U};
+    std::atomic<std::uint64_t> groups_{0U};
     std::atomic<bool> healthy_{true};
 };
 
@@ -436,23 +480,26 @@ int main(int argc, char** argv) {
         std::move(created_journal));
 
     EventRuntimeConfig config{};
+    config.feed_session_epoch = 1U;
     config.worker.trade_date = 20260807U;
+    config.worker.feed_session_epoch = 1U;
     config.worker.owner_count = static_cast<std::uint32_t>(options.actors);
     config.worker.revision_epoch = 1U;
     config.worker.logic_version = 1U;
     config.worker.calculation_run_id.bytes[0U] = std::byte{1U};
     config.worker.fact_journal = journal;
-    config.worker.maximum_orders = 1U;
+    config.worker.maximum_carry_orders = 1U;
     config.worker.maximum_cached_events = static_cast<std::size_t>(
         maximum_per_actor + options.micro_batch_rows + 1U);
     config.worker.maximum_pending_commits = 1'024U;
     config.worker.maximum_acknowledged_raw_dependencies =
-        std::max<std::size_t>(options.micro_batch_rows * 2U, 1'024U);
+        std::max<std::size_t>(options.micro_batch_rows * 2U, 65'536U);
     config.micro_batch_rows = options.micro_batch_rows;
-    config.micro_batch_max_delay_ns = 1'000'000U;
+    config.micro_batch_max_delay_ns = UINT64_C(50'000'000);
     config.maximum_raw_ack_backlog_per_owner =
         config.worker.maximum_acknowledged_raw_dependencies;
-    config.maximum_late_backlog_per_owner = 1U;
+    config.maximum_occurrence_join_entries_per_owner =
+        config.worker.maximum_acknowledged_raw_dependencies;
 
     InMemoryRevisionSink sink(options.actors);
     std::unique_ptr<EventRuntime> runtime =
@@ -470,6 +517,23 @@ int main(int argc, char** argv) {
     std::atomic<std::uint64_t> maximum_schedule_lag_ns{0U};
     auto finish_ns = std::make_unique<std::atomic<std::uint64_t>[]>(
         options.actors);
+    std::vector<std::vector<std::uint64_t>> actor_dispatch_latencies(
+        options.actors);
+    std::vector<std::vector<std::uint64_t>> actor_cut_latencies(
+        options.actors);
+    const std::uint64_t samples_per_actor =
+        maximum_per_actor / options.latency_sample_every +
+        (maximum_per_actor % options.latency_sample_every == 0U ? 0U : 1U);
+    for (auto& samples : actor_dispatch_latencies) {
+        samples.reserve(static_cast<std::size_t>(samples_per_actor));
+    }
+    const std::uint64_t cuts_per_actor =
+        maximum_per_actor / options.micro_batch_rows + 1U;
+    for (auto& samples : actor_cut_latencies) {
+        samples.reserve(static_cast<std::size_t>(cuts_per_actor));
+    }
+    std::atomic<std::uint64_t> maximum_dispatch_latency_ns{0U};
+    std::atomic<std::uint64_t> maximum_cut_latency_ns{0U};
     const std::uint64_t start_ns =
         MonotonicNowNs() + UINT64_C(100'000'000);
     std::vector<std::thread> threads;
@@ -478,6 +542,37 @@ int main(int argc, char** argv) {
         threads.emplace_back([&, actor] {
             std::vector<CanonicalTick> acknowledgements;
             acknowledgements.reserve(options.micro_batch_rows);
+            std::uint64_t cut_oldest_origin_ns = 0U;
+            std::size_t facts_in_cut = 0U;
+            const auto publish_maximum = [](std::atomic<std::uint64_t>* target,
+                                            std::uint64_t value) {
+                std::uint64_t current = target->load(
+                    std::memory_order_relaxed);
+                while (value > current &&
+                       !target->compare_exchange_weak(
+                           current, value, std::memory_order_relaxed,
+                           std::memory_order_relaxed)) {
+                }
+            };
+            const auto service_until_pollable = [&]() {
+                while (!runtime->CanPollDispatch(actor)) {
+                    if (!runtime->FlushDue(actor, MonotonicNowNs())) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const auto record_cut_latency = [&]() {
+                const std::uint64_t completed_ns = MonotonicNowNs();
+                const std::uint64_t latency =
+                    completed_ns >= cut_oldest_origin_ns
+                    ? completed_ns - cut_oldest_origin_ns
+                    : 0U;
+                actor_cut_latencies[actor].push_back(latency);
+                publish_maximum(&maximum_cut_latency_ns, latency);
+                cut_oldest_origin_ns = 0U;
+                facts_in_cut = 0U;
+            };
             ready.fetch_add(1U, std::memory_order_release);
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -489,9 +584,22 @@ int main(int argc, char** argv) {
                  ordinal += static_cast<std::uint64_t>(options.actors)) {
                 const std::uint64_t deadline = start_ns +
                     ScheduledOffsetNs(ordinal, options.target_rate);
-                const std::uint64_t now = options.unpaced
-                    ? MonotonicNowNs()
-                    : WaitUntil(deadline);
+                if (!options.unpaced &&
+                    local_sequence % options.pacing_burst == 0U) {
+                    const std::uint64_t available_steps =
+                        (total - 1U - ordinal) /
+                        static_cast<std::uint64_t>(options.actors);
+                    const std::uint64_t burst_steps = std::min(
+                        available_steps,
+                        static_cast<std::uint64_t>(
+                            options.pacing_burst - 1U));
+                    const std::uint64_t burst_last = ordinal + burst_steps *
+                        static_cast<std::uint64_t>(options.actors);
+                    static_cast<void>(WaitUntil(
+                        start_ns + ScheduledOffsetNs(
+                            burst_last, options.target_rate)));
+                }
+                const std::uint64_t now = MonotonicNowNs();
                 std::uint64_t first = first_actual_ns.load(
                     std::memory_order_relaxed);
                 while (now < first &&
@@ -509,11 +617,42 @@ int main(int argc, char** argv) {
                            std::memory_order_relaxed)) {
                 }
                 ++local_sequence;
+                if (facts_in_cut == 0U) {
+                    cut_oldest_origin_ns = options.unpaced ? now : deadline;
+                }
                 CanonicalTick tick = MakeStatusTick(
-                    actor, local_sequence, ordinal + 1U, now);
-                if (!runtime->AppendTick(actor, tick)) {
+                    actor, local_sequence, ordinal + 1U,
+                    options.unpaced ? now : deadline);
+                TickDispatch dispatch{};
+                dispatch.tick = tick;
+                dispatch.feed_session_epoch = 1U;
+                dispatch.expected_sequence = local_sequence;
+                dispatch.admission_floor = 1U;
+                dispatch.evict_before = local_sequence + 1U;
+                dispatch.dispatch_fence = local_sequence;
+                dispatch.channel = tick.common.channel;
+                dispatch.owner = static_cast<std::uint32_t>(actor);
+                dispatch.market = tick.common.identity.market;
+                dispatch.kind = TickDispatchKind::kProjectOrdered;
+                dispatch.catalog_match = true;
+                if (!runtime->AppendDispatch(actor, dispatch)) {
                     abort.store(true, std::memory_order_release);
                     break;
+                }
+                ++facts_in_cut;
+                if (ordinal % options.latency_sample_every == 0U) {
+                    const std::uint64_t dispatched_ns = MonotonicNowNs();
+                    const std::uint64_t latency_origin = options.unpaced
+                        ? now
+                        : deadline;
+                    const std::uint64_t dispatch_latency =
+                        dispatched_ns >= latency_origin
+                        ? dispatched_ns - latency_origin
+                        : 0U;
+                    publish_maximum(
+                        &maximum_dispatch_latency_ns, dispatch_latency);
+                    actor_dispatch_latencies[actor].push_back(
+                        dispatch_latency);
                 }
                 acknowledgements.push_back(std::move(tick));
                 if (acknowledgements.size() ==
@@ -525,13 +664,26 @@ int main(int argc, char** argv) {
                     }
                     acknowledgements.clear();
                 }
+                if (facts_in_cut == options.micro_batch_rows) {
+                    if (!service_until_pollable()) {
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                    record_cut_latency();
+                } else if ((local_sequence & 255U) == 0U &&
+                           !runtime->FlushDue(actor, MonotonicNowNs())) {
+                    abort.store(true, std::memory_order_release);
+                    break;
+                }
             }
             if (!acknowledgements.empty() &&
                 !runtime->OnRawTickBatchAcknowledged(acknowledgements)) {
                 abort.store(true, std::memory_order_release);
             }
-            if (!runtime->Flush(actor)) {
+            if (!runtime->Flush(actor) || !service_until_pollable()) {
                 abort.store(true, std::memory_order_release);
+            } else if (facts_in_cut != 0U) {
+                record_cut_latency();
             }
             finish_ns[actor].store(
                 MonotonicNowNs(), std::memory_order_release);
@@ -560,15 +712,28 @@ int main(int argc, char** argv) {
     const EventRuntimeStats stats = runtime->stats();
     const FactJournalStats journal_stats = journal->stats();
     const ProcessMemory process_memory = ReadProcessMemory();
+    std::vector<std::uint64_t> dispatch_latencies;
+    std::vector<std::uint64_t> cut_latencies;
+    for (const auto& actor : actor_dispatch_latencies) {
+        dispatch_latencies.insert(
+            dispatch_latencies.end(), actor.begin(), actor.end());
+    }
+    for (const auto& actor : actor_cut_latencies) {
+        cut_latencies.insert(
+            cut_latencies.end(), actor.begin(), actor.end());
+    }
+    std::sort(dispatch_latencies.begin(), dispatch_latencies.end());
+    std::sort(cut_latencies.begin(), cut_latencies.end());
     std::error_code file_size_error;
     const std::uintmax_t observed_file_bytes =
         std::filesystem::file_size(journal_path, file_size_error);
     const std::uint64_t first_processing_ns = first_actual_ns.load(
         std::memory_order_acquire);
     const std::uint64_t measurement_origin_ns =
-        first_processing_ns == std::numeric_limits<std::uint64_t>::max()
-            ? start_ns
-            : first_processing_ns;
+        options.unpaced &&
+            first_processing_ns != std::numeric_limits<std::uint64_t>::max()
+        ? first_processing_ns
+        : start_ns;
     const double actors_elapsed_seconds =
         actors_completed_ns <= measurement_origin_ns
         ? 0.0
@@ -589,6 +754,10 @@ int main(int argc, char** argv) {
         ? 0.0
         : static_cast<double>(stats.workers.facts_journaled) /
               preflush_elapsed_seconds;
+    const double steady_rate = actors_elapsed_seconds == 0.0
+        ? 0.0
+        : static_cast<double>(stats.workers.facts_journaled) /
+              actors_elapsed_seconds;
     const double durable_rate = durable_elapsed_seconds == 0.0
         ? 0.0
         : static_cast<double>(stats.workers.facts_journaled) /
@@ -605,6 +774,16 @@ int main(int argc, char** argv) {
               1'000'000.0;
     const double required_rate =
         static_cast<double>(options.target_rate) * 0.99;
+    const double facts_per_micro_batch = stats.micro_batches_applied == 0U
+        ? 0.0
+        : static_cast<double>(stats.facts_in_micro_batches) /
+              static_cast<double>(stats.micro_batches_applied);
+    const double minimum_micro_batch_density =
+        static_cast<double>(options.micro_batch_rows) * 0.80;
+    const double revisions_per_persistence_group = sink.groups() == 0U
+        ? 0.0
+        : static_cast<double>(sink.rows()) /
+              static_cast<double>(sink.groups());
     const bool runtime_healthy = runtime->healthy();
     const std::string runtime_fatal = runtime->fatal_error();
     const bool journal_healthy = journal->healthy();
@@ -612,8 +791,10 @@ int main(int argc, char** argv) {
     bool valid = !abort.load(std::memory_order_acquire) && drained &&
         journal_flushed && runtime_healthy && journal_healthy &&
         sink.healthy() &&
-        stats.normal_ticks_received == total &&
-        stats.late_ticks_received == 0U &&
+        stats.ordered_dispositions_received == total &&
+        stats.hole_fill_dispositions_received == 0U &&
+        stats.rejected_dispositions_received == 0U &&
+        stats.occurrence_join_entries == 0U &&
         stats.raw_tick_acks_received == total &&
         stats.source_conflicts == 0U && stats.invalid_inputs == 0U &&
         stats.workers.facts_journaled == total &&
@@ -642,7 +823,8 @@ int main(int argc, char** argv) {
         journal_stats.errors == 0U &&
         journal_stats.flush_calls >= 1U && !file_size_error &&
         observed_file_bytes == expected_file_bytes &&
-        durable_rate >= required_rate;
+        steady_rate >= required_rate &&
+        facts_per_micro_batch >= minimum_micro_batch_density;
 
     runtime.reset();
     journal.reset();
@@ -662,6 +844,8 @@ int main(int argc, char** argv) {
               << " target_msg_s=" << options.target_rate
               << " seconds=" << options.seconds
               << " micro_batch_rows=" << options.micro_batch_rows
+              << " latency_sample_every=" << options.latency_sample_every
+              << " pacing_burst=" << options.pacing_burst
               << " pacing=" << (options.unpaced ? "unpaced" : "scheduled")
               << " fact_payload_storage=disk_journal"
               << " journal_recovery=false"
@@ -669,14 +853,29 @@ int main(int argc, char** argv) {
               << " journal_cleanup="
               << (journal_cleanup_ok ? "removed" : "failed") << '\n'
               << "event_state_result expected_facts=" << total
-              << " normal_ticks_received="
-              << stats.normal_ticks_received
+              << " ordered_dispositions_received="
+              << stats.ordered_dispositions_received
               << " raw_tick_acks_received="
               << stats.raw_tick_acks_received
               << " facts_journaled=" << stats.workers.facts_journaled
               << " revisions_created=" << stats.workers.revisions_created
               << " micro_batches=" << stats.micro_batches_applied
+              << " facts_in_micro_batches="
+              << stats.facts_in_micro_batches
+              << " facts_per_micro_batch=" << facts_per_micro_batch
+              << " required_facts_per_micro_batch="
+              << minimum_micro_batch_density
+              << " micro_batch_rows_max=" << stats.micro_batch_rows_max
+              << " row_limit_flushes=" << stats.row_limit_flushes
+              << " timer_flushes=" << stats.timer_flushes
+              << " forced_active_flushes="
+              << stats.forced_active_flushes
+              << " empty_control_flushes="
+              << stats.empty_control_flushes
               << " revision_batches=" << sink.batches()
+              << " persistence_groups=" << sink.groups()
+              << " revisions_per_persistence_group="
+              << revisions_per_persistence_group
               << " revision_rows_acked_in_memory=" << sink.rows()
               << " pending_raw_commits="
               << stats.workers.pending_raw_commits
@@ -707,6 +906,7 @@ int main(int argc, char** argv) {
               << actors_elapsed_seconds
               << " preflush_elapsed_s=" << preflush_elapsed_seconds
               << " durable_elapsed_s=" << durable_elapsed_seconds
+              << " steady_fact_s=" << steady_rate
               << " preflush_fact_s=" << preflush_rate
               << " durable_fact_s=" << durable_rate
               << " required_fact_s=" << required_rate
@@ -716,6 +916,37 @@ int main(int argc, char** argv) {
               << static_cast<double>(maximum_schedule_lag_ns.load(
                      std::memory_order_relaxed)) /
                      1'000.0
+              << " dispatch_latency_samples="
+              << dispatch_latencies.size()
+              << " dispatch_latency_p50_us="
+              << static_cast<double>(Percentile(
+                     dispatch_latencies, 0.50L)) / 1'000.0
+              << " dispatch_latency_p90_us="
+              << static_cast<double>(Percentile(
+                     dispatch_latencies, 0.90L)) / 1'000.0
+              << " dispatch_latency_p99_us="
+              << static_cast<double>(Percentile(
+                     dispatch_latencies, 0.99L)) / 1'000.0
+              << " dispatch_latency_p999_us="
+              << static_cast<double>(Percentile(
+                     dispatch_latencies, 0.999L)) / 1'000.0
+              << " dispatch_latency_max_us="
+              << static_cast<double>(maximum_dispatch_latency_ns.load(
+                     std::memory_order_relaxed)) / 1'000.0
+              << " projection_cut_latency_samples="
+              << cut_latencies.size()
+              << " projection_cut_latency_p50_us="
+              << static_cast<double>(Percentile(
+                     cut_latencies, 0.50L)) / 1'000.0
+              << " projection_cut_latency_p90_us="
+              << static_cast<double>(Percentile(
+                     cut_latencies, 0.90L)) / 1'000.0
+              << " projection_cut_latency_p99_us="
+              << static_cast<double>(Percentile(
+                     cut_latencies, 0.99L)) / 1'000.0
+              << " projection_cut_latency_max_us="
+              << static_cast<double>(maximum_cut_latency_ns.load(
+                     std::memory_order_relaxed)) / 1'000.0
               << " ordered_batch_fast_path="
               << stats.workers.ordered_batch_fast_path
               << " unordered_batch_sorts="

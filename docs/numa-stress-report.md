@@ -2,6 +2,13 @@
 
 测试日期：2026-08-06
 
+> 历史报告说明：本报告记录的是当日已经被替换的独立
+> `LateRecovery` 队列架构及其指标名称。当前实现使用统一
+> `TickDispatch`、strict first-wins、精确 hole ledger 和 owner FIFO
+> controls；以下旧术语与数字仅用于保留原始测试证据，不构成当前接口或
+> 正确性契约。当前契约见
+> [`mdl-ingestd-design.md`](mdl-ingestd-design.md)。
+
 ## 1. 结论
 
 在本机 NUMA node 1 上显式绑定一个硬件线程/物理核，当前
@@ -150,17 +157,17 @@ admission lane 饱和或 instrument dispatch 饱和。
 | Dispatch overflow counter（LateRecovery publish） | 2 |
 | Engine | unhealthy，测试 FAIL |
 
-因果顺序是：共享 OS 在一个未闭合 reverse window 内暂停 producer 超过
-500 us；recovery 按设计记录紧凑 `ChannelGap`、推进 frontier 并继续实时
-流；迟到的完整 canonical body 不倒插，而进入 LateRecovery。这个容量
-benchmark 没有运行实时 LateRecovery consumer，固定的 loss-sensitive
-LateRecovery 队列随后按设计 fail-fast，而不是静默丢 body。
+以下因果顺序只解释 2026-08-06 当日的旧实现：共享 OS 在一个未闭合
+reverse window 内暂停 producer 超过 500 us；recovery 记录 `ChannelGap`、
+推进 frontier 并继续实时流；迟到的完整 canonical body 进入当时独立的
+`LateRecovery` 队列。该 benchmark 没有运行旧队列的 consumer，队列耗尽
+后按当时设计 fail-fast，而不是静默丢 body。
 
-这个结果不是 reorder buffer 丢弃已收到报文，也不表示应把生产默认值
-暗中改长。它表明若坚持 500 us 缺口决策，同时要求五分钟内所有可回补
-局部乱序都仍进入严格实时支路，则生产环境还必须控制 OS/IRQ/SMT 抖动，
-并让 LateRecovery 支路始终有消费者。若真实网络回补超过 500 us，语义
-应是 gap + 实时继续 + LateRecovery，而不是冻结 Channel 或倒插实时流。
+这个历史结果不是 reorder buffer 丢弃已收到报文，也不表示应把生产默认值
+暗中改长；但它不能转化为给当前实现配置 `LateRecovery` consumer 的建议。
+当前实现没有该队列：仍在精确 hole ledger 和在线窗口内的首个回补通过统一
+`TickDispatch` 进入 owner repair，其他后到 occurrence 通过 disposition/raw
+ACK join 结算并拒绝。现行验收应分别覆盖这两条路径及其容量边界。
 
 20 ms 测试覆盖只回答“在缺口决策没有被非业务调度暂停意外触发时，
 reorder/canonical/dispatch 管线能否承载目标速率”。它不构成把生产等待
@@ -201,12 +208,12 @@ numactl --physcpubind=32-63 --membind=1 \
 |---:|---|---|
 | P0 | 使用 cpuset/cgroup 或 `isolcpus` 同时隔离被测物理核及其 SMT siblings；将 NIC/存储 IRQ 和 RCU 工作移出热核 | 使 500 us gap 决策不被普通调度暂停主导 |
 | P0 | 固定 `performance` governor，并在授权和审计后评估 `SCHED_FIFO`；监控 starvation | 降低频率与调度唤醒抖动 |
-| P0 | 真实 MDL SDK + NIC 上重复六组 5 分钟测试，保留默认 500 us，并单独注入 100/300/499/>500 us 回补 | 区分可闭合乱序、gap advance 和 LateRecovery 语义 |
-| P0 | 给 LateRecovery 配置持续消费者和 durable raw 副本，压测其最坏突发 | 防止迟到 body 队列耗尽；保证后续修订能力 |
+| P0 | 真实 MDL SDK + NIC 上重复六组 5 分钟测试，保留默认 500 us，并单独注入 100/300/499/>500 us 回补 | 区分可闭合乱序、`GapOpen`、窗口内 hole fill 和过窗拒绝语义 |
+| P0 | 压测 exact hole ledger、统一 `TickDispatch`/owner fence 与 disposition/raw-ACK join 的最坏突发 | 验证回补修订能力、拒绝结算和所有有界 ledger 的 fail-closed 行为 |
 | P0 | 使用同时交织的 SZ `6.101.33`/`6.101.36` 捕获回放确认共享 `ApplSeqNum` 域 | 关闭当前 vendor 文档未明确声明共享计数器的事实边界 |
 | P1 | 用五类 tuple 的真实比例、真实 body size、Channel/Instrument 基数和 burst profile 重测 | 本报告只有单一 `4.101.24` 合成负载 |
 | P1 | 在目标 1 TiB 主机上执行 first-touch/NUMA 页面、huge page、内存锁定和 queue capacity 验证 | 本测试机仅约 503 GiB，不能代替目标内存拓扑验收 |
-| P1 | 将 p50/p99/p999/max、schedule lag、gap epoch、LateRecovery、lane/dispatch occupancy 接入监控 | 在生产中分辨算法延迟、网络回补和 OS 抖动 |
+| P1 | 将 p50/p99/p999/max、schedule lag、gap epoch、hole fill/reject/expiry、ACK join 和 lane/dispatch occupancy 接入监控 | 在生产中分辨算法延迟、网络回补、拒绝结算和 OS 抖动 |
 
 在完成上述 P0 之前，合理结论是“当前实现的合成进程内路径已证明
 1.2M msg/s / 5 min 能力”，而不是“生产端到端 1.2M msg/s 已验收”。

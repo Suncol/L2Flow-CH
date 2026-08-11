@@ -90,7 +90,7 @@ enum QualityFlag : std::uint64_t {
     kQualityInvalidAmount = UINT64_C(1) << 10U,
     kQualityInvalidOrderReference = UINT64_C(1) << 11U,
     kQualityNonIntegralMatchedQuantity = UINT64_C(1) << 12U,
-    kQualityLateRecovery = UINT64_C(1) << 13U,
+    kQualityHoleFill = UINT64_C(1) << 13U,
 };
 
 enum TickValidity : std::uint64_t {
@@ -229,46 +229,56 @@ struct ChannelGap final {
     // individual older ranges.
     std::uint64_t gap_epoch = 0U;
     std::uint64_t cumulative_missing_sequences = 0U;
+    std::uint64_t feed_session_epoch = 0U;
 };
 
-enum class LateRecoveryReason : std::uint8_t {
-    // The realtime ordered frontier has already advanced beyond this native
-    // position. This can be a recovered gap member or a retransmission;
-    // downstream reconciliation must decide using durable identity/history.
-    kBehindCommittedFrontier,
-    // PARTIAL retained the first canonical projection for a native position
-    // and diverted a different projection instead of freezing the channel.
-    kPendingCanonicalConflict,
+enum class TickDispatchKind : std::uint8_t {
+    kProjectOrdered,
+    kProjectHoleFill,
+    kRejectLateFact,
+    kGapOpen,
+    kChannelSeal,
 };
 
-struct LateRecoveryTick final {
+// One fixed-width record is used on every decoder-lane -> owner edge. The
+// occurrence kinds carry tick; the control kinds carry the explicit Channel
+// fields. expected_sequence and admission_floor are captured when an
+// occurrence is classified and must never be recomputed downstream.
+struct TickDispatch final {
     CanonicalTick tick{};
-    std::uint64_t committed_next_sequence = 0U;
-    std::uint64_t observed_gap_epoch = 0U;
-    LateRecoveryReason reason =
-        LateRecoveryReason::kBehindCommittedFrontier;
+    std::uint64_t feed_session_epoch = 0U;
+    std::uint64_t expected_sequence = 0U;
+    std::uint64_t admission_floor = 0U;
+    std::uint64_t generation = 0U;
+    std::uint64_t dispatch_fence = 0U;
+    std::uint64_t first_missing = 0U;
+    std::uint64_t last_missing = 0U;
+    std::uint64_t evict_before = 0U;
+    std::uint32_t channel = 0U;
+    std::uint32_t owner = 0U;
+    Market market = Market::kUnknown;
+    TickDispatchKind kind = TickDispatchKind::kProjectOrdered;
     bool catalog_match = false;
 };
 
 enum class ChannelFaultReason : std::uint8_t {
-    kCanonicalConflict,
     kDecodeFailure,
 };
 
 struct ChannelFault final {
     Market market = Market::kUnknown;
-    ChannelFaultReason reason =
-        ChannelFaultReason::kCanonicalConflict;
+    ChannelFaultReason reason = ChannelFaultReason::kDecodeFailure;
     std::uint32_t channel = 0U;
     std::uint64_t expected_sequence = 0U;
     std::uint64_t observed_sequence = 0U;
     std::uint64_t detected_monotonic_ns = 0U;
+    std::uint64_t feed_session_epoch = 0U;
 };
 
 static_assert(std::is_trivially_copyable_v<CanonicalTick>);
 static_assert(std::is_trivially_copyable_v<CanonicalSnapshot>);
 static_assert(std::is_trivially_copyable_v<ChannelGap>);
-static_assert(std::is_trivially_copyable_v<LateRecoveryTick>);
+static_assert(std::is_trivially_copyable_v<TickDispatch>);
 static_assert(std::is_trivially_copyable_v<ChannelFault>);
 
 }  // namespace l2flow::ingest

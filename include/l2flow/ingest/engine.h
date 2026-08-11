@@ -17,6 +17,9 @@ class RawRecordTap;
 
 struct EngineConfig final {
     std::uint32_t trade_date = 0U;
+    // One engine instance owns exactly one externally allocated feed epoch.
+    // SequenceRecovery state is never shared across epochs.
+    std::uint64_t feed_session_epoch = 0U;
     StartMode start_mode = StartMode::kFromOpen;
     StreamMask enabled_streams = kDefaultAShareL2StreamMask;
 
@@ -30,11 +33,9 @@ struct EngineConfig final {
     std::size_t maximum_snapshot_body_bytes = 64U * 1024U;
     // Capacity is per producer-lane -> instrument-owner SPSC edge.
     std::size_t dispatch_queue_capacity = 1'024U;
-    // Gaps do not use a bounded event queue: they use one coalescing mailbox
-    // per native Channel plus a dirty bitmap. These capacities apply to the
-    // loss-sensitive fault and LateRecovery record queues, respectively.
+    // Gap telemetry uses one coalescing mailbox per native Channel plus a dirty
+    // bitmap. Correctness controls use the owner TickDispatch FIFOs.
     std::size_t diagnostic_queue_capacity = 4'096U;
-    std::size_t late_recovery_queue_capacity = 4'096U;
 
     std::size_t maximum_channels_per_tick_lane = 256U;
     std::size_t reorder_entries_per_channel = 4'096U;
@@ -74,8 +75,11 @@ struct EngineStats final {
     std::uint64_t catalog_misses = 0U;
     std::uint64_t dispatched_ticks = 0U;
     std::uint64_t dispatched_snapshots = 0U;
-    std::uint64_t duplicates_or_late = 0U;
-    std::uint64_t late_recovery_dispatched = 0U;
+    std::uint64_t rejected_late_facts = 0U;
+    std::uint64_t hole_fills_dispatched = 0U;
+    std::uint64_t source_channel_controls = 0U;
+    std::uint64_t owner_control_deliveries = 0U;
+    std::uint64_t expired_hole_sequences = 0U;
     std::uint64_t gaps_skipped = 0U;
     std::uint64_t from_open_channels_frozen = 0U;
     std::uint64_t channel_faults_dispatched = 0U;
@@ -104,23 +108,18 @@ public:
         std::span<const std::byte> body,
         std::uint64_t receive_monotonic_ns) noexcept;
 
-    // Each owner index is a single-consumer endpoint. Event/KLine workers in
-    // the next stage own these calls; this repository intentionally stops at
-    // the dispatch boundary.
-    [[nodiscard]] bool TryPollTick(
+    // Each owner index is a single-consumer endpoint. Production mdl_ingestd
+    // assigns one owner drain thread to these calls and forwards TickDispatch
+    // records to the Event/KLine runtimes.
+    [[nodiscard]] bool TryPollTickDispatch(
         std::size_t owner,
-        CanonicalTick* output) noexcept;
+        TickDispatch* output) noexcept;
     [[nodiscard]] bool TryPollSnapshot(
         std::size_t owner,
         CanonicalSnapshot* output) noexcept;
     // Gap and fault diagnostics each form one shared single-consumer
     // endpoint across all tick lanes.
     [[nodiscard]] bool TryPollGap(ChannelGap* output) noexcept;
-    // One shared single-consumer endpoint across all tick lanes. Records are
-    // canonical late/conflicting bodies; queue exhaustion is fatal rather
-    // than a silent loss.
-    [[nodiscard]] bool TryPollLateRecovery(
-        LateRecoveryTick* output) noexcept;
     [[nodiscard]] bool TryPollChannelFault(
         ChannelFault* output) noexcept;
 

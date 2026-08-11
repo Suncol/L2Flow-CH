@@ -19,9 +19,9 @@ The implemented boundary is:
 ```text
 MDL callback -> admission/decode -> RawCanonicalBatch -> ClickHouse writers
                                 |
-                                +-> recovery -> instrument-owner queues
-                                                |
-                                                +-> ArrowHotEgress -> mmap rings
+                                +-> SequenceRecovery -> owner TickDispatch FIFO
+                                                        |
+                                    ordered/hole fill -> ArrowHotEgress -> mmap
 ```
 
 `ArrowHotEgress` does not depend on `IngestEngine`; the daemon currently calls
@@ -35,15 +35,24 @@ ClickHouse retry does not block Arrow owner-drain publication.
 
 One producer run creates:
 
-- one ordered Tick ring per instrument owner;
+- one Tick ring per instrument owner containing both ordered and accepted
+  hole-fill rows;
 - one Snapshot ring per instrument owner;
-- one global LateRecovery Tick ring;
 - one global Control ring.
 
 Every individual ring is single-producer and multi-consumer. Tick and Snapshot
-rings preserve the FIFO order delivered to that owner. LateRecovery and Control
-preserve their own FIFO order. There is no exchange-provided or locally claimed
-global order across owners, rings, markets, channels, Tick, and Snapshot.
+rings preserve the FIFO order delivered to that owner; Control preserves its
+own FIFO order. There is no exchange-provided or locally claimed global order
+across owners, rings, markets, channels, Tick, Snapshot, and Control.
+
+`SequenceRecovery` emits five `TickDispatch` kinds on the owner FIFO. Arrow
+accepts only `kProjectOrdered` and `kProjectHoleFill`; rejected occurrence
+dispositions and owner correctness controls are consumed by Event/KLine but are
+not Arrow Tick rows. The Tick schema's `stream_role` distinguishes ordered from
+hole fill. For a hole fill, nullable `expected_sequence`, `admission_floor`,
+`generation`, `evict_before`, and `catalog_match` preserve the arrival-time
+classification token; those columns are null on an ordered row. Diagnostic
+`ChannelGap` and `ChannelFault` records still enter the global Control ring.
 
 `ingress_sequence` remains available for downstream correlation within one
 feed epoch. Descriptor `first_ingress_sequence` and
@@ -230,8 +239,6 @@ tick.0=tick-owner-0.arrow
 tick_control.0=tick-owner-0.ctl
 snapshot.0=snapshot-owner-0.arrow
 snapshot_control.0=snapshot-owner-0.ctl
-late_recovery=late-recovery.arrow
-late_recovery_control=late-recovery.ctl
 control=control.arrow
 control_control=control.ctl
 ```
@@ -257,7 +264,7 @@ data = aligned_header_schema + 128*D + S*align64(64 + P)
 ctl  = align4096(4096 + 64*C) + 64*S
 ```
 
-The complete run has `2*owner_count + 2` rings. Tick/Snapshot and diagnostic
+The complete run has `2*owner_count + 1` rings. Tick/Snapshot and diagnostic
 rings can use different `P`. Creation uses `ftruncate` followed by
 `posix_fallocate`, so insufficient backing space fails at startup instead of
 surfacing as a first-write `SIGBUS` in the hot path. Mapped pages can still
@@ -343,7 +350,7 @@ pipeline.
 The pass threshold for scheduled producer, owner/Arrow append, and Arrow
 reader throughput is at least 99% of the requested rate. A pass also requires
 exact admitted, dispatched, published, and read row counts; correct affinity;
-and zero lane-full, dispatch-overflow, gap, late-recovery, channel-fault,
+and zero lane-full, dispatch-overflow, gap, hole-fill/rejection, channel-fault,
 ordering, clock, protocol, oversized, pinned-segment, and Control-drop counts.
 The output contains two distinct latency distributions:
 

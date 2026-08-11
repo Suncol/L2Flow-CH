@@ -17,7 +17,15 @@ struct EventClickHouseConfig final {
     std::string password;
     std::string no_proxy = "*";
 
-    std::size_t insert_chunk_rows = 16'384U;
+    // One physical RowBinary request is bounded independently from the
+    // logical Event recovery batches that it carries. A logical batch larger
+    // than either request bound is split across multiple immutable requests.
+    std::size_t insert_request_max_rows = 1'024U;
+    std::size_t insert_request_max_bytes = 1U * 1'024U * 1'024U;
+    // A writer lane combines only a consecutive FIFO prefix. The delay is
+    // measured from the oldest queued logical batch and is bypassed on stop.
+    std::size_t physical_group_max_batches = 256U;
+    std::uint64_t physical_group_max_delay_ns = 1'000'000U;
     // Number of independent, ordered Event INSERT lanes.  The supported
     // production values are 1, 2, 4, and 8.  A batch is routed by its
     // logical Event owner, so all revisions for one owner stay FIFO on one
@@ -44,17 +52,34 @@ struct EventClickHouseConfig final {
     std::string* error) noexcept;
 
 struct EventClickHouseStats final {
+    std::uint64_t submission_groups_queued = 0U;
+    std::uint64_t submission_groups_released = 0U;
     std::uint64_t revision_batches_queued = 0U;
     std::uint64_t revision_batches_acked = 0U;
     std::uint64_t revision_batches_released = 0U;
     std::uint64_t revision_rows_queued = 0U;
     std::uint64_t revision_rows_acked = 0U;
-    std::uint64_t revision_chunks_acked = 0U;
+    std::uint64_t physical_groups_committed = 0U;
+    std::uint64_t revision_insert_requests_acked = 0U;
+    std::uint64_t marker_insert_requests_acked = 0U;
     std::uint64_t recovery_runs_committed = 0U;
     std::uint64_t retry_attempts = 0U;
     std::uint64_t unknown_outcomes = 0U;
     std::uint64_t bytes_sent = 0U;
+    std::uint64_t physical_group_batches_max = 0U;
+    std::uint64_t physical_group_rows_max = 0U;
+    std::uint64_t revision_request_rows_max = 0U;
+    std::uint64_t revision_request_bytes_max = 0U;
+    std::uint64_t revision_insert_latency_ns_total = 0U;
+    std::uint64_t revision_insert_latency_ns_max = 0U;
+    std::uint64_t marker_insert_latency_ns_total = 0U;
+    std::uint64_t marker_insert_latency_ns_max = 0U;
+    std::uint64_t queued_revision_batches = 0U;
     std::uint64_t queued_revision_rows = 0U;
+    std::uint64_t queued_submission_groups = 0U;
+    std::uint64_t queued_revision_batches_high_water = 0U;
+    std::uint64_t queued_revision_rows_high_water = 0U;
+    std::uint64_t queued_submission_groups_high_water = 0U;
 };
 
 class EventClickHouseSink final : public event::EventRevisionSink {
@@ -70,8 +95,8 @@ public:
     [[nodiscard]] bool Start(std::string* error);
     [[nodiscard]] bool Stop(std::string* error) noexcept;
 
-    [[nodiscard]] bool AppendRevisionBatch(
-        std::shared_ptr<const event::EventRevisionBatch> batch)
+    [[nodiscard]] bool AppendRevisionGroup(
+        std::vector<std::shared_ptr<const event::EventRevisionBatch>> batches)
         noexcept override;
 
     [[nodiscard]] bool healthy() const noexcept;

@@ -140,7 +140,7 @@ void AppendAnchor(HashInput* hash, const TradeAnchor& anchor) {
     AppendAnchor(&hash, payload.first_trade);
     AppendAnchor(&hash, payload.last_trade);
     hash.Append(payload.source_quality_flags);
-    hash.Append(payload.has_late_recovery);
+    hash.Append(payload.has_hole_fill);
     hash.Append(payload.provisional);
     return hash.Finish();
 }
@@ -220,6 +220,25 @@ void AppendAnchor(HashInput* hash, const TradeAnchor& anchor) {
     // The canonical decoder intentionally permits Shenzhen ChannelNo == 0.
     return tick.common.kind == CanonicalKind::kShenzhenOrder ||
            tick.common.kind == CanonicalKind::kShenzhenTransaction;
+}
+
+[[nodiscard]] bool AdmissionValid(const KLineWorkerConfig& config,
+                                  const KLineInput& input) noexcept {
+    const KLineAdmissionToken& token = input.admission;
+    const std::uint64_t sequence = input.tick.common.native_sequence;
+    if (token.feed_session_epoch != config.feed_session_epoch ||
+        token.expected_sequence == 0U || token.admission_floor == 0U ||
+        token.retention_floor == 0U || token.dispatch_fence == 0U ||
+        token.admission_floor > token.expected_sequence ||
+        sequence == std::numeric_limits<std::uint64_t>::max()) {
+        return false;
+    }
+    if (token.sequence_class == KLineSequenceClass::kOrdered) {
+        return sequence >= token.expected_sequence;
+    }
+    return token.sequence_class == KLineSequenceClass::kHoleFill &&
+           sequence >= token.admission_floor &&
+           sequence < token.expected_sequence;
 }
 
 [[nodiscard]] bool ExchangeTimeValidForKLine(
@@ -330,7 +349,7 @@ public:
         CanonicalTick tick{};
         Identifier128 contribution_hash{};
         bool projected_trade = false;
-        bool late = false;
+        bool hole_fill = false;
     };
 
     struct BarState final {
@@ -392,15 +411,13 @@ public:
                                                    std::memory_order_relaxed);
                     continue;
                 }
+                if (!AdmissionValid(config_, input)) {
+                    return Failure(&result,
+                                   "KLine admission token is invalid");
+                }
                 dependencies.insert(RawTickDependency{
                     input.tick.common.ingress_sequence,
                     input.tick.common.kind});
-                if (input.upstream_conflict) {
-                    saw_conflict = true;
-                    stats_.source_conflicts.fetch_add(
-                        1U, std::memory_order_relaxed);
-                    continue;
-                }
                 admission_ticks.push_back(input.tick);
                 admission_inputs.push_back(&input);
             }
@@ -445,7 +462,9 @@ public:
                     input.tick.common.channel,
                     input.tick.common.native_sequence};
                 record.tick = admission_winners[index];
-                record.late = input.late_recovery;
+                record.hole_fill =
+                    input.admission.sequence_class ==
+                    KLineSequenceClass::kHoleFill;
                 record.projected_trade = TradeProjectionValid(record.tick);
                 if (record.projected_trade) {
                     record.contribution_hash = HashContribution(record.tick);
@@ -476,7 +495,8 @@ public:
                 ++result.trades_inserted;
                 stats_.trades_projected.fetch_add(
                     1U, std::memory_order_relaxed);
-                batch_has_late_trade = batch_has_late_trade || record.late;
+                batch_has_late_trade =
+                    batch_has_late_trade || record.hole_fill;
                 for (const std::uint32_t interval : config_.interval_seconds) {
                     const std::uint64_t duration =
                         static_cast<std::uint64_t>(interval) *
@@ -529,7 +549,7 @@ public:
                 revision_batch->owner = config_.owner;
                 revision_batch->batch_sequence = sequence;
                 revision_batch->reason = batch_has_late_trade
-                    ? RevisionReason::kLateRecovery
+                    ? RevisionReason::kHoleFill
                     : RevisionReason::kLiveProjection;
 
                 for (const auto& [bar_key, state] : bar_patch) {
@@ -799,8 +819,7 @@ private:
             }
         }
         payload.source_quality_flags |= tick.common.quality_flags;
-        payload.has_late_recovery =
-            payload.has_late_recovery || record.late;
+        payload.has_hole_fill = payload.has_hole_fill || record.hole_fill;
         for (std::size_t index = 0U; index < state->contribution_xor.size();
              ++index) {
             state->contribution_xor[index] ^=
@@ -877,7 +896,8 @@ bool ValidateKLineWorkerConfig(const KLineWorkerConfig& config,
     };
     if (!ValidTradeDate(config.trade_date) || config.owner_count == 0U ||
         config.owner >= config.owner_count || config.revision_epoch == 0U ||
-        config.logic_version == 0U || IsZero(config.calculation_run_id) ||
+        config.logic_version == 0U || config.feed_session_epoch == 0U ||
+        IsZero(config.calculation_run_id) ||
         config.interval_seconds.empty() ||
         config.maximum_bars == 0U || config.maximum_pending_commits == 0U ||
         config.maximum_acknowledged_raw_dependencies == 0U) {

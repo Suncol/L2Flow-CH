@@ -23,16 +23,17 @@ decode-complete canonical facts before recovery and persists them in
 also contains the optional owner-local Event projection and ClickHouse
 revision sink described in
 [`event-worker-clickhouse.md`](event-worker-clickhouse.md). Event calculation
-consumes ordered and `LateRecovery` ticks, while publication is gated by the
-corresponding raw ACKs. The optional KLine plane in
+consumes projectable facts and channel controls from the unified `TickDispatch`
+FIFO. The optional KLine plane in
 [`kline-worker-clickhouse.md`](kline-worker-clickhouse.md) consumes the same
-two Tick branches, uses SDK body exchange time for integer-second windows, and
-has an independent revision sink behind the same raw ACK boundary. The
-Event and KLine planes share the local disk-backed process-lifetime
-FactJournal described in [`fact-journal.md`](fact-journal.md). That file is not
-a durable restart/replay boundary. The repository does not contain CSV/WAL
-replay, checkpoint restore, reconnect
-epoch inference, cold derived-state bootstrap, or intraday restart
+stream and uses SDK body exchange time for integer-second windows. Both
+runtimes settle rejected occurrences in a bounded raw-ACK/disposition join;
+only projectable first-wins facts enter their workers, and publication remains
+gated by corresponding raw ACKs. Event and KLine share the local disk-backed
+process-lifetime FactJournal described in
+[`fact-journal.md`](fact-journal.md). That file is not a durable restart/replay
+boundary. The repository does not contain CSV/WAL replay, checkpoint restore,
+reconnect epoch inference, cold derived-state bootstrap, or intraday restart
 reconciliation. Startup is exactly one of:
 
 - `from-open`: the process claims coverage beginning at native sequence 1;
@@ -112,8 +113,9 @@ is likewise not claimed.
   waits both default to 500 microseconds but remain separately configurable.
   These values are tuning defaults, not protocol constants or statements
   about upstream backfill latency.
-- Instrument/fault/LateRecovery dispatch overload, admission-lane exhaustion,
-  and raw ClickHouse batch-pool exhaustion are fatal continuity boundaries.
+- TickDispatch/fault overload, admission-lane exhaustion, raw ClickHouse
+  batch-pool exhaustion, and any derived ACK-join exhaustion are fatal
+  continuity boundaries.
   The process never silently drops a record to remain live. A raw row already
   acknowledged by ClickHouse can support later reconciliation, but it does not
   make an overloaded live process safe to continue. Gap notification is the
@@ -225,43 +227,42 @@ Each newly observed channel begins with `expected = 1`.
   records;
 - future sequence: retain it during `from_open_gap_wait_ns`, allowing an
   out-of-order network/upstream backfill to close the gap normally;
-- canonical duplicate while pending: keep the first and count the duplicate;
-- conflicting canonical projection at the same pending native position:
-  freeze only that channel and emit `ChannelFault`;
+- any later occurrence at an already pending native position: reject it without
+  payload comparison; the first canonical body remains authoritative;
 - gap-wait expiry, reorder-span breach, or a full-table slot collision: record
-  `ChannelGap`, advance to the smallest retained position, drain in order, and
-  retry the current record without freezing or discarding retained bodies;
-- a later record below the advanced frontier: publish its canonical body to
-  `LateRecovery`, never insert it backward into the realtime stream;
+  an exact open-hole interval, emit `GapOpen`, advance to the smallest retained
+  position, drain in order, and retry the current record without discarding the
+  current or retained body;
+- a later record below the advanced frontier: accept it only when it is still
+  inside the online window and atomically claims a position in the exact hole
+  ledger; otherwise emit a rejected-occurrence disposition;
 - a full-decode failure with a valid native descriptor: freeze only that
   channel and emit a decode fault.
 
 Other channels and snapshot lanes continue. FROM_OPEN history is complete
 until the first committed gap; after that gap, all subsequent realtime records
-for that Channel carry incomplete-history quality. Because this stage does not
-retain unbounded committed payload history, `LateRecovery` identifies a body
-as behind the frontier but cannot by itself prove whether it is a recovered
-gap member or a retransmission.
+for that channel carry incomplete-history quality. Closing or expiring every
+currently repairable hole does not restore the historical completeness claim.
 
 ### PARTIAL
 
-PARTIAL uses the same bounded gap advance and LateRecovery behavior, but its
-starting claim is different: it never claims the unobserved opening prefix.
+PARTIAL uses the same bounded gap advance, exact hole admission, and
+first-wins behavior, but its starting claim is different: it never claims the
+unobserved opening prefix.
 
 1. During the configurable initial hold it retains arrivals and selects the
    smallest observed native sequence as the process-start origin.
 2. Later future records wait in the bounded reorder table.
 3. When `partial_gap_wait_ns` expires, a record exceeds the bounded span, or
    a modulo slot collides because the reorder table is full, the lane records
-   `ChannelGap`, advances to the smallest present sequence, drains retained
-   records in native order, and iteratively retries the current record.
+   an exact missing interval, emits `GapOpen`, advances to the smallest present
+   sequence, drains retained records in native order, and iteratively retries
+   the current record.
 4. A later record below the advanced frontier is not inserted backward into
-   the realtime stream. Its full canonical tick is published to the bounded
-   `LateRecovery` branch with the committed frontier and observed gap epoch.
-   Such a body can be a recovered gap member or a retransmission; downstream
-   durable reconciliation must decide which.
-5. A conflicting pending record deterministically keeps the first projection,
-   diverts the conflicting canonical body to `LateRecovery`, and continues.
+   the ordered stream. It is either an accepted exact hole fill or a rejected
+   occurrence, decided once at SequenceRecovery arrival.
+5. A later record at a pending or already claimed native position is rejected;
+   payload equality/conflict does not alter first-wins.
 
 The capacity rule below is identical after either mode has an active frontier.
 For example, with `expected=4` and retained `5,6,7,8`, arrival of `9` at a full
@@ -277,22 +278,33 @@ retry 9 and emit it
 All realtime records from a PARTIAL channel have
 `kTickChannelHistoryValid` cleared; after a committed gap they also retain
 the channel's incomplete-history quality. Missing native positions do not
-allocate one placeholder apiece.
+allocate one payload placeholder apiece. They are stored as a preallocated,
+sorted set of disjoint inclusive intervals bounded by
+`reorder_entries_per_channel`; a split that would exhaust interval capacity
+fails the engine closed.
 
 No fake event is synthesized for a missing native position because its
 instrument and message kind are unknowable. Instead, the first subsequently
 dispatched target record carries `gap_before_first/last`, `gap_epoch`, and
 `kQualitySequenceGapBefore`.
 
-Gap control delivery cannot overflow a queue. Every observed Channel owns one
-fixed mailbox, and decoder lanes set its dirty bit after publishing the latest
-exact `GapRange`. The mailbox also carries cumulative `gap_epoch` and
+Diagnostic gap telemetry cannot overflow an event queue. Every observed Channel
+owns one fixed mailbox, and decoder lanes set its dirty bit after publishing the
+latest exact `GapRange`. The mailbox also carries cumulative `gap_epoch` and
 `cumulative_missing_sequences`. If a consumer is slow, multiple notifications
 for the same Channel coalesce: the latest range remains exact and an epoch jump
 reports that older notifications were coalesced. Recovering every older range
 then requires the canonical record metadata and/or the separate raw durable
 path; the mailbox never fabricates an enclosing range that could label present
 sequences as missing.
+
+That coalescing mailbox is diagnostic. Correctness controls use `GapOpen` and
+`ChannelSeal` records broadcast into every affected decoder-lane-to-owner SPSC
+FIFO. `GapOpen` is published before the first drained fact beyond the committed
+gap. A `ChannelSeal` is published when the retention frontier advances after a
+hole fill or expiration. Both carry a generation and a per-edge
+`dispatch_fence`; downstream owners consume them in FIFO order with projectable
+and rejected occurrences.
 
 PARTIAL clears `kTickChannelHistoryValid` from the first emitted record, not
 only after the first observed gap, because the pre-start channel prefix is
@@ -303,12 +315,49 @@ retain their independent validity. A resource failure (allocation,
 loss-sensitive output queue exhaustion, or invalid channel identity) is not
 reclassified as a historical gap and can still fail the process.
 
-`LateRecovery` is deliberately loss-sensitive and bounded. Queue exhaustion
-fails the engine rather than silently discarding the canonical body. If that
-body is lost during a crash before its raw batch receives a ClickHouse ACK,
-later historical repair may still be impossible: the raw queue is volatile
-and there is no local WAL. Once the corresponding raw occurrence is ACKed,
-reconciliation can query it from `raw_tick`.
+### Exact admission and first-wins
+
+For an active channel define:
+
+```text
+E = expected, the next native sequence SequenceRecovery wants
+W = maximum_reorder_span
+A = max(process_origin, E - W)
+R = first position in the earliest open-hole interval, or E when none exists
+```
+
+`mdl_ingestd` exposes `W` as `--maximum-reorder-span`. The independent
+`--reorder-entries-per-channel` value is the preallocated pending-record and
+hole-interval capacity; it must be a power of two and at least `W`. Neither
+capacity grows when repair or eviction falls behind.
+
+Classification uses `E` and `A` at the occurrence's first arrival:
+
+```text
+sequence >= E     -> ordered/reorder path
+A <= sequence < E -> PROJECT_HOLE_FILL only if the exact position is OPEN
+sequence < A      -> REJECT_LATE_FACT
+```
+
+`sequence == A` is eligible only for an open hole. A sequence in `[A,E)` that
+is not open is also rejected. A successful hole claim removes exactly that
+position before dispatch, so a second arrival cannot claim it. Every occurrence
+carries its captured `E/A` and generation. Projectable occurrences additionally
+carry the current `R` as `evict_before`, and `ChannelSeal` carries a newly
+advanced `R`; none is recomputed after owner-queue delay.
+
+Strict first-wins applies to `(trade_date, market, channel,
+feed_session_epoch, native_sequence)`. The first body wins whether later bodies
+are byte-identical or conflicting; every later body is rejected without
+replacement. The raw tap still captured each decoded occurrence before this
+decision. For catalog-resolved ticks, `REJECT_LATE_FACT` is therefore required
+to settle the raw ACK without admitting the body to Event, KLine, or the
+FactJournal.
+
+Open holes older than `A` expire and can never reopen. `E` may jump across a
+gap, so `E-1` is not necessarily a complete prefix. `A` is the admission close
+frontier, while `R` is the repair retention frontier. With no hole `R=E`; with
+holes it pins only the suffix beginning at the earliest still-open position.
 
 ## 6. Instrument dispatch
 
@@ -318,16 +367,54 @@ consumer, avoiding an MPSC compare-and-swap hotspot. Owner assignment is
 `instrument_ordinal % W` and is stable for the frozen daily catalog.
 
 Ticks and snapshots use separate matrices so the much larger snapshot record
-does not inflate every tick slot. Channel faults and canonical LateRecovery
-bodies each use one SPSC queue per tick lane and one fair single-consumer
-endpoint. Gap state uses the fixed per-lane/per-Channel mailbox and dirty
-bitmap described above.
+does not inflate every tick slot. Every Tick edge carries one fixed-width
+`TickDispatch` representation:
+
+```text
+kProjectOrdered
+kProjectHoleFill
+kRejectLateFact
+kGapOpen
+kChannelSeal
+```
+
+Catalog-resolved projectable and rejected occurrences go only to their
+instrument owner.
+`GapOpen` and `ChannelSeal` are broadcast to all owners because a missing
+position's instrument is unknowable. Before broadcasting a control, the lane
+checks capacity on every destination edge; partial broadcast is not permitted.
+Each published record receives the next producer-edge `dispatch_fence`, so one
+owner can validate FIFO progress without treating an owner-local sparse channel
+subsequence as a completeness proof. Channel faults retain the separate
+diagnostic endpoint. Gap telemetry uses the fixed per-lane/per-channel mailbox
+and dirty bitmap described above.
 
 The executable gives each owner endpoint to exactly one drain thread. That
 thread also owns the corresponding Event and KLine workers when those outputs
-are enabled. It polls one Tick and fans out copies; it never assigns a second
-consumer to the owner endpoint. Calling one owner endpoint from multiple
+are enabled. It polls `TryPollTickDispatch(owner, ...)` and forwards each record
+to both enabled runtimes; only projectable kinds enter Arrow. It never assigns a
+second consumer to the owner endpoint. Calling one owner endpoint from multiple
 consumers violates the SPSC contract.
+
+### Raw ACK/disposition join
+
+The raw tap captures a decoded occurrence before SequenceRecovery, so raw ACK
+and final disposition can arrive in either order. Event and KLine each maintain
+an owner-local bounded join keyed by:
+
+```text
+(feed_session_epoch, ingress_sequence, canonical_kind)
+```
+
+Projectable disposition plus ACK forwards the durability dependency to that
+worker's pending revision FIFO. Rejected disposition plus ACK deletes the join
+slot immediately and never enters the FactJournal, repair, bar projection, or
+derived sink. A duplicate ACK/disposition side is a sticky failure while the
+key still has an unmatched live join slot; inbox overflow and join capacity
+exhaustion are also fail-closed. Resolved slots are reclaimed immediately, so
+the join does not keep an unbounded post-resolution duplicate history. The raw
+callback-once and SequenceRecovery occurrence-once rules are producer
+contracts.
 
 ## 7. 64-core / 1-TiB deployment starting point
 
@@ -338,7 +425,7 @@ The defaults are a starting point, not a measured production guarantee:
 - 16 instrument owners;
 - one SDK I/O thread and serialized callback admission;
 - bounded per-edge dispatch queues and lazily allocated per-observed-channel
-  reorder slabs.
+  reorder arrays.
 
 On a 64-core host, reserve cores for the OS/IRQs, the vendor SDK, ClickHouse
 writer threads, and Event/KLine owner work. Pin decoder lanes only after
@@ -371,29 +458,51 @@ The principal memory terms are:
 ```text
 tick admission      = tick_lanes * tick_slots * max_tick_body
 snapshot admission  = snapshot_lanes * snapshot_slots * max_snapshot_body
-tick dispatch       = tick_lanes * owners * edge_capacity * sizeof(tick)
+tick dispatch       = tick_lanes * owners * edge_capacity * sizeof(TickDispatch)
 snapshot dispatch   = snapshot_lanes * owners * edge_capacity * sizeof(snapshot)
 reorder             = observed_channels * reorder_entries * sizeof(pending tick)
-late recovery       = tick_lanes * late_capacity * sizeof(late canonical tick)
+hole ledger         = observed_channels * reorder_entries * sizeof(hole interval)
 gap state           = tick_lanes * max_channels * sizeof(gap mailbox slot)
-Event facts/uses    = accepted intraday facts plus up to two order roles each
-Event bundles       = current Event rows retained by owner-local BundleCache
+Event hot suffix    = sum_channels(E-R) + accepted inflight + eviction lag
+Event carry orders  = full baselines + retained order-use suffixes
+Event staging       = repair + END + pending revisions + ACK joins
+KLine               = bars + heads + pending revisions + ACK joins
+FactJournal         = process-lifetime file + directory + hot cache
 ```
 
-A 1-TiB deployment has ample capacity, but oversized queues increase cold-page,
-TLB, and cache cost. Increase them only from burst and latency measurements.
+Event enforces independent hard caps for hot fact count/estimated bytes, carry
+order count, conservative order-history bytes, repair bytes, Shanghai END
+candidates/rows/staging bytes, pending revision bytes, and ACK join entries. Its
+eviction is node/estimated-byte sliced and compacts order histories to a full
+private-state baseline before erasing closed fact/Bundle/head/phase/barrier
+state. In no-gap traffic `R=E`, so the logical Event fact suffix normally
+approaches zero instead of retaining a fixed full window.
+
+This is logical compaction, not a process RSS guarantee. The carry-order table
+uses a fixed directory with lazily allocated bucket-head pages, and its two
+range indexes use exactly accounted arrays. Fact/Bundle/head indexes remain
+standard node containers; erasing entries need not shrink their hash buckets
+or make the allocator return pages to the OS. No per-channel hot-fact
+`ChannelPage`/slab allocator or `madvise`/`unmap` reclaim path is implemented.
+KLine bar state and the shared FactJournal file/directory have independent
+lifetimes and are not reclaimed by Event seals. A 1-TiB deployment can
+accommodate large configured caps, but oversized queues and maps increase
+cold-page, TLB, allocator, and cache cost. Increase them only from burst,
+repair, and latency measurements.
 
 ## 8. Lifecycle and failure boundaries
 
-Startup order is catalog/stream config -> raw/Event object preallocation ->
-Event ClickHouse schema validation and writer thread when enabled -> raw
-ClickHouse schema validation and writer threads -> engine preallocation ->
-decoder threads -> SDK manager/subscriber -> connect. `Connect()` may invoke
-callbacks synchronously, so the sinks, Event runtime, and engine are running
-before it is called. The physical session is returned only after successful
-Logon plus confirmation of every configured subscription. Market data is
-admitted only after that readiness state. The readiness timeout defaults to
-30 seconds and is configurable with `--sdk-ready-timeout-seconds`.
+Startup order is catalog/stream config -> FactJournal and Event/KLine/raw
+sink/runtime object preallocation -> engine preallocation -> optional Arrow
+egress creation -> Event/KLine ClickHouse schema validation and writer startup
+-> raw ClickHouse schema validation and writer startup -> decoder threads ->
+owner drain threads -> SDK manager/subscriber -> connect. `Connect()` may invoke
+callbacks synchronously, so the sinks, Event/KLine runtimes, engine, and owner
+drains are running before it is called. The physical session is returned only
+after successful Logon plus confirmation of every configured subscription.
+Market data is admitted only after that readiness state. The readiness timeout
+defaults to 30 seconds and is configurable with
+`--sdk-ready-timeout-seconds`.
 
 The first connection/discard/readiness boundary is sticky. The handler stops
 admission immediately, so SDK auto-reconnect callbacks cannot enter the old
@@ -408,14 +517,23 @@ Shutdown order is fixed:
 2. call `IOManager::Shutdown()` as the callback-quiescence boundary;
 3. release Subscriber, then IOManager;
 4. drain and join decoder lanes, flushing partial raw batches;
-5. drain instrument/fault/LateRecovery queues and final dirty gap state;
-6. flush every final partial Event and KLine micro-batch;
-7. wait for every ClickHouse raw batch ACK and stop raw writer threads, which
-   fans final ACK callbacks out to both enabled derived runtimes;
-8. finish private Event repair, drain both raw-ACK gates, submit all now-durable
+5. keep every owner thread servicing its `TickDispatch` FIFO, Event/KLine
+   background work, and raw-ACK inbox while the ClickHouse raw writers flush;
+6. wait for every ClickHouse raw batch ACK and stop/join the raw writer
+   threads, which closes the only remaining ACK producer side;
+7. only then signal the owner consumers to observe empty engine FIFOs, drain
+   the final ACK inbox entries, collect fault/final dirty gap diagnostics, and
+   exit; flush every final partial Event and KLine micro-batch after they join;
+8. finish private Event repair/eviction, drain both ACK/disposition joins and
+   worker raw-ACK gates, flush the shared FactJournal, submit all now-durable
    revision batches, and stop the Event/KLine writers after their independent
    recovery markers are ACKed;
 9. seal the optional Arrow hot path and destroy the engine/handler.
+
+Stopping owner consumers before step 6 is invalid: raw `Stop()` can still
+drain more queued rows than one owner ACK inbox can hold. Keeping the consumers
+alive makes shutdown use the same bounded join path as steady state instead of
+turning a legal slow-sink backlog into an artificial capacity failure.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
 to reach zero before releasing Subscriber and IOManager. If vendor shutdown
@@ -427,47 +545,39 @@ intentionally retained for process lifetime.
 
 Automated tests cover all five fixed layouts, SH/SZ normalization, joint
 6.33/6.36 ordering, equal default gap waits, FROM_OPEN in-window backfill,
-timeout/capacity gap advance and conflict isolation, PARTIAL gap advance,
-reorder-capacity no-loss progression, LateRecovery diversion, coalescing gap
-mailbox behavior, catalog-miss continuity tokens, nested snapshot lists,
-overlapping dynamic range rejection, configured stream exclusion, and runtime
-tuple handling. Wire-level control tests additionally cover Logon/Subscribe
-readiness accumulation, nonzero return/status rejection, malformed and
-overlapping list rejection, API timeout/discard classification, sticky first
-boundary behavior, PARTIAL pre-ready discard, FROM_OPEN pre-ready rejection,
-and readiness timeout.
+timeout/capacity gap advance, strict pending first-wins, exact admission-floor
+accept/reject boundaries, PARTIAL gap advance, reorder-capacity no-loss
+progression, exact hole claim/expiration, owner FIFO `GapOpen`/`ChannelSeal`
+fences, coalescing diagnostic gap mailbox behavior, catalog-miss continuity
+tokens, nested snapshot lists, overlapping dynamic range rejection, configured
+stream exclusion, and runtime tuple handling. Wire-level control tests
+additionally cover Logon/Subscribe readiness accumulation, nonzero
+return/status rejection, malformed and overlapping list rejection, API
+timeout/discard classification, sticky first boundary behavior, PARTIAL
+pre-ready discard, FROM_OPEN pre-ready rejection, and readiness timeout.
 Raw-path tests additionally prove pre-recovery capture of retransmissions and
 catalog misses, fail-closed tap behavior, fixed BLAKE3 provenance vectors,
 preallocation accounting, ArrowStream-to-ClickHouse mapping, nested Snapshot
 levels, Date partitioning, occurrence uniqueness, and explicit replay order.
-Event tests cover journal-first same-batch ordering, cross-batch late Add
-repair, unknown-reference removal, raw-ACK FIFO gating, Shanghai END additions
-and tombstones, phase-status scope, private budgeted repair, per-order
-generation restart, disjoint live publication during repair, multi-owner
-routing, final partial-batch drain, immutable retry bodies, current-table
-replacement/tombstones, recovery markers, and startup rejection of a mismatched
-external schema. KLine tests cover SDK exchange-time windowing despite opposing
-local receive order, invalid-time no-fallback behavior, deterministic OHLC,
-multiple intervals, duplicate/conflict handling, raw ACK-before-fact, late
-historical revision, runtime routing, immutable sink retries, owner-affine
-writer lanes, current-table replacement, and schema validation.
+Event tests cover journal-first same-batch ordering, cross-batch hole-filled Add
+repair, unknown-reference removal, order-baseline/phase-anchor
+compaction, no-gap fact eviction, raw ACK-before/after project and reject joins,
+Shanghai END additions/tombstones and sliced capacity limits, private budgeted
+repair, per-order generation restart, disjoint live publication during repair,
+multi-owner routing, final partial-batch drain, immutable retry bodies,
+current-table replacement/tombstones, recovery markers, and startup rejection
+of a mismatched external schema. KLine tests cover SDK exchange-time windowing
+despite opposing local receive order, invalid-time no-fallback behavior,
+deterministic OHLC, multiple intervals, defensive duplicate/conflict checks,
+ACK-before/after disposition joins, hole-fill historical revision, runtime
+routing, immutable sink retries, owner-affine writer lanes, current-table
+replacement, and schema validation.
 
-The implementation passes the strict warning build and the C++ ASan/UBSan
-suite in the available environment. The external Python process in the
-cross-language Arrow test cannot load an ASan-instrumented shared object
-without preloading the ASan runtime, so it is excluded from that sanitizer
-run. TSan requires `setarch x86_64 -R` in this container; with that address
-layout, the Event worker, Event sink retry fixture, and raw sink/ACK listener
-fixture pass. TSan also found and drove the removal of a race in the local HTTP
-test fixture's listener-fd teardown.
-
-The NUMA-pinned synthetic callback benchmark sustained 800k, 1.0M, and 1.2M
-messages/s for five minutes in both ordered and locally reversed test cases,
-subject to the exact test policy and limitations in
-[numa-stress-report.md](numa-stress-report.md). This is evidence for the
-implemented in-process pipeline, not for the physical vendor SDK, network,
-every configured tuple, or a 1-TiB production host. Production acceptance
-still requires:
+Sanitizer, NUMA, and end-to-end throughput qualification must be rerun against
+the replacement dispatch/retention implementation. The 2026-08-06 numbers in
+[numa-stress-report.md](numa-stress-report.md) preserve evidence for the
+superseded independent-recovery-queue architecture only; they are not evidence
+for this implementation. Production acceptance still requires:
 
 - real MDL SDK connection and shutdown tests;
 - captured five-tuple replay, including jointly interleaved SZ 6.33/6.36;
@@ -476,6 +586,9 @@ still requires:
   unchanged 500-microsecond default gap policy;
 - fault injection for malformed bodies, lane saturation, slow owners, SDK
   disconnects, and process termination;
+- allocator-aware Event pages/slabs if an OS-visible RSS plateau is required;
+- coordinated Event/KLine close frontiers and FactJournal directory/file
+  reclamation;
 - cold Event/KLine bootstrap and reconciliation, explicit derived-state session
   Finalize, and durable external allocation of revision epochs and calculation
   run IDs.

@@ -8,28 +8,46 @@ MDL SDK callback
   -> channel/instrument-sharded decoder lanes
   -> decode-complete raw tap -> preallocated canonical batches
        -> ClickHouse writer threads -> raw_tick/raw_snapshot MergeTree
-  -> exchange-native channel sequence recovery
-  -> fixed-width canonical records
-  -> instrument-owner dispatch queues + gap/LateRecovery controls
-       -> owner-local Event journal and minimal-closure projection
-       -> raw ACK gate -> Event revision log/current ClickHouse tables
-       -> owner-local exchange-time KLine projection
-       -> raw ACK gate -> KLine revision log/current ClickHouse tables
-  -> per-owner shared-memory Arrow rings + Python/Polars reader
+  -> first-wins channel sequence recovery + exact hole ledger
+  -> per-owner FIFO of fixed-width TickDispatch records
+       -> ordered/hole-fill projection or rejected-occurrence settlement
+       -> GapOpen/ChannelSeal owner fences
+       -> bounded raw-ACK/disposition join
+            -> gap-driven Event retention + order baseline compaction
+            -> Event revision log/current ClickHouse tables
+            -> owner-local exchange-time KLine projection
+            -> KLine revision log/current ClickHouse tables
+       -> projectable ticks in per-owner Arrow rings
+  -> snapshot owner queues -> per-owner Arrow snapshot rings
 ```
 
 `raw_tick` and `raw_snapshot` are the first durable ClickHouse boundary in this
 repository. The raw tap runs after complete decode/normalization and before
 SequenceRecovery, duplicate/conflict handling, and catalog-miss suppression.
 The shared-memory Arrow branch remains an independent bounded volatile hot
-path. The optional Event runtime consumes the ordered and `LateRecovery`
-branches, journals each micro-batch before projection, and publishes immutable
-revision batches only after the corresponding `raw_tick` occurrences are
-acknowledged. The optional KLine runtime uses only SDK body exchange time for
-window identity and OHLC ordering, revises historical bars from
-`LateRecovery`, and uses the same raw-ACK publication gate. Cold derived-state
-bootstrap and historical restart reconciliation remain outside this
-milestone. The supported startup modes are `from-open` and `partial`.
+path. `SequenceRecovery` classifies every catalog-resolved occurrence exactly
+once as ordered, an accepted hole fill, or rejected. It sends that disposition
+and `GapOpen`/`ChannelSeal` controls through the same decoder-lane-to-owner FIFO;
+there is no second recovery queue. The Event and KLine runtimes join each
+disposition with its independently arriving `raw_tick` ACK. Event applies the
+gap/seal controls as retention fences; KLine validates the controls but does
+not reclaim bar state from them. Rejected occurrences settle in the bounded
+joins and never enter either worker or the FactJournal. Projectable occurrences
+may be calculated before raw durability, but immutable revision batches cannot
+enter a derived sink until their raw dependencies are acknowledged.
+
+Event retains only the suffix required by open holes, compacts closed order
+uses into full private-state baselines, and processes repair, Shanghai END
+candidate attachment, and eviction in bounded slices. Final Bundle diff and
+`CommitProjection` remain one-shot. Carry orders and the channel, instrument,
+phase, and barrier outer indexes use fixed-directory lazy-paged hash tables;
+order range indexes use exactly accounted arrays. Fact, Bundle, and head maps
+remain standard C++ node containers. There is no per-channel hot-fact
+page/slab allocator or `madvise`/`unmap` path, so logical release does not
+guarantee that the allocator returns capacity to the OS. KLine bars and the
+shared FactJournal have independent lifetime/capacity contracts. Cold
+derived-state bootstrap and historical restart reconciliation remain outside
+this milestone. The supported startup modes are `from-open` and `partial`.
 
 ## Build and test
 
@@ -251,12 +269,16 @@ numactl --physcpubind=64-119,192-247 --membind=1 \
 
 The profile disables table auto-creation; provision the selected single-node
 or replicated production schema first. Its 32-owner Arrow layout preallocates
-approximately 17.3 GiB of ring payload capacity in `/dev/shm`, plus metadata
-and alignment overhead. Event and KLine state limits are per
-owner and fail closed on exhaustion. These settings are a topology-derived
-starting profile, not proof of 1M messages/s end-to-end capacity; qualify the
-actual catalog, interval set, replay distribution, ClickHouse schema/storage,
-and Arrow consumers under a sustained production-like run before rollout.
+approximately 17.13 GiB of ring payload capacity in `/dev/shm`, plus metadata
+and alignment overhead. Event hot-fact count/bytes, carry orders, private
+repair, pending revision bytes, Shanghai END staging, ACK joins, and sink queues
+have independent per-owner or global hard bounds and fail closed on exhaustion.
+Those logical bounds do not include allocator-retained buckets/pages, the
+process-lifetime FactJournal directory/file, or KLine bar state. These settings
+are a topology-derived starting profile, not proof of 1M messages/s end-to-end
+capacity; qualify the actual catalog, interval set, replay distribution,
+ClickHouse schema/storage, and Arrow consumers under a sustained
+production-like run before rollout.
 
 Physical runs default to `--operation-mode live`. Live mode is unbounded,
 does not accept `--run-seconds`, and does not allocate or publish the test
@@ -326,7 +348,31 @@ Enable the Event projection on top of that durable raw path with:
 --event-revision-epoch <durably allocated nonzero monotone epoch>
 --event-calculation-run-id <unique 32-hex calculation run ID>
 --event-logic-version 1
+--event-micro-batch-rows <calculation cut row bound>
+--event-micro-batch-max-delay-ns <owner scheduling delay bound>
+--event-persistence-group-max-batches <logical commits per owner submission>
+--event-persistence-group-max-rows <revisions per owner submission>
+--event-persistence-group-max-bytes <owned bytes per owner submission>
+--event-persistence-group-max-delay-ns <oldest durable commit wait>
+--event-insert-request-max-rows <revision rows per physical HTTP request>
+--event-insert-request-max-bytes <RowBinary bytes per physical HTTP request>
+--event-physical-group-max-batches <logical commits per physical group>
+--event-physical-group-max-delay-ns <oldest lane entry wait>
 --event-writer-lanes <1|2|4|8>
+--event-queue-revision-batches <global logical-batch queue cap>
+--event-queue-revision-rows <global revision-row queue cap>
+--event-maximum-carry-orders <per-owner hard cap>
+--event-maximum-order-history-bytes <per-owner logical-owned-byte hard cap>
+--event-maximum-hot-facts <per-owner hard cap>
+--event-maximum-hot-fact-bytes <per-owner hard cap>
+--event-maximum-repair-bytes <per-owner hard cap>
+--event-maximum-pending-revision-bytes <per-owner hard cap>
+--event-maximum-end-staging-bytes <per-owner hard cap>
+--event-maximum-occurrence-join <per-owner hard cap>
+--event-maximum-pending-channel-seals <per-owner mailbox cap>
+--event-phase-slice-max-nodes <per-owner slice budget>
+--event-phase-slice-max-bytes <per-owner slice budget>
+--event-phase-slice-max-cpu-ns <per-owner slice budget>
 ```
 
 The revision epoch occupies the high 32 bits of each Event version and must be
@@ -351,9 +397,9 @@ Enable one or more integer-second KLine intervals on the same durable raw path:
 Intervals are repeatable and restricted to 1 through 86,400 seconds. Window
 keys and OHLC order use the valid SDK `TickTime`/`TransactTime` normalized to
 nanoseconds from exchange midnight; host wall time, receive time, and SDK
-header `LocalTime` never substitute for it. Late recovery emits higher-version
-updates to the same logical bar. The exact eligibility, ordering, provisional,
-raw-ACK, and restart contracts are documented in
+header `LocalTime` never substitute for it. An accepted hole fill emits a
+higher-version update to the same logical bar. The exact eligibility,
+ordering, provisional, raw-ACK, and restart contracts are documented in
 [docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
 
 For replicated production tables, provision the external DDL, add
@@ -371,13 +417,24 @@ invalidate its complete-prefix contract.
 Both successful and failed connection attempts print the stable startup field
 `pre_ready_messages_discarded`; these callbacks are rejected by the handler
 before engine, raw, Event, KLine, or Arrow admission.
-The core library exposes `TryPollTick`, `TryPollSnapshot`, `TryPollGap`,
-`TryPollLateRecovery`, and `TryPollChannelFault` for the next-stage workers.
-In either startup mode, a native record arriving behind the already-published
-frontier is never inserted backward into the realtime ordered stream; its
-canonical body is sent to `LateRecovery` for later reconciliation. This is
-separate from the raw durable copy, which already captured the decoded
-occurrence before SequenceRecovery changed or diverted it.
+The core library exposes `TryPollTickDispatch`, `TryPollSnapshot`, `TryPollGap`,
+and `TryPollChannelFault`. Each `TickDispatch` is one of
+`kProjectOrdered`, `kProjectHoleFill`, `kRejectLateFact`, `kGapOpen`, or
+`kChannelSeal`. For a channel with next expected sequence `E`, configured
+online repair span `W`, and process origin `origin`, recovery captures
+`A=max(origin,E-W)` when an occurrence first arrives. A position in `[A,E)` is
+accepted only when it atomically claims a still-open hole; `sequence < A` and
+every behind-frontier position not present in the exact hole ledger are
+rejected permanently. `sequence == A` is therefore accepted only for an open
+hole. The captured `E/A` token travels with the occurrence and is never
+recomputed after owner-queue delay.
+
+The first canonical body observed for one `(trade_date, market, channel,
+feed_session_epoch, native_sequence)` is authoritative. Every later body at the
+same position is rejected without comparing or replacing payloads. This live
+classification is separate from the raw path, which captures every decoded
+occurrence before `SequenceRecovery` classifies it; only a successful raw
+ClickHouse INSERT ACK establishes the raw durability boundary.
 
 The Arrow memory protocol, restart/disconnect contract, sizing formulas,
 deployment rules, and Python API are documented in
@@ -385,11 +442,11 @@ deployment rules, and Python API are documented in
 The ClickHouse ACK, batching, retry, replay-order, schema, and overload
 contracts are documented in
 [docs/clickhouse-raw-path.md](docs/clickhouse-raw-path.md).
-The Event journal, minimal-closure repair, stable-key, revision, and current
-query contracts are documented in
+The Event gap-driven retention, order baseline compaction, minimal-closure
+repair, stable-key, revision, and current-query contracts are documented in
 [docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
-The exchange-time KLine, late-revision, and ClickHouse current-query contracts
-are documented in
+The exchange-time KLine, hole-fill revision, and ClickHouse current-query
+contracts are documented in
 [docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
 The shared Event/KLine FactJournal capacity and storage contract is documented
 in [docs/fact-journal.md](docs/fact-journal.md).
@@ -405,6 +462,11 @@ results are in
 settings remain independent (`--from-open-gap-wait-ns` and
 `--partial-gap-wait-ns`) for measured production tuning; `from-open` does not
 receive a longer default merely because upstream/network backfill is possible.
+`--maximum-reorder-span` configures the online hole-admission window `W`.
+`--reorder-entries-per-channel` configures the preallocated pending-record and
+hole-interval capacity; it must be a power of two and at least `W`. Tune both
+from measured reorder/backfill distance rather than increasing either after a
+repair or eviction backlog appears.
 
 The full contract and deployment guidance are in
 [docs/mdl-ingestd-design.md](docs/mdl-ingestd-design.md).

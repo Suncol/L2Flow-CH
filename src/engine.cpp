@@ -170,18 +170,24 @@ public:
     SpscRing& operator=(const SpscRing&) = delete;
 
     [[nodiscard]] bool TryPush(const T& value) noexcept {
-        const std::uint64_t head = head_.load(std::memory_order_relaxed);
-        if (head - cached_tail_ >=
-            static_cast<std::uint64_t>(capacity_)) {
-            cached_tail_ = tail_.load(std::memory_order_acquire);
-            if (head - cached_tail_ >=
-                static_cast<std::uint64_t>(capacity_)) {
-                return false;
-            }
+        if (!CanPush()) {
+            return false;
         }
+        const std::uint64_t head = head_.load(std::memory_order_relaxed);
         storage_.Store(static_cast<std::size_t>(head) & mask_, value);
         head_.store(head + 1U, std::memory_order_release);
         return true;
+    }
+
+    // Producer-only capacity probe. After it succeeds, this producer can push
+    // one element without another thread consuming capacity.
+    [[nodiscard]] bool CanPush() noexcept {
+        const std::uint64_t head = head_.load(std::memory_order_relaxed);
+        if (head - cached_tail_ < static_cast<std::uint64_t>(capacity_)) {
+            return true;
+        }
+        cached_tail_ = tail_.load(std::memory_order_acquire);
+        return head - cached_tail_ < static_cast<std::uint64_t>(capacity_);
     }
 
     [[nodiscard]] bool TryPop(T* output) noexcept {
@@ -321,8 +327,11 @@ struct alignas(64) TickLaneStats final {
     std::atomic<std::uint64_t> decode_errors{0U};
     std::atomic<std::uint64_t> catalog_misses{0U};
     std::atomic<std::uint64_t> dispatched_ticks{0U};
-    std::atomic<std::uint64_t> duplicates_or_late{0U};
-    std::atomic<std::uint64_t> late_recovery_dispatched{0U};
+    std::atomic<std::uint64_t> rejected_late_facts{0U};
+    std::atomic<std::uint64_t> hole_fills_dispatched{0U};
+    std::atomic<std::uint64_t> source_channel_controls{0U};
+    std::atomic<std::uint64_t> owner_control_deliveries{0U};
+    std::atomic<std::uint64_t> expired_hole_sequences{0U};
     std::atomic<std::uint64_t> gaps_skipped{0U};
     std::atomic<std::uint64_t> from_open_channels_frozen{0U};
     std::atomic<std::uint64_t> channel_faults_dispatched{0U};
@@ -420,7 +429,6 @@ public:
                std::size_t owners,
                std::size_t queue_capacity,
                std::size_t fault_capacity,
-               std::size_t late_recovery_capacity,
                std::size_t maximum_channels_per_tick_producer)
         : tick_producers_(tick_producers),
           snapshot_producers_(snapshot_producers),
@@ -434,13 +442,14 @@ public:
               tick_producers * gap_words_per_producer_)),
           gap_consumer_pending_(
               tick_producers * gap_words_per_producer_, 0U),
+          tick_dispatch_fences_(tick_producers * owners, 0U),
           tick_consumer_cursor_(owners, 0U),
           snapshot_consumer_cursor_(owners, 0U) {
-        tick_queues_.reserve(tick_producers * owners);
+        tick_dispatch_queues_.reserve(tick_producers * owners);
         for (std::size_t index = 0U; index < tick_producers * owners;
              ++index) {
-            tick_queues_.push_back(
-                std::make_unique<SpscRing<CanonicalTick>>(queue_capacity));
+            tick_dispatch_queues_.push_back(
+                std::make_unique<SpscRing<TickDispatch>>(queue_capacity));
         }
         snapshot_queues_.reserve(snapshot_producers * owners);
         for (std::size_t index = 0U; index < snapshot_producers * owners;
@@ -450,13 +459,9 @@ public:
                     queue_capacity));
         }
         fault_queues_.reserve(tick_producers);
-        late_recovery_queues_.reserve(tick_producers);
         for (std::size_t index = 0U; index < tick_producers; ++index) {
             fault_queues_.push_back(
                 std::make_unique<SpscRing<ChannelFault>>(fault_capacity));
-            late_recovery_queues_.push_back(
-                std::make_unique<SpscRing<LateRecoveryTick>>(
-                    late_recovery_capacity));
         }
         const std::size_t dirty_word_count =
             tick_producers * gap_words_per_producer_;
@@ -465,13 +470,53 @@ public:
         }
     }
 
-    [[nodiscard]] bool PublishTick(std::size_t producer,
-                                   std::size_t owner,
-                                   const CanonicalTick& tick) noexcept {
+    [[nodiscard]] bool PublishTickDispatch(
+        std::size_t producer,
+        std::size_t owner,
+        const TickDispatch& dispatch) noexcept {
         if (producer >= tick_producers_ || owner >= owners_) {
             return false;
         }
-        return tick_queues_[producer * owners_ + owner]->TryPush(tick);
+        const std::size_t index = producer * owners_ + owner;
+        std::uint64_t& fence = tick_dispatch_fences_[index];
+        if (fence == std::numeric_limits<std::uint64_t>::max()) {
+            return false;
+        }
+        TickDispatch published = dispatch;
+        published.owner = static_cast<std::uint32_t>(owner);
+        published.dispatch_fence = fence + 1U;
+        if (!tick_dispatch_queues_[index]->TryPush(published)) {
+            return false;
+        }
+        ++fence;
+        return true;
+    }
+
+    [[nodiscard]] bool PublishTickControl(
+        std::size_t producer,
+        const TickDispatch& control) noexcept {
+        if (producer >= tick_producers_) {
+            return false;
+        }
+        const std::size_t first = producer * owners_;
+        for (std::size_t owner = 0U; owner < owners_; ++owner) {
+            const std::size_t index = first + owner;
+            if (tick_dispatch_fences_[index] ==
+                    std::numeric_limits<std::uint64_t>::max() ||
+                !tick_dispatch_queues_[index]->CanPush()) {
+                return false;
+            }
+        }
+        for (std::size_t owner = 0U; owner < owners_; ++owner) {
+            const std::size_t index = first + owner;
+            TickDispatch published = control;
+            published.owner = static_cast<std::uint32_t>(owner);
+            published.dispatch_fence = ++tick_dispatch_fences_[index];
+            if (!tick_dispatch_queues_[index]->TryPush(published)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     [[nodiscard]] bool PublishSnapshot(
@@ -510,22 +555,17 @@ public:
                fault_queues_[producer]->TryPush(fault);
     }
 
-    [[nodiscard]] bool PublishLateRecovery(
-        std::size_t producer,
-        const LateRecoveryTick& record) noexcept {
-        return producer < late_recovery_queues_.size() &&
-               late_recovery_queues_[producer]->TryPush(record);
-    }
-
-    [[nodiscard]] bool TryPollTick(std::size_t owner,
-                                   CanonicalTick* output) noexcept {
+    [[nodiscard]] bool TryPollTickDispatch(
+        std::size_t owner,
+        TickDispatch* output) noexcept {
         if (owner >= owners_ || output == nullptr) {
             return false;
         }
         std::size_t& cursor = tick_consumer_cursor_[owner];
         for (std::size_t count = 0U; count < tick_producers_; ++count) {
             const std::size_t producer = (cursor + count) % tick_producers_;
-            if (tick_queues_[producer * owners_ + owner]->TryPop(output)) {
+            if (tick_dispatch_queues_[producer * owners_ + owner]->TryPop(
+                    output)) {
                 cursor = (producer + 1U) % tick_producers_;
                 return true;
             }
@@ -600,25 +640,6 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool TryPollLateRecovery(
-        LateRecoveryTick* output) noexcept {
-        if (output == nullptr || late_recovery_queues_.empty()) {
-            return false;
-        }
-        for (std::size_t count = 0U;
-             count < late_recovery_queues_.size(); ++count) {
-            const std::size_t producer =
-                (late_recovery_consumer_cursor_ + count) %
-                late_recovery_queues_.size();
-            if (late_recovery_queues_[producer]->TryPop(output)) {
-                late_recovery_consumer_cursor_ =
-                    (producer + 1U) % late_recovery_queues_.size();
-                return true;
-            }
-        }
-        return false;
-    }
-
     [[nodiscard]] bool TryPollFault(ChannelFault* output) noexcept {
         if (output == nullptr || fault_queues_.empty()) {
             return false;
@@ -639,74 +660,27 @@ private:
     std::size_t tick_producers_ = 0U;
     std::size_t snapshot_producers_ = 0U;
     std::size_t owners_ = 0U;
-    std::vector<std::unique_ptr<SpscRing<CanonicalTick>>> tick_queues_;
+    std::vector<std::unique_ptr<SpscRing<TickDispatch>>>
+        tick_dispatch_queues_;
     std::vector<std::unique_ptr<SpscRing<CanonicalSnapshot>>>
         snapshot_queues_;
     std::vector<std::unique_ptr<SpscRing<ChannelFault>>> fault_queues_;
-    std::vector<std::unique_ptr<SpscRing<LateRecoveryTick>>>
-        late_recovery_queues_;
     std::size_t gap_channels_per_producer_ = 0U;
     std::size_t gap_words_per_producer_ = 0U;
     std::unique_ptr<GapMailboxSlot[]> gap_slots_;
     std::unique_ptr<std::atomic<std::uint64_t>[]> gap_dirty_words_;
     std::vector<std::uint64_t> gap_consumer_pending_;
+    std::vector<std::uint64_t> tick_dispatch_fences_;
     std::vector<std::size_t> tick_consumer_cursor_;
     std::vector<std::size_t> snapshot_consumer_cursor_;
     std::size_t gap_consumer_word_cursor_ = 0U;
-    std::size_t late_recovery_consumer_cursor_ = 0U;
     std::size_t fault_consumer_cursor_ = 0U;
 };
-
-[[nodiscard]] bool IdentityEqual(const ExactIdentity& left,
-                                 const ExactIdentity& right) noexcept {
-    return left.market == right.market &&
-           left.security_id_source_size ==
-               right.security_id_source_size &&
-           left.security_id_size == right.security_id_size &&
-           std::equal(left.security_id_source.begin(),
-                      left.security_id_source.end(),
-                      right.security_id_source.begin()) &&
-           std::equal(left.security_id.begin(), left.security_id.end(),
-                      right.security_id.begin());
-}
-
-[[nodiscard]] bool DecimalEqual(const FixedDecimal& left,
-                                const FixedDecimal& right) noexcept {
-    return left.raw == right.raw && left.source_scale == right.source_scale &&
-           left.raw_valid == right.raw_valid;
-}
-
-[[nodiscard]] bool QuantityEqual(const ScaledInteger& left,
-                                 const ScaledInteger& right) noexcept {
-    return left.raw == right.raw && left.scale == right.scale &&
-           left.valid == right.valid;
-}
-
-[[nodiscard]] bool CanonicalPayloadEqual(const CanonicalTick& left,
-                                         const CanonicalTick& right) noexcept {
-    return left.common.message_key == right.common.message_key &&
-           left.common.kind == right.common.kind &&
-           left.common.channel == right.common.channel &&
-           left.common.native_sequence == right.common.native_sequence &&
-           left.common.exchange_time_raw == right.common.exchange_time_raw &&
-           IdentityEqual(left.common.identity, right.common.identity) &&
-           DecimalEqual(left.price, right.price) &&
-           DecimalEqual(left.amount, right.amount) &&
-           QuantityEqual(left.quantity, right.quantity) &&
-           left.primary_order_id == right.primary_order_id &&
-           left.buy_order_id == right.buy_order_id &&
-           left.sell_order_id == right.sell_order_id &&
-           left.sh_add_matched_quantity_raw ==
-               right.sh_add_matched_quantity_raw &&
-           left.raw_type == right.raw_type &&
-           left.raw_side == right.raw_side && left.action == right.action &&
-           left.side == right.side && left.aggressor == right.aggressor &&
-           left.order_type == right.order_type && left.phase == right.phase;
-}
 
 class SequenceRecovery final {
 public:
     SequenceRecovery(StartMode mode,
+                     std::uint64_t feed_session_epoch,
                      std::size_t maximum_channels,
                      std::size_t entries_per_channel,
                      std::uint64_t maximum_reorder_span,
@@ -714,6 +688,7 @@ public:
                      std::uint64_t gap_wait_ns,
                      TickLaneStats* stats)
         : mode_(mode),
+          feed_session_epoch_(feed_session_epoch),
           entries_per_channel_(entries_per_channel),
           slot_mask_(entries_per_channel - 1U),
           maximum_reorder_span_(maximum_reorder_span),
@@ -729,14 +704,13 @@ public:
         channel_table_mask_ = table_capacity - 1U;
     }
 
-    template <typename EmitTick, typename EmitGap, typename EmitFault,
-              typename EmitLate, typename Fatal>
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitGap, typename Fatal>
     void Process(const internal::TickDecodeResult& decoded,
                  std::uint64_t now,
-                 EmitTick&& emit_tick,
+                 EmitOccurrence&& emit_occurrence,
+                 EmitControl&& emit_control,
                  EmitGap&& emit_gap,
-                 EmitFault&& emit_fault,
-                 EmitLate&& emit_late,
                  Fatal&& fatal) noexcept {
         ChannelState* state = FindOrCreate(
             decoded.tick.common.identity.market,
@@ -746,33 +720,33 @@ public:
             return;
         }
         if (state->frozen) {
-            stats_->duplicates_or_late.fetch_add(1U,
-                                                 std::memory_order_relaxed);
+            const std::uint64_t expected = RejectionExpected(
+                *state, decoded.tick.common.native_sequence);
+            Reject(*state, decoded, expected,
+                   RejectionFloor(*state, expected),
+                   emit_occurrence, fatal);
             return;
         }
         if (mode_ == StartMode::kPartial && state->discovering) {
-            const InsertResult inserted = Insert(*state, decoded);
+            const InsertResult inserted = Insert(*state, decoded, 0U, 0U);
             if (inserted == InsertResult::kDuplicate) {
-                stats_->duplicates_or_late.fetch_add(
-                    1U, std::memory_order_relaxed);
-                return;
-            }
-            if (inserted == InsertResult::kConflict) {
-                // PARTIAL deterministically keeps the first canonical
-                // projection at that native position and diverts the other
-                // body for reconciliation instead of freezing the channel.
-                stats_->duplicates_or_late.fetch_add(
-                    1U, std::memory_order_relaxed);
-                static_cast<void>(DivertLateRecovery(
-                    *state, decoded,
-                    LateRecoveryReason::kPendingCanonicalConflict,
-                    emit_late, fatal));
+                const std::uint64_t expected = RejectionExpected(
+                    *state, decoded.tick.common.native_sequence);
+                Reject(*state, decoded, expected,
+                       RejectionFloor(*state, expected),
+                       emit_occurrence, fatal);
                 return;
             }
             if (inserted == InsertResult::kCollision) {
-                FinishDiscovery(*state, now, emit_tick, fatal);
-                ProcessActive(*state, decoded, now, emit_tick, emit_gap,
-                              emit_fault, emit_late, fatal);
+                const std::uint64_t sequence =
+                    decoded.tick.common.native_sequence;
+                if (sequence < MinimumPending(*state)) {
+                    ActivateDiscoveredOrigin(*state, sequence);
+                } else {
+                    FinishDiscovery(*state, now, emit_occurrence, fatal);
+                }
+                ProcessActive(*state, decoded, now, emit_occurrence,
+                              emit_control, emit_gap, fatal);
                 return;
             }
             if (state->first_seen_ns == 0U) {
@@ -782,19 +756,21 @@ public:
                 }
             }
             if (initial_hold_ns_ == 0U ||
-                DeadlineReached(
-                    now, state->first_seen_ns, initial_hold_ns_)) {
-                FinishDiscovery(*state, now, emit_tick, fatal);
+                DeadlineReached(now, state->first_seen_ns,
+                                initial_hold_ns_)) {
+                FinishDiscovery(*state, now, emit_occurrence, fatal);
             }
             return;
         }
-        ProcessActive(*state, decoded, now, emit_tick, emit_gap,
-                      emit_fault, emit_late, fatal);
+        ProcessActive(*state, decoded, now, emit_occurrence, emit_control,
+                      emit_gap, fatal);
     }
 
-    template <typename EmitTick, typename EmitGap, typename Fatal>
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitGap, typename Fatal>
     void Poll(std::uint64_t now,
-              EmitTick&& emit_tick,
+              EmitOccurrence&& emit_occurrence,
+              EmitControl&& emit_control,
               EmitGap&& emit_gap,
               Fatal&& fatal) noexcept {
         if (next_deadline_ns_ == 0U || now < next_deadline_ns_) {
@@ -807,28 +783,29 @@ public:
                 continue;
             }
             if (state.discovering) {
-                if (DeadlineReached(
-                        now, state.first_seen_ns, initial_hold_ns_)) {
-                    FinishDiscovery(state, now, emit_tick, fatal);
+                if (DeadlineReached(now, state.first_seen_ns,
+                                    initial_hold_ns_)) {
+                    FinishDiscovery(state, now, emit_occurrence, fatal);
                 } else {
-                    ScheduleDeadline(state.first_seen_ns,
-                                     initial_hold_ns_);
+                    ScheduleDeadline(state.first_seen_ns, initial_hold_ns_);
                 }
                 continue;
             }
             if (state.gap_open_ns != 0U &&
                 DeadlineReached(now, state.gap_open_ns, gap_wait_ns_)) {
-                ForceGapToMinimum(
-                    state, now, emit_tick, emit_gap, fatal);
+                ForceGapToMinimum(state, now, emit_occurrence, emit_control,
+                                  emit_gap, fatal);
             } else if (state.gap_open_ns != 0U) {
                 ScheduleDeadline(state.gap_open_ns, gap_wait_ns_);
             }
         }
     }
 
-    template <typename EmitTick, typename EmitGap, typename Fatal>
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitGap, typename Fatal>
     void Flush(std::uint64_t now,
-               EmitTick&& emit_tick,
+               EmitOccurrence&& emit_occurrence,
+               EmitControl&& emit_control,
                EmitGap&& emit_gap,
                Fatal&& fatal) noexcept {
         for (std::size_t index = 0U; index < channel_count_; ++index) {
@@ -837,20 +814,28 @@ public:
                 continue;
             }
             if (state.discovering) {
-                FinishDiscovery(state, now, emit_tick, fatal);
+                FinishDiscovery(state, now, emit_occurrence, fatal);
             }
             while (state.pending_count > 0U) {
-                ForceGapToMinimum(
-                    state, now, emit_tick, emit_gap, fatal);
+                const std::size_t pending_before = state.pending_count;
+                ForceGapToMinimum(state, now, emit_occurrence, emit_control,
+                                  emit_gap, fatal);
+                if (state.pending_count >= pending_before) {
+                    fatal("native-sequence flush made no progress");
+                    break;
+                }
             }
         }
     }
 
-    template <typename EmitFault, typename Fatal>
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitFault, typename Fatal>
     void FreezeDecodeFailure(Market market,
                              std::uint32_t channel,
                              std::uint64_t sequence,
                              std::uint64_t now,
+                             EmitOccurrence&& emit_occurrence,
+                             EmitControl&& emit_control,
                              EmitFault&& emit_fault,
                              Fatal&& fatal) noexcept {
         if (mode_ != StartMode::kFromOpen) {
@@ -862,25 +847,33 @@ public:
                   "while recording a decode failure");
             return;
         }
-        FreezeFromOpen(*state, ChannelFaultReason::kDecodeFailure,
-                       sequence, now, emit_fault, fatal);
+        RejectPendingAndFreeze(*state, sequence, now, emit_occurrence,
+                               emit_control, emit_fault, fatal);
     }
 
 private:
     struct PendingSlot final {
         CanonicalTick tick{};
+        std::uint64_t arrival_expected = 0U;
+        std::uint64_t arrival_floor = 0U;
         bool occupied = false;
         bool emit = false;
+    };
+
+    struct HoleInterval final {
+        std::uint64_t first = 0U;
+        std::uint64_t last = 0U;
+        std::uint64_t generation = 0U;
     };
 
     struct ChannelState final {
         Market market = Market::kUnknown;
         std::uint32_t channel = 0U;
-        bool used = false;
         bool frozen = false;
         bool discovering = false;
-        bool history_complete = true;
+        bool expired_loss = false;
         bool gap_metadata_pending = false;
+        std::uint64_t origin = 1U;
         std::uint64_t expected = 1U;
         std::uint64_t first_seen_ns = 0U;
         std::uint64_t gap_open_ns = 0U;
@@ -890,14 +883,21 @@ private:
         std::uint64_t pending_gap_last = 0U;
         std::size_t mailbox_slot = 0U;
         std::size_t pending_count = 0U;
+        std::size_t hole_count = 0U;
         std::unique_ptr<PendingSlot[]> pending;
+        std::unique_ptr<HoleInterval[]> holes;
     };
 
     enum class InsertResult : std::uint8_t {
         kInserted,
         kDuplicate,
-        kConflict,
         kCollision,
+    };
+
+    enum class ClaimResult : std::uint8_t {
+        kNotFound,
+        kClaimed,
+        kCapacityExhausted,
     };
 
     [[nodiscard]] static bool DeadlineReached(
@@ -930,6 +930,61 @@ private:
         return value ^ (value >> 31U);
     }
 
+    [[nodiscard]] std::uint64_t AdmissionFloorFor(
+        const ChannelState& state,
+        std::uint64_t expected) const noexcept {
+        if (expected <= state.origin ||
+            expected - state.origin <= maximum_reorder_span_) {
+            return state.origin;
+        }
+        return expected - maximum_reorder_span_;
+    }
+
+    [[nodiscard]] std::uint64_t AdmissionFloor(
+        const ChannelState& state) const noexcept {
+        return AdmissionFloorFor(state, state.expected);
+    }
+
+    [[nodiscard]] static std::uint64_t RejectionExpected(
+        const ChannelState& state,
+        std::uint64_t sequence) noexcept {
+        if (state.expected != 0U) {
+            return state.expected;
+        }
+        if (state.origin != 0U) {
+            return state.origin;
+        }
+        return sequence;
+    }
+
+    [[nodiscard]] std::uint64_t RejectionFloor(
+        const ChannelState& state,
+        std::uint64_t expected) const noexcept {
+        return state.expected == 0U || state.origin == 0U
+            ? expected
+            : AdmissionFloor(state);
+    }
+
+    [[nodiscard]] std::uint64_t RetentionFrontier(
+        const ChannelState& state) const noexcept {
+        return state.hole_count == 0U ? state.expected
+                                     : state.holes[0U].first;
+    }
+
+    [[nodiscard]] std::uint64_t ProjectedRetentionFrontier(
+        const ChannelState& state,
+        std::uint64_t projected_expected) const noexcept {
+        const std::uint64_t floor =
+            AdmissionFloorFor(state, projected_expected);
+        for (std::size_t index = 0U; index < state.hole_count; ++index) {
+            const HoleInterval& hole = state.holes[index];
+            if (hole.last >= floor) {
+                return std::max(hole.first, floor);
+            }
+        }
+        return projected_expected;
+    }
+
     [[nodiscard]] ChannelState* FindOrCreate(Market market,
                                               std::uint32_t channel) noexcept {
         std::size_t slot =
@@ -944,16 +999,18 @@ private:
                 ChannelState& state = channels_[channel_count_];
                 state.pending.reset(
                     new (std::nothrow) PendingSlot[entries_per_channel_]);
-                if (state.pending == nullptr) {
+                state.holes.reset(
+                    new (std::nothrow) HoleInterval[entries_per_channel_]);
+                if (state.pending == nullptr || state.holes == nullptr) {
                     return nullptr;
                 }
                 state.market = market;
                 state.channel = channel;
                 state.mailbox_slot = channel_count_;
-                state.used = true;
                 state.discovering = mode_ == StartMode::kPartial;
-                state.history_complete = mode_ == StartMode::kFromOpen;
-                state.expected = mode_ == StartMode::kFromOpen ? 1U : 0U;
+                state.expired_loss = mode_ == StartMode::kPartial;
+                state.origin = mode_ == StartMode::kFromOpen ? 1U : 0U;
+                state.expected = state.origin;
                 channel_table_[slot] =
                     static_cast<std::uint32_t>(channel_count_ + 1U);
                 ++channel_count_;
@@ -970,20 +1027,20 @@ private:
 
     [[nodiscard]] InsertResult Insert(
         ChannelState& state,
-        const internal::TickDecodeResult& decoded) noexcept {
+        const internal::TickDecodeResult& decoded,
+        std::uint64_t arrival_expected,
+        std::uint64_t arrival_floor) noexcept {
         const std::uint64_t sequence = decoded.tick.common.native_sequence;
         PendingSlot& slot = state.pending[
             static_cast<std::size_t>(sequence) & slot_mask_];
         if (slot.occupied) {
-            if (slot.tick.common.native_sequence != sequence) {
-                return InsertResult::kCollision;
-            }
-            return CanonicalPayloadEqual(slot.tick, decoded.tick) &&
-                           slot.emit == decoded.catalog_match
+            return slot.tick.common.native_sequence == sequence
                        ? InsertResult::kDuplicate
-                       : InsertResult::kConflict;
+                       : InsertResult::kCollision;
         }
         slot.tick = decoded.tick;
+        slot.arrival_expected = arrival_expected;
+        slot.arrival_floor = arrival_floor;
         slot.emit = decoded.catalog_match;
         slot.occupied = true;
         ++state.pending_count;
@@ -1012,40 +1069,101 @@ private:
         return minimum;
     }
 
-    template <typename EmitLate, typename Fatal>
-    [[nodiscard]] bool DivertLateRecovery(
+    [[nodiscard]] TickDispatch MakeOccurrence(
         const ChannelState& state,
-        const internal::TickDecodeResult& decoded,
-        LateRecoveryReason reason,
-        EmitLate&& emit_late,
-        Fatal&& fatal) noexcept {
-        LateRecoveryTick record{};
-        record.tick = decoded.tick;
-        record.tick.validity &= ~kTickChannelHistoryValid;
-        record.tick.common.quality_flags |=
-            kQualityChannelHistoryIncomplete | kQualityLateRecovery;
-        record.tick.common.gap_epoch = state.gap_epoch;
-        record.committed_next_sequence = state.expected;
-        record.observed_gap_epoch = state.gap_epoch;
-        record.reason = reason;
-        record.catalog_match = decoded.catalog_match;
-        if (!emit_late(record)) {
-            fatal("LateRecovery canonical record queue overflow");
-            return false;
+        const CanonicalTick& tick,
+        bool catalog_match,
+        TickDispatchKind kind,
+        std::uint64_t expected_at_arrival,
+        std::uint64_t floor_at_arrival,
+        std::uint64_t generation) const noexcept {
+        TickDispatch dispatch{};
+        dispatch.tick = tick;
+        dispatch.feed_session_epoch = feed_session_epoch_;
+        dispatch.expected_sequence = expected_at_arrival;
+        dispatch.admission_floor = floor_at_arrival;
+        dispatch.generation = generation;
+        dispatch.channel = state.channel;
+        dispatch.market = state.market;
+        dispatch.kind = kind;
+        dispatch.catalog_match = catalog_match;
+        return dispatch;
+    }
+
+    template <typename EmitOccurrence, typename Fatal>
+    void Reject(const ChannelState& state,
+                const internal::TickDecodeResult& decoded,
+                std::uint64_t expected_at_arrival,
+                std::uint64_t floor_at_arrival,
+                EmitOccurrence&& emit_occurrence,
+                Fatal&& fatal) noexcept {
+        stats_->rejected_late_facts.fetch_add(1U,
+                                             std::memory_order_relaxed);
+        if (!decoded.catalog_match) {
+            return;
         }
+        const TickDispatch dispatch = MakeOccurrence(
+            state, decoded.tick, true, TickDispatchKind::kRejectLateFact,
+            expected_at_arrival, floor_at_arrival, state.gap_epoch);
+        if (!emit_occurrence(dispatch)) {
+            fatal("rejected-fact dispatch queue overflow");
+        }
+    }
+
+    template <typename EmitOccurrence, typename Fatal>
+    [[nodiscard]] bool RejectPending(ChannelState& state,
+                                     EmitOccurrence&& emit_occurrence,
+                                     Fatal&& fatal) noexcept {
+        while (state.pending_count != 0U) {
+            const std::uint64_t sequence = MinimumPending(state);
+            PendingSlot* const slot = Find(state, sequence);
+            if (slot == nullptr) {
+                fatal("pending first-wins state is inconsistent");
+                return false;
+            }
+            CanonicalTick tick = slot->tick;
+            const bool should_emit = slot->emit;
+            const std::uint64_t expected_at_arrival =
+                slot->arrival_expected != 0U
+                    ? slot->arrival_expected
+                    : RejectionExpected(state,
+                                        tick.common.native_sequence);
+            const std::uint64_t floor_at_arrival =
+                slot->arrival_floor != 0U
+                    ? slot->arrival_floor
+                    : RejectionFloor(state, expected_at_arrival);
+            slot->occupied = false;
+            --state.pending_count;
+            stats_->rejected_late_facts.fetch_add(
+                1U, std::memory_order_relaxed);
+            if (!should_emit) {
+                continue;
+            }
+            TickDispatch dispatch = MakeOccurrence(
+                state, tick, true, TickDispatchKind::kRejectLateFact,
+                expected_at_arrival, floor_at_arrival, state.gap_epoch);
+            dispatch.evict_before = RetentionFrontier(state);
+            if (!emit_occurrence(dispatch)) {
+                fatal("pending rejected-fact dispatch queue overflow");
+                return false;
+            }
+        }
+        state.gap_open_ns = 0U;
         return true;
     }
 
-    template <typename EmitTick, typename Fatal>
+    template <typename EmitOccurrence, typename Fatal>
     [[nodiscard]] bool EmitOne(ChannelState& state,
                                PendingSlot& slot,
-                               EmitTick&& emit_tick,
+                               EmitOccurrence&& emit_occurrence,
                                Fatal&& fatal) noexcept {
         CanonicalTick tick = slot.tick;
         const bool should_emit = slot.emit;
+        const std::uint64_t expected_at_arrival = slot.arrival_expected;
+        const std::uint64_t floor_at_arrival = slot.arrival_floor;
         slot.occupied = false;
         --state.pending_count;
-        if (!state.history_complete) {
+        if (state.expired_loss || state.hole_count != 0U) {
             tick.validity &= ~kTickChannelHistoryValid;
             tick.common.quality_flags |= kQualityChannelHistoryIncomplete;
         }
@@ -1056,24 +1174,39 @@ private:
             tick.common.gap_before_last = state.pending_gap_last;
             state.gap_metadata_pending = false;
         }
-        if (should_emit && !emit_tick(tick)) {
-            fatal("instrument tick dispatch queue overflow");
-            return false;
+        if (should_emit) {
+            if (expected_at_arrival == 0U || floor_at_arrival == 0U ||
+                floor_at_arrival > expected_at_arrival) {
+                fatal("ordered arrival token is not initialized");
+                return false;
+            }
+            const std::uint64_t projected_expected =
+                tick.common.native_sequence + 1U;
+            TickDispatch dispatch = MakeOccurrence(
+                state, tick, true, TickDispatchKind::kProjectOrdered,
+                expected_at_arrival, floor_at_arrival,
+                state.gap_epoch);
+            dispatch.evict_before =
+                ProjectedRetentionFrontier(state, projected_expected);
+            if (!emit_occurrence(dispatch)) {
+                fatal("instrument TickDispatch queue overflow");
+                return false;
+            }
         }
         return true;
     }
 
-    template <typename EmitTick, typename Fatal>
+    template <typename EmitOccurrence, typename Fatal>
     void DrainContiguous(ChannelState& state,
                          std::uint64_t now,
-                         EmitTick&& emit_tick,
+                         EmitOccurrence&& emit_occurrence,
                          Fatal&& fatal) noexcept {
         for (;;) {
             PendingSlot* slot = Find(state, state.expected);
             if (slot == nullptr) {
                 break;
             }
-            if (!EmitOne(state, *slot, emit_tick, fatal)) {
+            if (!EmitOne(state, *slot, emit_occurrence, fatal)) {
                 return;
             }
             ++state.expected;
@@ -1084,21 +1217,149 @@ private:
         }
     }
 
-    template <typename EmitGap, typename Fatal>
+    [[nodiscard]] bool AddHole(ChannelState& state,
+                               std::uint64_t first,
+                               std::uint64_t last,
+                               std::uint64_t generation) noexcept {
+        if (last < first) {
+            return true;
+        }
+        if (state.hole_count >= entries_per_channel_) {
+            return false;
+        }
+        if (state.hole_count != 0U &&
+            state.holes[state.hole_count - 1U].last >= first) {
+            return false;
+        }
+        state.holes[state.hole_count++] =
+            HoleInterval{first, last, generation};
+        return true;
+    }
+
+    [[nodiscard]] ClaimResult ClaimHole(ChannelState& state,
+                                         std::uint64_t sequence,
+                                         std::uint64_t* generation) noexcept {
+        std::size_t lower = 0U;
+        std::size_t upper = state.hole_count;
+        while (lower < upper) {
+            const std::size_t middle = lower + (upper - lower) / 2U;
+            if (state.holes[middle].last < sequence) {
+                lower = middle + 1U;
+            } else {
+                upper = middle;
+            }
+        }
+        if (lower == state.hole_count ||
+            sequence < state.holes[lower].first) {
+            return ClaimResult::kNotFound;
+        }
+        const HoleInterval claimed = state.holes[lower];
+        *generation = claimed.generation;
+        if (claimed.first == sequence && claimed.last == sequence) {
+            std::move(state.holes.get() + lower + 1U,
+                      state.holes.get() + state.hole_count,
+                      state.holes.get() + lower);
+            --state.hole_count;
+        } else if (claimed.first == sequence) {
+            state.holes[lower].first = sequence + 1U;
+        } else if (claimed.last == sequence) {
+            state.holes[lower].last = sequence - 1U;
+        } else {
+            if (state.hole_count >= entries_per_channel_) {
+                return ClaimResult::kCapacityExhausted;
+            }
+            std::move_backward(state.holes.get() + lower + 1U,
+                               state.holes.get() + state.hole_count,
+                               state.holes.get() + state.hole_count + 1U);
+            state.holes[lower].last = sequence - 1U;
+            state.holes[lower + 1U] =
+                HoleInterval{sequence + 1U, claimed.last,
+                             claimed.generation};
+            ++state.hole_count;
+        }
+        return ClaimResult::kClaimed;
+    }
+
+    void ExpireOpenHoles(ChannelState& state,
+                         std::uint64_t floor) noexcept {
+        std::size_t expired = 0U;
+        std::uint64_t expired_sequences = 0U;
+        while (expired < state.hole_count &&
+               state.holes[expired].last < floor) {
+            expired_sequences += state.holes[expired].last -
+                                 state.holes[expired].first + 1U;
+            ++expired;
+        }
+        if (expired != 0U) {
+            std::move(state.holes.get() + expired,
+                      state.holes.get() + state.hole_count,
+                      state.holes.get());
+            state.hole_count -= expired;
+        }
+        if (state.hole_count != 0U && state.holes[0U].first < floor) {
+            expired_sequences += floor - state.holes[0U].first;
+            state.holes[0U].first = floor;
+        }
+        stats_->expired_hole_sequences.fetch_add(
+            expired_sequences, std::memory_order_relaxed);
+        state.expired_loss = state.expired_loss || expired_sequences != 0U;
+    }
+
+    template <typename EmitControl, typename Fatal>
+    [[nodiscard]] bool EmitSeal(const ChannelState& state,
+                                EmitControl&& emit_control,
+                                Fatal&& fatal) noexcept {
+        TickDispatch seal{};
+        seal.feed_session_epoch = feed_session_epoch_;
+        seal.expected_sequence = state.expected;
+        seal.admission_floor = AdmissionFloor(state);
+        seal.generation = state.gap_epoch;
+        seal.evict_before = RetentionFrontier(state);
+        seal.channel = state.channel;
+        seal.market = state.market;
+        seal.kind = TickDispatchKind::kChannelSeal;
+        if (!emit_control(seal)) {
+            fatal("ChannelSeal dispatch queue overflow");
+            return false;
+        }
+        return true;
+    }
+
+    template <typename EmitControl, typename Fatal>
+    [[nodiscard]] bool ExpireAndMaybeSeal(
+        ChannelState& state,
+        std::uint64_t previous_retention,
+        bool previously_had_holes,
+        EmitControl&& emit_control,
+        Fatal&& fatal) noexcept {
+        ExpireOpenHoles(state, AdmissionFloor(state));
+        return !previously_had_holes ||
+                       RetentionFrontier(state) <= previous_retention
+                   ? true
+                   : EmitSeal(state, emit_control, fatal);
+    }
+
+    template <typename EmitControl, typename EmitGap, typename Fatal>
     [[nodiscard]] bool RecordGap(ChannelState& state,
                                  std::uint64_t first,
                                  std::uint64_t last,
                                  std::uint64_t next,
                                  std::uint64_t now,
+                                 EmitControl&& emit_control,
                                  EmitGap&& emit_gap,
                                  Fatal&& fatal) noexcept {
         if (last < first) {
             return true;
         }
-        state.history_complete = false;
-        if (state.gap_epoch !=
+        if (state.gap_epoch ==
             std::numeric_limits<std::uint64_t>::max()) {
-            ++state.gap_epoch;
+            fatal("channel gap generation exhausted");
+            return false;
+        }
+        ++state.gap_epoch;
+        if (!AddHole(state, first, last, state.gap_epoch)) {
+            fatal("open-hole interval capacity exhausted");
+            return false;
         }
         const std::uint64_t missing_count = next - first;
         if (std::numeric_limits<std::uint64_t>::max() -
@@ -1112,6 +1373,22 @@ private:
         state.pending_gap_first = first;
         state.pending_gap_last = last;
         state.gap_metadata_pending = true;
+
+        TickDispatch opened{};
+        opened.feed_session_epoch = feed_session_epoch_;
+        opened.expected_sequence = state.expected;
+        opened.admission_floor = AdmissionFloor(state);
+        opened.generation = state.gap_epoch;
+        opened.first_missing = first;
+        opened.last_missing = last;
+        opened.channel = state.channel;
+        opened.market = state.market;
+        opened.kind = TickDispatchKind::kGapOpen;
+        if (!emit_control(opened)) {
+            fatal("GapOpen dispatch queue overflow");
+            return false;
+        }
+
         ChannelGap gap{};
         gap.market = state.market;
         gap.channel = state.channel;
@@ -1122,6 +1399,7 @@ private:
         gap.gap_epoch = state.gap_epoch;
         gap.cumulative_missing_sequences =
             state.cumulative_missing_sequences;
+        gap.feed_session_epoch = feed_session_epoch_;
         if (!emit_gap(state.mailbox_slot, gap)) {
             fatal("channel gap mailbox invariant failed");
             return false;
@@ -1130,144 +1408,210 @@ private:
         return true;
     }
 
-    template <typename EmitFault, typename Fatal>
-    void FreezeFromOpen(ChannelState& state,
-                        ChannelFaultReason reason,
-                        std::uint64_t observed_sequence,
-                        std::uint64_t now,
-                        EmitFault&& emit_fault,
-                        Fatal&& fatal) noexcept {
-        if (!state.frozen) {
-            state.frozen = true;
-            stats_->from_open_channels_frozen.fetch_add(
-                1U, std::memory_order_relaxed);
-            ChannelFault fault{};
-            fault.market = state.market;
-            fault.reason = reason;
-            fault.channel = state.channel;
-            fault.expected_sequence = state.expected;
-            fault.observed_sequence = observed_sequence;
-            fault.detected_monotonic_ns = now;
-            if (!emit_fault(fault)) {
-                fatal("channel fault dispatch queue overflow");
-            }
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitFault, typename Fatal>
+    void RejectPendingAndFreeze(ChannelState& state,
+                                std::uint64_t observed_sequence,
+                                std::uint64_t now,
+                                EmitOccurrence&& emit_occurrence,
+                                EmitControl&& emit_control,
+                                EmitFault&& emit_fault,
+                                Fatal&& fatal) noexcept {
+        if (state.frozen) {
+            return;
+        }
+        if (!RejectPending(state, emit_occurrence, fatal)) {
+            return;
+        }
+        const bool had_open_holes = state.hole_count != 0U;
+        ExpireOpenHoles(state, state.expected);
+        state.frozen = true;
+        stats_->from_open_channels_frozen.fetch_add(
+            1U, std::memory_order_relaxed);
+        ChannelFault fault{};
+        fault.market = state.market;
+        fault.reason = ChannelFaultReason::kDecodeFailure;
+        fault.channel = state.channel;
+        fault.expected_sequence = state.expected;
+        fault.observed_sequence = observed_sequence;
+        fault.detected_monotonic_ns = now;
+        fault.feed_session_epoch = feed_session_epoch_;
+        if (had_open_holes && !EmitSeal(state, emit_control, fatal)) {
+            return;
+        }
+        if (!emit_fault(fault)) {
+            fatal("channel fault dispatch queue overflow");
         }
     }
 
-    template <typename EmitTick, typename Fatal>
+    template <typename EmitOccurrence, typename Fatal>
     void FinishDiscovery(ChannelState& state,
                          std::uint64_t now,
-                         EmitTick&& emit_tick,
+                         EmitOccurrence&& emit_occurrence,
                          Fatal&& fatal) noexcept {
         if (!state.discovering || state.pending_count == 0U) {
             state.discovering = false;
             return;
         }
-        state.discovering = false;
-        state.expected = MinimumPending(state);
-        DrainContiguous(state, now, emit_tick, fatal);
+        ActivateDiscoveredOrigin(state, MinimumPending(state));
+        DrainContiguous(state, now, emit_occurrence, fatal);
     }
 
-    template <typename EmitTick, typename EmitGap, typename Fatal>
+    void ActivateDiscoveredOrigin(ChannelState& state,
+                                  std::uint64_t origin) noexcept {
+        state.discovering = false;
+        state.origin = origin;
+        state.expected = origin;
+        for (std::size_t index = 0U; index < entries_per_channel_; ++index) {
+            PendingSlot& slot = state.pending[index];
+            if (slot.occupied) {
+                slot.arrival_expected = origin;
+                slot.arrival_floor = origin;
+            }
+        }
+    }
+
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitGap, typename Fatal>
     void ForceGapToMinimum(ChannelState& state,
                            std::uint64_t now,
-                           EmitTick&& emit_tick,
+                           EmitOccurrence&& emit_occurrence,
+                           EmitControl&& emit_control,
                            EmitGap&& emit_gap,
                            Fatal&& fatal) noexcept {
         if (state.pending_count == 0U) {
             state.gap_open_ns = 0U;
             return;
         }
+        const std::uint64_t previous_retention = RetentionFrontier(state);
+        const bool previously_had_holes = state.hole_count != 0U;
         const std::uint64_t minimum = MinimumPending(state);
-        if (minimum > state.expected &&
+        const bool opened_gap = minimum > state.expected;
+        if (opened_gap &&
             !RecordGap(state, state.expected, minimum - 1U, minimum, now,
-                       emit_gap, fatal)) {
+                       emit_control, emit_gap, fatal)) {
             return;
         }
         state.expected = minimum;
-        DrainContiguous(state, now, emit_tick, fatal);
+        DrainContiguous(state, now, emit_occurrence, fatal);
+        static_cast<void>(ExpireAndMaybeSeal(
+            state, previous_retention,
+            previously_had_holes || opened_gap,
+            emit_control, fatal));
     }
 
-    template <typename EmitTick, typename EmitGap, typename EmitFault,
-              typename EmitLate, typename Fatal>
+    template <typename EmitOccurrence, typename EmitControl,
+              typename EmitGap, typename Fatal>
     void ProcessActive(ChannelState& state,
                        const internal::TickDecodeResult& decoded,
                        std::uint64_t now,
-                       EmitTick&& emit_tick,
+                       EmitOccurrence&& emit_occurrence,
+                       EmitControl&& emit_control,
                        EmitGap&& emit_gap,
-                       EmitFault&& emit_fault,
-                       EmitLate&& emit_late,
                        Fatal&& fatal) noexcept {
         const std::uint64_t sequence = decoded.tick.common.native_sequence;
+        const std::uint64_t arrival_expected = state.expected;
+        const std::uint64_t arrival_floor = AdmissionFloor(state);
+        if (sequence == std::numeric_limits<std::uint64_t>::max()) {
+            Reject(state, decoded, arrival_expected, arrival_floor,
+                   emit_occurrence, fatal);
+            fatal("native sequence exhausted");
+            return;
+        }
         for (;;) {
             if (sequence < state.expected) {
-                stats_->duplicates_or_late.fetch_add(
-                    1U, std::memory_order_relaxed);
-                static_cast<void>(DivertLateRecovery(
-                    state, decoded,
-                    LateRecoveryReason::kBehindCommittedFrontier,
-                    emit_late, fatal));
+                if (sequence < arrival_floor) {
+                    Reject(state, decoded, arrival_expected, arrival_floor,
+                           emit_occurrence, fatal);
+                    return;
+                }
+                const std::uint64_t previous_retention =
+                    RetentionFrontier(state);
+                std::uint64_t hole_generation = 0U;
+                const ClaimResult claimed =
+                    ClaimHole(state, sequence, &hole_generation);
+                if (claimed == ClaimResult::kCapacityExhausted) {
+                    fatal("open-hole split capacity exhausted");
+                    return;
+                }
+                if (claimed == ClaimResult::kNotFound) {
+                    Reject(state, decoded, arrival_expected, arrival_floor,
+                           emit_occurrence, fatal);
+                    return;
+                }
+
+                if (decoded.catalog_match) {
+                    CanonicalTick tick = decoded.tick;
+                    tick.validity &= ~kTickChannelHistoryValid;
+                    tick.common.quality_flags |=
+                        kQualityChannelHistoryIncomplete |
+                        kQualityHoleFill;
+                    tick.common.gap_epoch = state.gap_epoch;
+                    const TickDispatch dispatch = MakeOccurrence(
+                        state, tick, true,
+                        TickDispatchKind::kProjectHoleFill,
+                        arrival_expected, arrival_floor, hole_generation);
+                    TickDispatch pinned = dispatch;
+                    pinned.evict_before = RetentionFrontier(state);
+                    if (!emit_occurrence(pinned)) {
+                        fatal("hole-fill TickDispatch queue overflow");
+                        return;
+                    }
+                }
+                if (RetentionFrontier(state) > previous_retention) {
+                    static_cast<void>(EmitSeal(state, emit_control, fatal));
+                }
                 return;
             }
             if (sequence == state.expected) {
+                const std::uint64_t previous_retention =
+                    RetentionFrontier(state);
+                const bool previously_had_holes = state.hole_count != 0U;
                 PendingSlot temporary{};
                 temporary.tick = decoded.tick;
+                temporary.arrival_expected = arrival_expected;
+                temporary.arrival_floor = arrival_floor;
                 temporary.emit = decoded.catalog_match;
                 temporary.occupied = true;
                 ++state.pending_count;
-                if (!EmitOne(state, temporary, emit_tick, fatal)) {
+                if (!EmitOne(state, temporary, emit_occurrence, fatal)) {
                     return;
                 }
                 ++state.expected;
-                DrainContiguous(state, now, emit_tick, fatal);
+                DrainContiguous(state, now, emit_occurrence, fatal);
+                static_cast<void>(ExpireAndMaybeSeal(
+                    state, previous_retention, previously_had_holes,
+                    emit_control, fatal));
                 return;
             }
 
             const std::uint64_t span = sequence - state.expected;
-            const InsertResult inserted = Insert(state, decoded);
+            const InsertResult inserted = Insert(
+                state, decoded, arrival_expected, arrival_floor);
             if (inserted == InsertResult::kDuplicate) {
-                stats_->duplicates_or_late.fetch_add(
-                    1U, std::memory_order_relaxed);
-                return;
-            }
-            if (inserted == InsertResult::kConflict) {
-                stats_->duplicates_or_late.fetch_add(
-                    1U, std::memory_order_relaxed);
-                if (mode_ == StartMode::kFromOpen) {
-                    FreezeFromOpen(
-                        state, ChannelFaultReason::kCanonicalConflict,
-                        sequence, now, emit_fault, fatal);
-                } else {
-                    static_cast<void>(DivertLateRecovery(
-                        state, decoded,
-                        LateRecoveryReason::kPendingCanonicalConflict,
-                        emit_late, fatal));
-                }
+                Reject(state, decoded, arrival_expected, arrival_floor,
+                       emit_occurrence, fatal);
                 return;
             }
             if (inserted == InsertResult::kCollision ||
                 span > maximum_reorder_span_) {
                 if (inserted == InsertResult::kInserted) {
-                    // The far record is already retained; advancing to the
-                    // smallest retained native position preserves order.
-                    ForceGapToMinimum(
-                        state, now, emit_tick, emit_gap, fatal);
+                    ForceGapToMinimum(state, now, emit_occurrence,
+                                      emit_control, emit_gap, fatal);
                     return;
                 }
                 const std::uint64_t minimum = MinimumPending(state);
                 if (state.pending_count == 0U || sequence < minimum) {
                     if (!RecordGap(state, state.expected, sequence - 1U,
-                                   sequence, now, emit_gap, fatal)) {
+                                   sequence, now, emit_control, emit_gap,
+                                   fatal)) {
                         return;
                     }
                     state.expected = sequence;
                 } else {
-                    ForceGapToMinimum(
-                        state, now, emit_tick, emit_gap, fatal);
+                    ForceGapToMinimum(state, now, emit_occurrence,
+                                      emit_control, emit_gap, fatal);
                 }
-                // Retry iteratively after freeing at least one colliding
-                // position; adversarial sequence patterns cannot grow the
-                // worker stack.
                 continue;
             }
             if (state.gap_open_ns == 0U) {
@@ -1275,13 +1619,15 @@ private:
                 ScheduleDeadline(state.gap_open_ns, gap_wait_ns_);
             }
             if (gap_wait_ns_ == 0U) {
-                ForceGapToMinimum(state, now, emit_tick, emit_gap, fatal);
+                ForceGapToMinimum(state, now, emit_occurrence, emit_control,
+                                  emit_gap, fatal);
             }
             return;
         }
     }
 
     StartMode mode_ = StartMode::kFromOpen;
+    std::uint64_t feed_session_epoch_ = 0U;
     std::size_t entries_per_channel_ = 0U;
     std::size_t slot_mask_ = 0U;
     std::uint64_t maximum_reorder_span_ = 0U;
@@ -1304,8 +1650,10 @@ private:
         }
         return false;
     };
-    if (!IsTradeDateValid(config.trade_date)) {
-        return fail("trade_date is not a supported valid calendar date");
+    if (!IsTradeDateValid(config.trade_date) ||
+        config.feed_session_epoch == 0U) {
+        return fail("trade_date and feed_session_epoch must identify a valid "
+                    "feed run");
     }
     if (catalog.size() == 0U) {
         return fail("instrument catalog is empty");
@@ -1324,8 +1672,7 @@ private:
         config.maximum_tick_body_bytes < 70U ||
         config.maximum_snapshot_body_bytes < 248U ||
         config.dispatch_queue_capacity < 2U ||
-        config.diagnostic_queue_capacity < 2U ||
-        config.late_recovery_queue_capacity < 2U) {
+        config.diagnostic_queue_capacity < 2U) {
         return fail("slot, body, or dispatch capacity is too small");
     }
     if (config.maximum_channels_per_tick_lane == 0U) {
@@ -1343,6 +1690,9 @@ private:
         config.snapshot_slots_per_lane >
             std::numeric_limits<std::size_t>::max() /
                 config.maximum_snapshot_body_bytes ||
+        config.instrument_workers >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max()) ||
         config.tick_decoder_lanes >
             std::numeric_limits<std::size_t>::max() /
                 config.instrument_workers ||
@@ -1402,7 +1752,6 @@ public:
                       config.instrument_workers,
                       config.dispatch_queue_capacity,
                       config.diagnostic_queue_capacity,
-                      config.late_recovery_queue_capacity,
                       config.maximum_channels_per_tick_lane) {
         tick_lanes_.reserve(config_.tick_decoder_lanes);
         tick_recovery_.reserve(config_.tick_decoder_lanes);
@@ -1413,6 +1762,7 @@ public:
                 config_.maximum_tick_body_bytes));
             tick_recovery_.push_back(std::make_unique<SequenceRecovery>(
                 config_.start_mode,
+                config_.feed_session_epoch,
                 config_.maximum_channels_per_tick_lane,
                 config_.reorder_entries_per_channel,
                 config_.maximum_reorder_span,
@@ -1651,9 +2001,10 @@ public:
         return AdmissionResult::kAccepted;
     }
 
-    [[nodiscard]] bool TryPollTick(std::size_t owner,
-                                   CanonicalTick* output) noexcept {
-        return dispatcher_.TryPollTick(owner, output);
+    [[nodiscard]] bool TryPollTickDispatch(
+        std::size_t owner,
+        TickDispatch* output) noexcept {
+        return dispatcher_.TryPollTickDispatch(owner, output);
     }
 
     [[nodiscard]] bool TryPollSnapshot(
@@ -1664,11 +2015,6 @@ public:
 
     [[nodiscard]] bool TryPollGap(ChannelGap* output) noexcept {
         return dispatcher_.TryPollGap(output);
-    }
-
-    [[nodiscard]] bool TryPollLateRecovery(
-        LateRecoveryTick* output) noexcept {
-        return dispatcher_.TryPollLateRecovery(output);
     }
 
     [[nodiscard]] bool TryPollChannelFault(
@@ -1697,10 +2043,17 @@ public:
                 std::memory_order_relaxed);
             result.dispatched_ticks += lane.dispatched_ticks.load(
                 std::memory_order_relaxed);
-            result.duplicates_or_late += lane.duplicates_or_late.load(
+            result.rejected_late_facts += lane.rejected_late_facts.load(
                 std::memory_order_relaxed);
-            result.late_recovery_dispatched +=
-                lane.late_recovery_dispatched.load(
+            result.hole_fills_dispatched +=
+                lane.hole_fills_dispatched.load(std::memory_order_relaxed);
+            result.source_channel_controls +=
+                lane.source_channel_controls.load(std::memory_order_relaxed);
+            result.owner_control_deliveries +=
+                lane.owner_control_deliveries.load(
+                    std::memory_order_relaxed);
+            result.expired_hole_sequences +=
+                lane.expired_hole_sequences.load(
                     std::memory_order_relaxed);
             result.gaps_skipped += lane.gaps_skipped.load(
                 std::memory_order_relaxed);
@@ -1774,6 +2127,9 @@ private:
                                           overflow_counter) noexcept {
         constexpr std::size_t kMaximumSpins = 2'048U;
         for (std::size_t spin = 0U; spin < kMaximumSpins; ++spin) {
+            if (!healthy()) {
+                return false;
+            }
             if (publish(record)) {
                 return true;
             }
@@ -1792,28 +2148,56 @@ private:
                 config_.maximum_text_bytes,
                 config_.maximum_depth_items,
                 config_.maximum_queue_items};
-            const auto emit_tick = [this, lane_index, &lane_stats](
-                                       const CanonicalTick& tick) {
+            const auto emit_occurrence = [this, lane_index, &lane_stats](
+                                       const TickDispatch& dispatch) {
                 const std::size_t owner = InstrumentOwner(
-                    tick.common.instrument_ordinal);
+                    dispatch.tick.common.instrument_ordinal);
                 const bool published = PublishBounded(
-                    tick, [this, lane_index, owner](
-                              const CanonicalTick& value) {
-                        return dispatcher_.PublishTick(
+                    dispatch, [this, lane_index, owner](
+                              const TickDispatch& value) {
+                        return dispatcher_.PublishTickDispatch(
                             lane_index, owner, value);
                     },
                     &lane_stats.dispatch_overflows);
                 if (published) {
-                    lane_stats.dispatched_ticks.fetch_add(
+                    if (dispatch.kind ==
+                            TickDispatchKind::kProjectOrdered ||
+                        dispatch.kind ==
+                            TickDispatchKind::kProjectHoleFill) {
+                        lane_stats.dispatched_ticks.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                    if (dispatch.kind ==
+                        TickDispatchKind::kProjectHoleFill) {
+                        lane_stats.hole_fills_dispatched.fetch_add(
+                            1U, std::memory_order_relaxed);
+                    }
+                }
+                return published;
+            };
+            const auto emit_control = [this, lane_index, &lane_stats](
+                                          const TickDispatch& control) {
+                const bool published = PublishBounded(
+                    control,
+                    [this, lane_index](const TickDispatch& value) {
+                        return dispatcher_.PublishTickControl(
+                            lane_index, value);
+                    },
+                    &lane_stats.dispatch_overflows);
+                if (published) {
+                    lane_stats.source_channel_controls.fetch_add(
                         1U, std::memory_order_relaxed);
+                    lane_stats.owner_control_deliveries.fetch_add(
+                        config_.instrument_workers,
+                        std::memory_order_relaxed);
                 }
                 return published;
             };
             const auto emit_gap = [this, lane_index](
                                       std::size_t channel_slot,
                                       const ChannelGap& gap) {
-                return dispatcher_.PublishGap(
-                    lane_index, channel_slot, gap);
+                return healthy() &&
+                       dispatcher_.PublishGap(lane_index, channel_slot, gap);
             };
             const auto emit_fault = [this, lane_index, &lane_stats](
                                         const ChannelFault& fault) {
@@ -1829,21 +2213,6 @@ private:
                 }
                 return published;
             };
-            const auto emit_late = [this, lane_index, &lane_stats](
-                                       const LateRecoveryTick& record) {
-                const bool published = PublishBounded(
-                    record,
-                    [this, lane_index](const LateRecoveryTick& value) {
-                        return dispatcher_.PublishLateRecovery(
-                            lane_index, value);
-                    },
-                    &lane_stats.dispatch_overflows);
-                if (published) {
-                    lane_stats.late_recovery_dispatched.fetch_add(
-                        1U, std::memory_order_relaxed);
-                }
-                return published;
-            };
             const auto fatal = [this](const char* message) {
                 SetFatal(message);
             };
@@ -1855,6 +2224,13 @@ private:
                 internal::OwnedMessageView message;
                 if (lane.TryConsume(&slot, &message)) {
                     idle_spins = 0U;
+                    if (!healthy()) {
+                        if (!lane.Release(slot)) {
+                            SetFatal(
+                                "tick lane recycle queue invariant failed");
+                        }
+                        continue;
+                    }
                     internal::TickDecodeResult decoded;
                     const internal::DecodeError error = internal::DecodeTick(
                         message, config_.trade_date, limits, catalog_,
@@ -1876,15 +2252,16 @@ private:
                                 "admission stopped at a continuity boundary");
                         }
                         if (raw_accepted) {
-                            recovery.Process(decoded,
-                                             message.receive_monotonic_ns,
-                                             emit_tick, emit_gap, emit_fault,
-                                             emit_late, fatal);
+                            recovery.Process(
+                                decoded, message.receive_monotonic_ns,
+                                emit_occurrence, emit_control, emit_gap,
+                                fatal);
                         }
                     } else {
                         lane_stats.decode_errors.fetch_add(
                             1U, std::memory_order_relaxed);
-                        if (config_.start_mode == StartMode::kFromOpen) {
+                        if (healthy() &&
+                            config_.start_mode == StartMode::kFromOpen) {
                             Market market = Market::kUnknown;
                             std::uint32_t channel = 0U;
                             std::uint64_t sequence = 0U;
@@ -1895,7 +2272,8 @@ private:
                                 recovery.FreezeDecodeFailure(
                                     market, channel, sequence,
                                     message.receive_monotonic_ns,
-                                    emit_fault, fatal);
+                                    emit_occurrence, emit_control, emit_fault,
+                                    fatal);
                             } else {
                                 SetFatal(
                                     "from-open tick decode failed and its "
@@ -1906,10 +2284,13 @@ private:
                     if (!lane.Release(slot)) {
                         SetFatal("tick lane recycle queue invariant failed");
                     }
-                    if (message.receive_monotonic_ns >= next_timer) {
-                        recovery.Poll(message.receive_monotonic_ns,
-                                      emit_tick, emit_gap, fatal);
-                        if (config_.raw_record_tap != nullptr &&
+                    if (healthy() &&
+                        message.receive_monotonic_ns >= next_timer) {
+                        recovery.Poll(
+                            message.receive_monotonic_ns, emit_occurrence,
+                            emit_control, emit_gap, fatal);
+                        if (healthy() &&
+                            config_.raw_record_tap != nullptr &&
                             !config_.raw_record_tap->PollTick(
                                 lane_index,
                                 message.receive_monotonic_ns)) {
@@ -1920,9 +2301,11 @@ private:
                     }
                 } else {
                     const std::uint64_t now = MonotonicNowNs();
-                    if (now >= next_timer) {
-                        recovery.Poll(now, emit_tick, emit_gap, fatal);
-                        if (config_.raw_record_tap != nullptr &&
+                    if (healthy() && now >= next_timer) {
+                        recovery.Poll(now, emit_occurrence, emit_control,
+                                      emit_gap, fatal);
+                        if (healthy() &&
+                            config_.raw_record_tap != nullptr &&
                             !config_.raw_record_tap->PollTick(
                                 lane_index, now)) {
                             SetFatal("raw Tick batch flush failed");
@@ -1931,8 +2314,10 @@ private:
                     }
                     if (!running_.load(std::memory_order_acquire) &&
                         lane.empty()) {
-                        recovery.Flush(
-                            now, emit_tick, emit_gap, fatal);
+                        if (healthy()) {
+                            recovery.Flush(now, emit_occurrence, emit_control,
+                                           emit_gap, fatal);
+                        }
                         if (config_.raw_record_tap != nullptr &&
                             !config_.raw_record_tap->FlushTick(lane_index)) {
                             SetFatal("final raw Tick batch flush failed");
@@ -1976,6 +2361,14 @@ private:
                 internal::OwnedMessageView message;
                 if (lane.TryConsume(&slot, &message)) {
                     idle_spins = 0U;
+                    if (!healthy()) {
+                        if (!lane.Release(slot)) {
+                            SetFatal(
+                                "snapshot lane recycle queue invariant "
+                                "failed");
+                        }
+                        continue;
+                    }
                     internal::SnapshotDecodeResult decoded;
                     const internal::DecodeError error =
                         internal::DecodeSnapshot(
@@ -2026,7 +2419,8 @@ private:
                         SetFatal(
                             "snapshot lane recycle queue invariant failed");
                     }
-                    if (config_.raw_record_tap != nullptr &&
+                    if (healthy() &&
+                        config_.raw_record_tap != nullptr &&
                         message.receive_monotonic_ns >= next_raw_timer &&
                         !config_.raw_record_tap->PollSnapshot(
                             lane_index, message.receive_monotonic_ns)) {
@@ -2047,10 +2441,11 @@ private:
                         }
                         break;
                     }
-                    if (config_.raw_record_tap != nullptr) {
+                    if (healthy() && config_.raw_record_tap != nullptr) {
                         ++timer_check_spins;
                     }
-                    if (config_.raw_record_tap != nullptr &&
+                    if (healthy() &&
+                        config_.raw_record_tap != nullptr &&
                         timer_check_spins >= 1'024U) {
                         timer_check_spins = 0U;
                         const std::uint64_t now = MonotonicNowNs();
@@ -2202,9 +2597,10 @@ AdmissionResult IngestEngine::AdmitMdlMessage(
     return impl_->Admit(header, body, receive_monotonic_ns);
 }
 
-bool IngestEngine::TryPollTick(std::size_t owner,
-                               CanonicalTick* output) noexcept {
-    return impl_->TryPollTick(owner, output);
+bool IngestEngine::TryPollTickDispatch(
+    std::size_t owner,
+    TickDispatch* output) noexcept {
+    return impl_->TryPollTickDispatch(owner, output);
 }
 
 bool IngestEngine::TryPollSnapshot(std::size_t owner,
@@ -2214,11 +2610,6 @@ bool IngestEngine::TryPollSnapshot(std::size_t owner,
 
 bool IngestEngine::TryPollGap(ChannelGap* output) noexcept {
     return impl_->TryPollGap(output);
-}
-
-bool IngestEngine::TryPollLateRecovery(
-    LateRecoveryTick* output) noexcept {
-    return impl_->TryPollLateRecovery(output);
 }
 
 bool IngestEngine::TryPollChannelFault(ChannelFault* output) noexcept {

@@ -1,6 +1,10 @@
 #include "l2flow/event/worker.h"
 
 #include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/ingest/engine.h"
+
+#include "event_exact_list.h"
+#include "event_lazy_paged_hash.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -374,6 +379,11 @@ void HashOrderSnapshot(SemanticHasher* hasher,
                    key.native_sequence};
 }
 
+[[nodiscard]] FactKey MakeFactKey(const EventKey& key) noexcept {
+    return FactKey{key.trade_date, key.market, key.channel,
+                   key.native_sequence};
+}
+
 [[nodiscard]] OrderKey MakeOrderKey(const CanonicalTick& tick,
                                     std::int64_t order_id) noexcept {
     return OrderKey{tick.common.trade_date,
@@ -651,7 +661,7 @@ void RefreshShenzhenState(OrderState* state) noexcept {
 
 struct RoleEval final {
     std::optional<OrderState> post_state;
-    std::optional<EventPayload> order_fragment;
+    std::optional<OrderDeltaOperation> order_operation;
     std::uint64_t source_quality_contribution = 0U;
     bool referenced_order_found = false;
     Side resolved_side = Side::kUnknown;
@@ -711,8 +721,7 @@ struct ApplyRoleResult final {
                 fact.common.quality_flags;
             const OrderDeltaOperation operation =
                 BeginOrderEmission(&state);
-            result.eval.order_fragment =
-                MakeOrderPayload(fact, state, operation);
+            result.eval.order_operation = operation;
             result.eval.post_state = state;
         } else {
             OrderState state = *previous;
@@ -730,8 +739,7 @@ struct ApplyRoleResult final {
             RefreshShenzhenState(&state);
             const OrderDeltaOperation operation =
                 BeginOrderEmission(&state);
-            result.eval.order_fragment =
-                MakeOrderPayload(fact, state, operation);
+            result.eval.order_operation = operation;
             result.eval.post_state = state;
         }
     } else if (fact.action == TickAction::kTrade ||
@@ -811,8 +819,7 @@ struct ApplyRoleResult final {
                 state.snapshot.quality_flags & ~before;
             const OrderDeltaOperation operation =
                 BeginOrderEmission(&state);
-            result.eval.order_fragment =
-                MakeOrderPayload(fact, state, operation);
+            result.eval.order_operation = operation;
             result.eval.post_state = state;
         }
     }
@@ -870,8 +877,7 @@ struct ApplyRoleResult final {
         }
         RefreshShanghaiState(&state);
         const OrderDeltaOperation operation = BeginOrderEmission(&state);
-        result.eval.order_fragment =
-            MakeOrderPayload(fact, state, operation);
+        result.eval.order_operation = operation;
         result.eval.post_state = state;
     } else if (fact.action == TickAction::kAdd) {
         OrderState state = previous.has_value()
@@ -999,8 +1005,7 @@ struct ApplyRoleResult final {
             RefreshShanghaiState(&state);
         }
         const OrderDeltaOperation operation = BeginOrderEmission(&state);
-        result.eval.order_fragment =
-            MakeOrderPayload(fact, state, operation);
+        result.eval.order_operation = operation;
         result.eval.post_state = state;
     } else if (fact.action == TickAction::kTrade) {
         const bool active_continuous =
@@ -1085,8 +1090,7 @@ struct ApplyRoleResult final {
         MarkMutation(fact, &state, true);
         RefreshShanghaiState(&state);
         const OrderDeltaOperation operation = BeginOrderEmission(&state);
-        result.eval.order_fragment =
-            MakeOrderPayload(fact, state, operation);
+        result.eval.order_operation = operation;
         result.eval.post_state = state;
     } else if (fact.action == TickAction::kCancel) {
         if (!previous.has_value()) {
@@ -1135,8 +1139,7 @@ struct ApplyRoleResult final {
         MarkMutation(fact, &state, true);
         RefreshShanghaiState(&state);
         const OrderDeltaOperation operation = BeginOrderEmission(&state);
-        result.eval.order_fragment =
-            MakeOrderPayload(fact, state, operation);
+        result.eval.order_operation = operation;
         result.eval.post_state = state;
     }
 
@@ -1266,21 +1269,42 @@ struct StateVersion final {
     Identifier128 input_set_hash{};
 };
 
-struct OrderHistory final {
-    std::map<std::uint64_t, OrderRole> uses;
-    std::map<std::uint64_t, StateVersion> versions;
-    std::uint64_t generation = 0U;
+struct OrderBaseline final {
+    std::uint64_t compacted_before = 0U;
+    std::uint64_t last_sequence = 0U;
+    StateVersion version{};
 };
+
+struct OrderUseNode final {
+    OrderRole role = OrderRole::kPrimary;
+    RoleEval eval{};
+    bool evaluated = false;
+};
+
+struct OrderHistory final {
+    OrderBaseline baseline{};
+    std::map<std::uint64_t, OrderUseNode> suffix;
+    std::uint64_t generation = 0U;
+    std::size_t instrument_order_slot = 0U;
+    std::size_t active_end_slot = std::numeric_limits<std::size_t>::max();
+};
+
+using OrderHistoryTable = internal::LazyPagedHashMap<
+    OrderKey, OrderHistory, OrderKeyHash>;
+using OrderIndexList = internal::ExactList<OrderKey>;
+using OrderRangeIndex = std::map<InstrumentChannelKey, OrderIndexList>;
 
 struct FactRecord final {
     journal::FactHandle handle{};
     Identifier128 fact_hash{};
-    std::vector<std::pair<OrderKey, OrderRole>> roles;
+    std::deque<std::pair<OrderKey, OrderRole>> roles;
     std::uint32_t instrument_id = 0U;
+    std::size_t accounted_bytes = 0U;
     TradingPhase projected_phase = TradingPhase::kUnknown;
     bool projectable = false;
     bool late = false;
     bool barrier = false;
+    bool phase_status = false;
     bool projected_phase_valid = false;
     bool roles_ordered = true;
 };
@@ -1307,10 +1331,6 @@ void UpsertFactRole(FactRecord* record,
         existing->second = role;
         return;
     }
-    if (record->roles.empty()) {
-        // Direct Add/Cancel/Trade facts have at most two distinct roles.
-        record->roles.reserve(2U);
-    }
     AppendUniqueFactRole(record, order, role);
 }
 
@@ -1330,6 +1350,34 @@ struct Bundle final {
     std::map<EventKey, Identifier128> input_set_hashes;
 };
 
+[[nodiscard]] std::size_t BundleRevisionCount(
+    const Bundle& old_bundle,
+    const Bundle& new_bundle) noexcept {
+    std::size_t count = 0U;
+    auto old_row = old_bundle.rows.begin();
+    auto new_row = new_bundle.rows.begin();
+    while (old_row != old_bundle.rows.end() ||
+           new_row != new_bundle.rows.end()) {
+        if (new_row == new_bundle.rows.end() ||
+            (old_row != old_bundle.rows.end() &&
+             old_row->first < new_row->first)) {
+            ++count;
+            ++old_row;
+            continue;
+        }
+        if (old_row == old_bundle.rows.end() ||
+            new_row->first < old_row->first) {
+            ++count;
+            ++new_row;
+            continue;
+        }
+        count += old_row->second == new_row->second ? 0U : 1U;
+        ++old_row;
+        ++new_row;
+    }
+    return count;
+}
+
 struct InstrumentFactIndex final {
     // Fact positions are append-ordered on the normal SequenceRecovery path.
     // A late insertion uses lower_bound and remains bounded by the per-
@@ -1338,11 +1386,12 @@ struct InstrumentFactIndex final {
     // The enclosing InstrumentChannelKey already owns every other FactKey
     // component.  Keeping only native_sequence avoids repeating 16 bytes of
     // partition identity for every fact retained during the trading day.
-    std::vector<std::uint64_t> ordered;
+    std::deque<std::uint64_t> ordered;
 };
 
 struct PhaseIndex final {
-    std::vector<std::pair<std::uint64_t, TradingPhase>> ordered;
+    std::deque<std::pair<std::uint64_t, TradingPhase>> ordered;
+    std::optional<std::pair<std::uint64_t, TradingPhase>> anchor;
 };
 
 void InsertInstrumentFact(InstrumentFactIndex* index,
@@ -1385,9 +1434,83 @@ struct EventHead final {
     bool deleted = false;
 };
 
+[[nodiscard]] constexpr std::size_t SaturatingAdd(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return right > std::numeric_limits<std::size_t>::max() - left
+        ? std::numeric_limits<std::size_t>::max()
+        : left + right;
+}
+
+[[nodiscard]] constexpr std::size_t SaturatingMultiply(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return left != 0U &&
+                   right > std::numeric_limits<std::size_t>::max() / left
+        ? std::numeric_limits<std::size_t>::max()
+        : left * right;
+}
+
+template <typename Value>
+[[nodiscard]] constexpr std::size_t TreeNodeOwnedBytes() noexcept {
+    // Three links, allocator bookkeeping and alignment are deliberately
+    // included. This is a conservative logical-owned-byte accounting unit;
+    // it is not an allocator-specific RSS measurement.
+    return sizeof(Value) + 5U * sizeof(void*);
+}
+
+[[nodiscard]] constexpr std::size_t OrderUseNodeOwnedBytes() noexcept {
+    return TreeNodeOwnedBytes<
+        std::pair<const std::uint64_t, OrderUseNode>>();
+}
+
+[[nodiscard]] constexpr std::size_t OrderIndexTreeNodeOwnedBytes() noexcept {
+    return TreeNodeOwnedBytes<
+        std::pair<const InstrumentChannelKey, OrderIndexList>>();
+}
+
+template <typename Value>
+[[nodiscard]] std::size_t DequeOwnedBytes(std::size_t count) noexcept {
+    constexpr std::size_t kBlockBytes = 512U;
+    constexpr std::size_t kValuesPerBlock = sizeof(Value) < kBlockBytes
+        ? kBlockBytes / sizeof(Value)
+        : 1U;
+    const std::size_t blocks = SaturatingAdd(
+        2U, count / kValuesPerBlock);
+    const std::size_t map_slots = SaturatingMultiply(
+        2U, SaturatingAdd(blocks, 8U));
+    const std::size_t block_storage = SaturatingMultiply(
+        SaturatingMultiply(blocks, kValuesPerBlock), sizeof(Value));
+    return SaturatingAdd(
+        block_storage,
+        SaturatingMultiply(map_slots, sizeof(void*)));
+}
+
+using PhaseEntry = std::pair<std::uint64_t, TradingPhase>;
+using BarrierRangeIndex = std::map<std::uint64_t, FactKey>;
+using ChannelFactRangeIndex = std::map<std::uint64_t, FactKey>;
+using BarrierTable = internal::LazyPagedHashMap<
+    InstrumentChannelKey, BarrierRangeIndex, InstrumentChannelKeyHash>;
+using InstrumentFactTable = internal::LazyPagedHashMap<
+    InstrumentChannelKey, InstrumentFactIndex, InstrumentChannelKeyHash>;
+using PhaseTable = internal::LazyPagedHashMap<
+    InstrumentChannelKey, PhaseIndex, InstrumentChannelKeyHash>;
+using ChannelFactTable = internal::LazyPagedHashMap<
+    ChannelKey, ChannelFactRangeIndex, ChannelKeyHash>;
+
+[[nodiscard]] std::size_t BarrierEntryOwnedBytes() noexcept {
+    return TreeNodeOwnedBytes<BarrierRangeIndex::value_type>();
+}
+
+[[nodiscard]] std::size_t ChannelFactEntryOwnedBytes() noexcept {
+    return TreeNodeOwnedBytes<ChannelFactRangeIndex::value_type>();
+}
+
 struct PendingCommit final {
     std::shared_ptr<const EventRevisionBatch> batch;
     std::set<RawTickDependency> raw_dependencies;
+    std::size_t owned_bytes = 0U;
+    std::uint64_t queued_monotonic_ns = 0U;
 };
 
 struct DirtyOrder final {
@@ -1395,18 +1518,73 @@ struct DirtyOrder final {
     bool late = false;
 };
 
-struct OrderPatch final {
-    OrderKey key{};
-    OrderHistory history{};
+struct PhaseScanSpan final {
+    InstrumentChannelKey range{};
+    std::size_t next_index = 0U;
+    std::size_t end_index = 0U;
+};
+
+struct EndExpansionTask final {
+    FactKey fact{};
+    InstrumentChannelKey range{};
+    std::size_t candidate_count = 0U;
+    std::size_t next_candidate = 0U;
+    std::size_t staging_bytes = 0U;
+    bool active_only = false;
+};
+
+enum class PendingCutStage : std::uint8_t {
+    kNormalize = 0U,
+    kRegisterInserted,
+    kSeedOrders,
+    kSeedEndOrders,
+    kSeedBundles,
+    kExpandComponents,
+    kFinalize,
+};
+
+struct PendingProjectionCut final {
+    std::vector<FactKey> inserted;
+    std::vector<std::pair<FactKey, RawTickDependency>> inserted_dependencies;
+    std::map<ChannelKey, std::uint64_t> retention_requests;
+    std::set<RawTickDependency> dependencies;
+    std::vector<PhaseScanSpan> phase_spans;
+    std::map<OrderKey, DirtyOrder> phase_dirty_orders;
+    std::map<FactKey, bool> phase_dirty_bundles;
+    std::vector<EndExpansionTask> end_expansions;
+    std::set<OrderKey> repair_orders;
+    std::set<FactKey> repair_facts;
+    std::deque<OrderKey> order_frontier;
+    std::deque<FactKey> fact_frontier;
+    std::optional<OrderKey> seed_order;
+    std::optional<OrderKey> seed_end_order;
+    std::optional<FactKey> seed_bundle;
+    std::optional<OrderKey> active_order;
+    std::optional<std::uint64_t> active_order_sequence;
+    std::optional<FactKey> active_fact;
+    std::size_t active_fact_role = 0U;
+    std::size_t next_phase_span = 0U;
+    std::size_t next_inserted = 0U;
+    std::size_t seed_end_expansion = 0U;
+    std::size_t accounted_bytes = 0U;
+    PendingCutStage stage = PendingCutStage::kNormalize;
+    bool source_only_fast = false;
+    bool saw_conflict = false;
+    bool saw_invalid = false;
+};
+
+struct RepairEvalPatch final {
+    RoleEval eval{};
+    std::uint64_t attempt_generation = 0U;
 };
 
 struct RepairOrderTask final {
     OrderKey key{};
     DirtyOrder dirty{};
-    OrderHistory history{};
     StateVersion previous{};
     std::optional<std::uint64_t> cursor;
-    std::uint64_t observed_generation = 0U;
+    std::uint64_t observed_live_generation = 0U;
+    std::uint64_t attempt_generation = 0U;
     bool initialized = false;
     bool complete = false;
 };
@@ -1418,13 +1596,164 @@ struct RepairTransaction final {
     // which made a large repair fan-out proportional to completed work.
     std::deque<OrderKey> ready_orders;
     std::set<OrderKey> ready_order_set;
-    std::map<RoleCacheKey, RoleEval> eval_patch;
+    std::map<RoleCacheKey, RepairEvalPatch> eval_patch;
     std::map<FactKey, bool> dirty_bundles;
     std::set<RawTickDependency> raw_dependencies;
     std::set<FactKey> inserted_facts;
+    std::deque<EndExpansionTask> end_expansions;
     std::optional<OrderKey> next_order;
-    bool late_recovery = false;
+    std::size_t end_staging_bytes = 0U;
+    std::size_t end_projected_rows = 0U;
+    bool hole_fill = false;
 };
+
+struct EvictionTask final {
+    ChannelKey channel{};
+    std::uint64_t evict_before = 0U;
+    std::optional<std::uint64_t> current_sequence;
+};
+
+[[nodiscard]] std::size_t PendingCommitPayloadOwnedBytes(
+    std::size_t revision_capacity,
+    std::size_t dependency_count) noexcept {
+    std::size_t bytes = sizeof(EventRevisionBatch) + 4U * sizeof(void*);
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(revision_capacity, sizeof(EventRevision)));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            dependency_count,
+            TreeNodeOwnedBytes<RawTickDependency>()));
+    return bytes;
+}
+
+[[nodiscard]] std::size_t RepairOwnedBytes(
+    const RepairTransaction& repair) noexcept {
+    std::size_t bytes = sizeof(RepairTransaction);
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            repair.tasks.size(),
+            TreeNodeOwnedBytes<
+                std::pair<const OrderKey, RepairOrderTask>>()));
+    for (const auto& [key, task] : repair.tasks) {
+        static_cast<void>(key);
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                task.dirty.new_sequences.size(),
+                TreeNodeOwnedBytes<std::uint64_t>()));
+    }
+    bytes = SaturatingAdd(
+        bytes, DequeOwnedBytes<OrderKey>(repair.ready_orders.size()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(repair.ready_order_set.size(),
+                           TreeNodeOwnedBytes<OrderKey>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            repair.eval_patch.size(),
+            TreeNodeOwnedBytes<
+                std::pair<const RoleCacheKey, RepairEvalPatch>>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            repair.dirty_bundles.size(),
+            TreeNodeOwnedBytes<std::pair<const FactKey, bool>>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(repair.raw_dependencies.size(),
+                           TreeNodeOwnedBytes<RawTickDependency>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(repair.inserted_facts.size(),
+                           TreeNodeOwnedBytes<FactKey>()));
+    bytes = SaturatingAdd(
+        bytes,
+        DequeOwnedBytes<EndExpansionTask>(repair.end_expansions.size()));
+    return bytes;
+}
+
+[[nodiscard]] std::size_t PendingProjectionCutOwnedBytes(
+    const PendingProjectionCut& cut) noexcept {
+    std::size_t bytes = sizeof(PendingProjectionCut);
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.inserted.capacity(), sizeof(FactKey)));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            cut.inserted_dependencies.capacity(),
+            sizeof(std::pair<FactKey, RawTickDependency>)));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.phase_spans.capacity(),
+                           sizeof(PhaseScanSpan)));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.end_expansions.capacity(),
+                           sizeof(EndExpansionTask)));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            cut.retention_requests.size(),
+            TreeNodeOwnedBytes<
+                std::pair<const ChannelKey, std::uint64_t>>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.dependencies.size(),
+                           TreeNodeOwnedBytes<RawTickDependency>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            cut.phase_dirty_bundles.size(),
+            TreeNodeOwnedBytes<std::pair<const FactKey, bool>>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            cut.phase_dirty_orders.size(),
+            TreeNodeOwnedBytes<std::pair<const OrderKey, DirtyOrder>>()));
+    for (const auto& [order, dirty] : cut.phase_dirty_orders) {
+        static_cast<void>(order);
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                dirty.new_sequences.size(),
+                TreeNodeOwnedBytes<std::uint64_t>()));
+    }
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.repair_orders.size(),
+                           TreeNodeOwnedBytes<OrderKey>()));
+    bytes = SaturatingAdd(
+        bytes,
+        SaturatingMultiply(cut.repair_facts.size(),
+                           TreeNodeOwnedBytes<FactKey>()));
+    bytes = SaturatingAdd(
+        bytes, DequeOwnedBytes<OrderKey>(cut.order_frontier.size()));
+    bytes = SaturatingAdd(
+        bytes, DequeOwnedBytes<FactKey>(cut.fact_frontier.size()));
+    return bytes;
+}
+
+[[nodiscard]] std::size_t PhaseFactWorkBytes(
+    const FactRecord& record) noexcept {
+    return SaturatingAdd(
+        SaturatingAdd(sizeof(CanonicalTick), sizeof(FactRecord)),
+        SaturatingMultiply(
+            record.roles.size(), sizeof(std::pair<OrderKey, OrderRole>)));
+}
+
+[[nodiscard]] constexpr std::size_t EndCandidateStagingBytes() noexcept {
+    return sizeof(OrderUseNode) +
+        sizeof(std::pair<OrderKey, OrderRole>) +
+        TreeNodeOwnedBytes<std::pair<const OrderKey, RepairOrderTask>>() +
+        TreeNodeOwnedBytes<std::uint64_t>() +
+        TreeNodeOwnedBytes<
+            std::pair<const RoleCacheKey, RepairEvalPatch>>();
+}
 
 struct AtomicEventWorkerStats final {
     std::atomic<std::uint64_t> facts_journaled{0U};
@@ -1442,12 +1771,36 @@ struct AtomicEventWorkerStats final {
     std::atomic<std::uint64_t> pending_raw_commits{0U};
     std::atomic<std::uint64_t> acknowledged_raw_dependencies{0U};
     std::atomic<std::uint64_t> revision_batches_submitted{0U};
+    std::atomic<std::uint64_t> persistence_groups_submitted{0U};
+    std::atomic<std::uint64_t> persistence_group_batches_max{0U};
+    std::atomic<std::uint64_t> persistence_group_rows_max{0U};
+    std::atomic<std::uint64_t> persistence_group_bytes_max{0U};
+    std::atomic<std::uint64_t> pending_revision_bytes{0U};
+    std::atomic<std::uint64_t> pending_revision_bytes_high_watermark{0U};
     std::atomic<std::uint64_t> active_repair_orders{0U};
+    std::atomic<std::uint64_t> active_repair_bytes{0U};
+    std::atomic<std::uint64_t> active_repair_bytes_high_watermark{0U};
+    std::atomic<std::uint64_t> phase_normalization_slices{0U};
+    std::atomic<std::uint64_t> phase_facts_scanned{0U};
+    std::atomic<std::uint64_t> phase_dirty_roles_discovered{0U};
+    std::atomic<std::uint64_t> pending_phase_bytes{0U};
+    std::atomic<std::uint64_t> pending_phase_bytes_high_watermark{0U};
     std::atomic<std::uint64_t> ordered_batch_fast_path{0U};
     std::atomic<std::uint64_t> unordered_batch_sorts{0U};
     std::atomic<std::uint64_t> barrier_index_orders_visited{0U};
+    std::atomic<std::uint64_t> end_expansion_slices{0U};
+    std::atomic<std::uint64_t> end_candidates_processed{0U};
     std::atomic<std::uint64_t> source_only_fast_path{0U};
+    std::atomic<std::uint64_t> order_uses_compacted{0U};
+    std::atomic<std::uint64_t> facts_evicted{0U};
+    std::atomic<std::uint64_t> eviction_slices{0U};
+    std::atomic<std::uint64_t> hot_facts{0U};
+    std::atomic<std::uint64_t> hot_fact_bytes{0U};
+    std::atomic<std::uint64_t> hot_fact_bytes_high_watermark{0U};
+    std::atomic<std::uint64_t> order_history_bytes{0U};
+    std::atomic<std::uint64_t> order_history_bytes_high_watermark{0U};
     std::atomic<bool> repair_pending{false};
+    std::atomic<bool> eviction_pending{false};
 };
 
 [[nodiscard]] bool ValidTradeDate(std::uint32_t value) noexcept {
@@ -1476,7 +1829,8 @@ struct AtomicEventWorkerStats final {
     const CanonicalTick& tick = input.tick;
     const Market market = tick.common.identity.market;
     if (!input.catalog_match || tick.common.trade_date != config.trade_date ||
-        tick.common.instrument_id == 0U || tick.common.channel == 0U ||
+        tick.common.instrument_id == 0U ||
+        (market == Market::kShanghai && tick.common.channel == 0U) ||
         tick.common.native_sequence == 0U ||
         tick.common.ingress_sequence == 0U ||
         (market != Market::kShanghai && market != Market::kShenzhen) ||
@@ -1489,6 +1843,26 @@ struct AtomicEventWorkerStats final {
     }
     return tick.common.kind == CanonicalKind::kShenzhenOrder ||
            tick.common.kind == CanonicalKind::kShenzhenTransaction;
+}
+
+[[nodiscard]] bool AdmissionValid(
+    const EventWorkerConfig& config,
+    const EventInput& input) noexcept {
+    const EventAdmissionToken& token = input.admission;
+    const std::uint64_t sequence = input.tick.common.native_sequence;
+    if (token.feed_session_epoch != config.feed_session_epoch ||
+        token.expected_sequence == 0U || token.admission_floor == 0U ||
+        token.retention_floor == 0U || token.dispatch_fence == 0U ||
+        token.admission_floor > token.expected_sequence ||
+        sequence == std::numeric_limits<std::uint64_t>::max()) {
+        return false;
+    }
+    if (token.sequence_class == EventSequenceClass::kOrdered) {
+        return sequence >= token.expected_sequence;
+    }
+    return token.sequence_class == EventSequenceClass::kHoleFill &&
+           sequence >= token.admission_floor &&
+           sequence < token.expected_sequence;
 }
 
 [[nodiscard]] bool DirectOrderSide(Side side) noexcept {
@@ -1632,7 +2006,7 @@ struct AtomicEventWorkerStats final {
 [[nodiscard]] bool RoleObservableEqual(const RoleEval& left,
                                        const RoleEval& right) noexcept {
     return left.post_state == right.post_state &&
-           left.order_fragment == right.order_fragment &&
+           left.order_operation == right.order_operation &&
            left.source_quality_contribution ==
                right.source_quality_contribution &&
            left.referenced_order_found == right.referenced_order_found &&
@@ -1642,31 +2016,83 @@ struct AtomicEventWorkerStats final {
 
 [[nodiscard]] StateVersion LatestBefore(const OrderHistory& history,
                                         std::uint64_t sequence) noexcept {
-    const auto position = history.versions.lower_bound(sequence);
-    if (position == history.versions.begin()) {
-        return {};
+    const auto position = history.suffix.lower_bound(sequence);
+    if (position != history.suffix.begin()) {
+        const OrderUseNode& node = std::prev(position)->second;
+        if (node.evaluated) {
+            return StateVersion{
+                node.eval.post_state, node.eval.input_set_hash};
+        }
     }
-    return std::prev(position)->second;
+    if (history.baseline.last_sequence != 0U &&
+        history.baseline.last_sequence < sequence) {
+        return history.baseline.version;
+    }
+    return {};
+}
+
+[[nodiscard]] const OrderState* LatestOrderState(
+    const OrderHistory& history) noexcept {
+    for (auto use = history.suffix.rbegin();
+         use != history.suffix.rend(); ++use) {
+        if (use->second.evaluated) {
+            return use->second.eval.post_state.has_value()
+                ? &*use->second.eval.post_state
+                : nullptr;
+        }
+    }
+    return history.baseline.version.state.has_value()
+        ? &*history.baseline.version.state
+        : nullptr;
 }
 
 [[nodiscard]] bool SetOrderUse(OrderHistory* history,
                                std::uint64_t sequence,
                                OrderRole role) {
-    const auto existing = history->uses.find(sequence);
-    if (existing != history->uses.end() && existing->second == role) {
+    if (sequence == 0U ||
+        sequence < history->baseline.compacted_before) {
+        return false;
+    }
+    auto existing = history->suffix.lower_bound(sequence);
+    if (existing != history->suffix.end() &&
+        existing->first == sequence &&
+        existing->second.role == role) {
         return true;
     }
     if (history->generation ==
         std::numeric_limits<std::uint64_t>::max()) {
         return false;
     }
-    if (existing == history->uses.end()) {
-        history->uses.emplace(sequence, role);
+    if (existing == history->suffix.end()) {
+        history->suffix.emplace_hint(
+            existing, sequence, OrderUseNode{role});
+    } else if (existing->first != sequence) {
+        history->suffix.emplace_hint(
+            existing, sequence, OrderUseNode{role});
     } else {
-        existing->second = role;
+        existing->second.role = role;
+        existing->second.evaluated = false;
+        existing->second.eval = {};
     }
     ++history->generation;
     return true;
+}
+
+[[nodiscard]] OrderUseNode* FindOrderUse(OrderHistory* history,
+                                         std::uint64_t sequence) noexcept {
+    auto position = history->suffix.find(sequence);
+    return position != history->suffix.end()
+        ? &position->second
+        : nullptr;
+}
+
+[[nodiscard]] const OrderUseNode* FindOrderUse(
+    const OrderHistory& history,
+    std::uint64_t sequence) noexcept {
+    const auto position = history.suffix.find(sequence);
+    return position != history.suffix.end()
+        ? &position->second
+        : nullptr;
 }
 
 [[nodiscard]] Identifier128 RecoveryRunIdentifier(
@@ -1714,7 +2140,14 @@ struct AtomicEventWorkerStats final {
 class EventWorker::Impl final {
 public:
     Impl(EventWorkerConfig config, EventRevisionSink* sink)
-        : config_(std::move(config)), sink_(sink) {
+        : config_(std::move(config)),
+          sink_(sink),
+          barriers_(config_.maximum_hot_facts),
+          instrument_facts_(config_.maximum_hot_facts),
+          phase_statuses_(config_.maximum_hot_facts),
+          order_histories_(config_.maximum_carry_orders),
+          channel_facts_(config_.maximum_hot_facts),
+          order_history_bytes_(order_histories_.directory_owned_bytes()) {
         // Reserve the complete bounded ACK index up front.  This keeps the
         // owner hot path free of rehash pauses while preserving the explicit
         // in-memory capacity/fail-closed contract.
@@ -1728,15 +2161,33 @@ public:
         reserve_bounded(&facts_, 65'536U);
         batch_tick_cache_.reserve(65'536U);
         reserve_bounded(&channel_states_, 1'024U);
-        reserve_bounded(&barriers_, 4'096U);
-        reserve_bounded(&instrument_facts_, 4'096U);
-        reserve_bounded(&phase_statuses_, 4'096U);
-        reserve_bounded(&orders_by_instrument_channel_,
-                        4'096U);
-        reserve_bounded(&order_histories_, config_.maximum_orders);
-        reserve_bounded(&role_cache_, config_.maximum_orders);
         reserve_bounded(&bundle_cache_, 65'536U);
-        reserve_bounded(&event_heads_, config_.maximum_cached_events);
+        reserve_bounded(&event_heads_, 65'536U);
+        reserve_bounded(&gap_ranges_, 1'024U);
+        hot_index_bytes_ = SaturatingAdd(
+            SaturatingAdd(barriers_.directory_owned_bytes(),
+                          instrument_facts_.directory_owned_bytes()),
+            SaturatingAdd(phase_statuses_.directory_owned_bytes(),
+                          channel_facts_.directory_owned_bytes()));
+        hot_fact_bytes_ = hot_index_bytes_;
+        pending_revision_bytes_ = DequeOwnedBytes<PendingCommit>(0U);
+        if (pending_revision_bytes_ >
+            config_.maximum_pending_revision_bytes) {
+            throw std::length_error(
+                "Event pending-commit deque exceeds byte cap");
+        }
+        if (order_history_bytes_ >
+            config_.maximum_order_history_bytes) {
+            throw std::length_error(
+                "Event order-history directory exceeds byte cap");
+        }
+        if (hot_fact_bytes_ > config_.maximum_hot_fact_bytes) {
+            throw std::length_error(
+                "Event hot-index directory exceeds byte cap");
+        }
+        PublishPendingRevisionBytes();
+        PublishOrderHistoryBytes();
+        PublishHotFactBytes();
     }
 
     [[nodiscard]] EventApplyResult ApplyBatch(
@@ -1746,11 +2197,16 @@ public:
             result.code = EventApplyCode::kFailed;
             return result;
         }
+        if (projection_input_fenced()) {
+            return Failure(
+                &result,
+                "Event owner input overtook a projection fence");
+        }
         if (inputs.empty()) {
             result.code = EventApplyCode::kDuplicateOnly;
             return result;
         }
-        if (!DrainDurableCommits()) {
+        if (!AdvanceDurableCommits()) {
             result.code = EventApplyCode::kSinkFailed;
             return result;
         }
@@ -1760,6 +2216,59 @@ public:
         }
 
         try {
+            std::map<ChannelKey, std::pair<std::uint64_t, std::uint64_t>>
+                protocol_cursors;
+            for (const EventInput& input : inputs) {
+                if (!StructurallyValid(config_, input)) {
+                    return Failure(
+                        &result, "Event input is structurally invalid");
+                }
+                if (!AdmissionValid(config_, input)) {
+                    return Failure(&result,
+                                   "Event admission token is invalid");
+                }
+                const ChannelKey channel{
+                    config_.trade_date,
+                    input.tick.common.identity.market,
+                    input.tick.common.channel};
+                const auto live = channel_states_.find(channel);
+                auto [cursor, inserted_cursor] = protocol_cursors.try_emplace(
+                    channel,
+                    live == channel_states_.end()
+                        ? std::pair<std::uint64_t, std::uint64_t>{0U, 0U}
+                        : std::pair{
+                              live->second.generation,
+                              live->second.applied_dispatch_fence});
+                static_cast<void>(inserted_cursor);
+                bool generation_valid = false;
+                if (input.admission.sequence_class ==
+                    EventSequenceClass::kOrdered) {
+                    generation_valid =
+                        input.admission.generation == cursor->second.first;
+                } else {
+                    const auto gaps = gap_ranges_.find(channel);
+                    if (gaps != gap_ranges_.end()) {
+                        const auto gap = gaps->second.find(
+                            input.admission.generation);
+                        generation_valid = gap != gaps->second.end() &&
+                            input.tick.common.native_sequence >=
+                                gap->second.first &&
+                            input.tick.common.native_sequence <=
+                                gap->second.second;
+                    }
+                }
+                if (!generation_valid ||
+                    input.admission.dispatch_fence <= cursor->second.second ||
+                    (live != channel_states_.end() &&
+                     input.tick.common.native_sequence <
+                         live->second.sealed_before)) {
+                    return Failure(
+                        &result,
+                        "Event admission generation/fence is stale");
+                }
+                cursor->second.second = input.admission.dispatch_fence;
+            }
+
             batch_tick_cache_.clear();
             std::vector<FactKey> inserted;
             inserted.reserve(inputs.size());
@@ -1769,6 +2278,7 @@ public:
             std::vector<CanonicalTick> journal_ticks;
             journal_ticks.reserve(inputs.size());
             std::map<ChannelKey, std::uint64_t> cut_frontiers;
+            std::map<ChannelKey, std::uint64_t> retention_requests;
             std::set<RawTickDependency> dependencies;
             bool saw_conflict = false;
             bool saw_invalid = false;
@@ -1777,16 +2287,10 @@ public:
             // Capture every touched frontier before this cut changes it, then
             // journal all facts before registering or applying any role.
             for (const EventInput& input : inputs) {
-                if (!StructurallyValid(config_, input)) {
-                    saw_invalid = true;
-                    source_only_candidate = false;
-                    continue;
-                }
-                if (input.upstream_conflict) {
-                    continue;
-                }
                 if (input.tick.common.identity.market != Market::kShanghai ||
-                    input.tick.action != TickAction::kStatus) {
+                    input.tick.action != TickAction::kStatus ||
+                    input.admission.sequence_class ==
+                        EventSequenceClass::kHoleFill) {
                     source_only_candidate = false;
                 }
                 const FactKey key = MakeFactKey(input.tick);
@@ -1815,9 +2319,6 @@ public:
 
             std::size_t admission_index = 0U;
             for (const EventInput& input : inputs) {
-                if (!StructurallyValid(config_, input)) {
-                    continue;
-                }
                 dependencies.insert(RawTickDependency{
                     input.tick.common.ingress_sequence,
                     input.tick.common.kind});
@@ -1825,17 +2326,24 @@ public:
                 const ChannelKey channel{
                     key.trade_date, key.market, key.channel};
                 EventChannelState& channel_state = channel_states_[channel];
-                if (input.committed_next_sequence != 0U) {
-                    channel_state.committed_next_sequence = std::max(
-                        channel_state.committed_next_sequence,
-                        input.committed_next_sequence);
-                }
-                channel_state.gap_epoch = std::max(
-                    channel_state.gap_epoch, input.observed_gap_epoch);
-                if (input.upstream_conflict) {
-                    ++stats_.source_conflicts;
-                    saw_conflict = true;
-                    continue;
+                channel_state.feed_session_epoch =
+                    config_.feed_session_epoch;
+                channel_state.expected_sequence = std::max(
+                    channel_state.expected_sequence,
+                    std::max(input.admission.expected_sequence,
+                             key.native_sequence + 1U));
+                channel_state.generation = std::max(
+                    channel_state.generation, input.admission.generation);
+                channel_state.admission_floor = std::max(
+                    channel_state.admission_floor,
+                    input.admission.admission_floor);
+                channel_state.applied_dispatch_fence =
+                    input.admission.dispatch_fence;
+                auto [request, new_request] = retention_requests.try_emplace(
+                    channel, input.admission.retention_floor);
+                if (!new_request) {
+                    request->second = std::max(
+                        request->second, input.admission.retention_floor);
                 }
                 const std::size_t current_admission = admission_index++;
                 const journal::AdmitResult& admission =
@@ -1862,6 +2370,10 @@ public:
                         "Event FactJournal consumer state diverged from "
                         "Event metadata");
                 }
+                if (facts_.size() >= config_.maximum_hot_facts) {
+                    return CapacityFailure(
+                        &result, "Event hot fact capacity exhausted");
+                }
                 const CanonicalTick& winner =
                     journal_winners[current_admission];
                 if (MakeFactKey(winner) != key) {
@@ -1877,9 +2389,17 @@ public:
                 record.projected_phase_valid =
                     (winner.validity & ingest::kTickPhaseValid) != 0U;
                 record.projectable = ProjectionInputValid(winner);
+                record.phase_status =
+                    key.market == Market::kShanghai &&
+                    winner.action == TickAction::kStatus &&
+                    record.projected_phase_valid;
+                const InstrumentChannelKey instrument_range =
+                    InstrumentChannel(winner);
+                saw_invalid = saw_invalid || !record.projectable;
                 source_only_candidate = source_only_candidate &&
                     record.projectable;
-                record.late = input.late_recovery ||
+                record.late = input.admission.sequence_class ==
+                                  EventSequenceClass::kHoleFill ||
                     key.native_sequence <= cut_frontiers.at(channel);
                 if (record.projectable) {
                     record.barrier =
@@ -1888,22 +2408,39 @@ public:
                         (winner.validity & ingest::kTickPhaseValid) != 0U &&
                         winner.phase == TradingPhase::kEnded;
                 }
+                record.accounted_bytes = FactOwnedBytes(
+                    record, nullptr, 0U);
+                if (record.accounted_bytes >
+                        config_.maximum_hot_fact_bytes ||
+                    hot_fact_bytes_ >
+                        config_.maximum_hot_fact_bytes -
+                            record.accounted_bytes) {
+                    return CapacityFailure(
+                        &result, "Event hot fact byte capacity exhausted");
+                }
                 batch_tick_cache_.emplace_back(key, winner);
                 facts_.emplace(key, std::move(record));
+                hot_fact_bytes_ += facts_.at(key).accounted_bytes;
+                stats_.hot_facts.store(
+                    facts_.size(), std::memory_order_relaxed);
+                PublishHotFactBytes();
+                if (!InsertChannelFact(channel, key, &result)) {
+                    return result;
+                }
                 inserted.push_back(key);
                 inserted_dependencies.emplace_back(
                     key, RawTickDependency{
                         input.tick.common.ingress_sequence,
                         input.tick.common.kind});
-                InsertInstrumentFact(
-                    &instrument_facts_[InstrumentChannel(winner)],
-                    key.native_sequence);
-                if (key.market == Market::kShanghai &&
-                    winner.action == TickAction::kStatus &&
-                    (winner.validity & ingest::kTickPhaseValid) != 0U) {
-                    InsertPhase(
-                        &phase_statuses_[InstrumentChannel(winner)],
-                        key.native_sequence, winner.phase);
+                if (!InsertInstrumentFactIndex(
+                        instrument_range, key.native_sequence, &result)) {
+                    return result;
+                }
+                if (facts_.at(key).phase_status &&
+                    !InsertPhaseIndex(
+                        instrument_range, key.native_sequence,
+                        winner.phase, &result)) {
+                    return result;
                 }
                 channel_state.journal_tail = std::max(
                     channel_state.journal_tail, key.native_sequence);
@@ -1917,8 +2454,19 @@ public:
             }
 
             if (inserted.empty()) {
-                QueueNoopDependencies(std::move(dependencies));
-                static_cast<void>(DrainDurableCommits());
+                if (!QueueNoopDependencies(std::move(dependencies))) {
+                    return CapacityFailure(
+                        &result,
+                        "Event pending revision byte capacity exhausted");
+                }
+                static_cast<void>(AdvanceDurableCommits());
+                for (const auto& [channel, floor] : retention_requests) {
+                    QueueEviction(channel, floor);
+                }
+                if (!ContinueEviction()) {
+                    result.code = EventApplyCode::kFailed;
+                    return result;
+                }
                 result.code = saw_conflict
                     ? EventApplyCode::kSourceConflict
                     : (saw_invalid ? EventApplyCode::kInvalidInput
@@ -1948,221 +2496,36 @@ public:
             if (source_only_fast) {
                 ++stats_.source_only_fast_path;
             }
-            std::set<FactKey> phase_changed;
-            if (!source_only_fast &&
-                !NormalizeShanghaiPhases(inserted, &phase_changed)) {
-                return Failure(&result,
-                               "Event Shanghai phase normalization failed");
-            }
-            std::map<OrderKey, DirtyOrder> dirty_orders;
-            std::map<FactKey, bool> dirty_bundles;
-            for (const FactKey& key : inserted) {
-                FactRecord& record = facts_.at(key);
-                dirty_bundles[key] = record.late;
-                if (!record.projectable) {
-                    saw_invalid = true;
-                    continue;
-                }
-                if (!source_only_fast) {
-                    if (!RegisterFactUses(key, &record, &dirty_orders,
-                                          &result)) {
-                        if (!healthy_) {
-                            result.code = EventApplyCode::kFailed;
-                            return result;
-                        }
-                        return CapacityFailure(
-                            &result,
-                            "Event OrderUseIndex capacity exhausted");
-                    }
-                } else if (record.barrier) {
-                    // A source-only cut has no existing orders to walk, but
-                    // END must still be retained for an order that arrives
-                    // later through late recovery.  RegisterFactUses also
-                    // applies the barrier to existing orders; this branch
-                    // only needs the persistent in-memory barrier index.
-                    barriers_[InstrumentChannel(key, record)]
-                        [key.native_sequence] = key;
-                }
-            }
-            for (const FactKey& key : phase_changed) {
-                if (std::binary_search(inserted.begin(), inserted.end(),
-                                       key)) {
-                    continue;
-                }
-                FactRecord& record = facts_.at(key);
-                dirty_bundles[key] = true;
-                for (const auto& [order, role] : record.roles) {
-                    static_cast<void>(role);
-                    DirtyOrder& dirty = dirty_orders[order];
-                    dirty.new_sequences.insert(key.native_sequence);
-                    dirty.late = true;
-                }
-            }
-
-            // Split this journal cut by connected components in the
-            // Fact-to-Order graph. A fact joins repair when it is itself late,
-            // references an active dirty order, or is connected through its
-            // other trade role. Disjoint components retain the append path.
-            std::set<OrderKey> repair_orders;
-            std::set<FactKey> repair_facts;
-            for (const auto& [order, dirty] : dirty_orders) {
-                if (dirty.late ||
-                    (active_repair_.has_value() &&
-                     active_repair_->tasks.contains(order))) {
-                    repair_orders.insert(order);
-                }
-            }
-            for (const auto& [key, late] : dirty_bundles) {
-                if (late) {
-                    repair_facts.insert(key);
-                }
-            }
-            bool expanded = true;
-            while (expanded) {
-                expanded = false;
-                for (const FactKey& key : repair_facts) {
-                    const FactRecord& record = facts_.at(key);
-                    for (const auto& [order, role] : record.roles) {
-                        static_cast<void>(role);
-                        if (dirty_orders.contains(order) &&
-                            repair_orders.insert(order).second) {
-                            expanded = true;
-                        }
-                    }
-                }
-                for (const OrderKey& order : repair_orders) {
-                    const auto dirty = dirty_orders.find(order);
-                    if (dirty == dirty_orders.end()) {
-                        continue;
-                    }
-                    for (const std::uint64_t sequence :
-                         dirty->second.new_sequences) {
-                        const FactKey key{
-                            order.trade_date, order.market,
-                            order.channel, sequence};
-                        if (dirty_bundles.contains(key) &&
-                            repair_facts.insert(key).second) {
-                            expanded = true;
-                        }
-                    }
-                }
-            }
-
-            std::map<OrderKey, DirtyOrder> repair_dirty_orders;
-            std::map<OrderKey, DirtyOrder> live_dirty_orders;
-            for (const auto& [order, dirty] : dirty_orders) {
-                (repair_orders.contains(order)
-                     ? repair_dirty_orders
-                     : live_dirty_orders)
-                    .emplace(order, dirty);
-            }
-            std::map<FactKey, bool> repair_dirty_bundles;
-            std::map<FactKey, bool> live_dirty_bundles;
-            for (const auto& [key, late] : dirty_bundles) {
-                (repair_facts.contains(key)
-                     ? repair_dirty_bundles
-                     : live_dirty_bundles)
-                    .emplace(key, late);
-            }
-            std::vector<FactKey> repair_inserted;
-            std::vector<FactKey> live_inserted;
-            repair_inserted.reserve(inserted.size());
-            live_inserted.reserve(inserted.size());
-            for (const FactKey& key : inserted) {
-                (repair_facts.contains(key)
-                     ? repair_inserted
-                     : live_inserted)
-                    .push_back(key);
-            }
-
-            std::set<RawTickDependency> repair_dependencies;
-            std::set<RawTickDependency> live_dependencies;
-            const auto add_fact_dependency = [&inserted_dependencies](
-                const FactKey& key,
-                std::set<RawTickDependency>* output) -> bool {
-                const auto dependency = std::lower_bound(
-                    inserted_dependencies.begin(),
-                    inserted_dependencies.end(), key,
-                    [](const auto& entry, const FactKey& value) {
-                        return entry.first < value;
-                    });
-                if (dependency == inserted_dependencies.end()) {
-                    return false;
-                }
-                if (dependency->first != key) {
-                    return false;
-                }
-                output->insert(dependency->second);
-                return true;
-            };
-            for (const FactKey& key : repair_inserted) {
-                if (!add_fact_dependency(key, &repair_dependencies)) {
-                    return Failure(
-                        &result, "Event raw dependency fact read failed");
-                }
-            }
-            for (const FactKey& key : live_inserted) {
-                if (!add_fact_dependency(key, &live_dependencies)) {
-                    return Failure(
-                        &result, "Event raw dependency fact read failed");
-                }
-            }
-            for (const RawTickDependency& dependency : dependencies) {
-                if (!repair_dependencies.contains(dependency) &&
-                    !live_dependencies.contains(dependency)) {
-                    (!live_inserted.empty()
-                         ? live_dependencies
-                         : repair_dependencies)
-                        .insert(dependency);
-                }
-            }
-
-            const bool has_repair_work =
-                !repair_dirty_orders.empty() ||
-                !repair_dirty_bundles.empty();
-            if (has_repair_work &&
-                !MergeRepair(
-                    repair_dirty_orders, repair_dirty_bundles,
-                    repair_inserted, std::move(repair_dependencies))) {
-                return Failure(
-                    &result, "Event repair transaction merge failed");
-            }
-
-            std::map<RoleCacheKey, RoleEval> eval_patch;
-            std::vector<OrderPatch> order_patches;
-            order_patches.reserve(live_dirty_orders.size());
-            for (const auto& [order, dirty] : live_dirty_orders) {
-                OrderPatch patch{};
-                if (!RecomputeOrder(order, dirty, &patch, &eval_patch,
-                                    &live_dirty_bundles, &result)) {
-                    return Failure(&result,
-                                   "Event order-role projection failed");
-                }
-                order_patches.push_back(std::move(patch));
-            }
-            if (!live_dirty_bundles.empty() || !live_inserted.empty()) {
-                if (!CommitProjection(
-                        &order_patches, &eval_patch,
-                        &live_dirty_bundles, live_inserted,
-                        std::move(live_dependencies), false, &result)) {
-                    return result;
-                }
-            } else if (!live_dependencies.empty()) {
-                QueueNoopDependencies(std::move(live_dependencies));
-            }
-            result.code = saw_conflict
-                ? EventApplyCode::kSourceConflict
-                : (saw_invalid ? EventApplyCode::kInvalidInput
-                               : EventApplyCode::kApplied);
-            if (!DrainDurableCommits()) {
-                result.code = EventApplyCode::kSinkFailed;
+            PendingProjectionCut cut{};
+            cut.inserted = std::move(inserted);
+            cut.inserted_dependencies = std::move(inserted_dependencies);
+            cut.retention_requests = std::move(retention_requests);
+            cut.dependencies = std::move(dependencies);
+            cut.source_only_fast = source_only_fast;
+            cut.saw_conflict = saw_conflict;
+            cut.saw_invalid = saw_invalid;
+            if (!BuildPhaseScanSpans(&cut, &result)) {
                 return result;
             }
-            if (active_repair_.has_value() &&
-                !AdvanceRepairSlice(has_repair_work ? &result : nullptr)) {
+            cut.accounted_bytes = PendingProjectionCutOwnedBytes(cut);
+            if (!InstallPendingProjectionCut(std::move(cut), &result)) {
                 return result;
             }
-            result.repair_pending = active_repair_.has_value();
+            if (!AdvancePendingProjectionCut(&result)) {
+                return result;
+            }
+            if (pending_projection_cut_.has_value()) {
+                result.code = saw_conflict
+                    ? EventApplyCode::kSourceConflict
+                    : (saw_invalid ? EventApplyCode::kInvalidInput
+                                   : EventApplyCode::kApplied);
+            }
+            if (!pending_projection_cut_.has_value() &&
+                active_repair_.has_value() &&
+                !AdvanceRepairSlice(&result)) {
+                return result;
+            }
+            result.repair_pending = repair_pending();
             return result;
         } catch (const std::bad_alloc&) {
             return CapacityFailure(&result,
@@ -2174,6 +2537,323 @@ public:
         } catch (...) {
             return Failure(&result,
                            "Event worker failed with unknown exception");
+        }
+    }
+
+    [[nodiscard]] bool ApplyGapOpen(const GapOpen& gap) noexcept {
+        if (!healthy_) {
+            return false;
+        }
+        if (projection_input_fenced()) {
+            SetFatal("Event GapOpen overtook a projection fence");
+            return false;
+        }
+        if (gap.feed_session_epoch != config_.feed_session_epoch ||
+            (gap.market == Market::kShanghai && gap.channel == 0U) ||
+            gap.first_missing == 0U ||
+            gap.last_missing < gap.first_missing || gap.generation == 0U ||
+            gap.dispatch_fence == 0U ||
+            (gap.market != Market::kShanghai &&
+             gap.market != Market::kShenzhen)) {
+            SetFatal("Event GapOpen is invalid");
+            return false;
+        }
+        try {
+            const ChannelKey channel{
+                config_.trade_date, gap.market, gap.channel};
+            EventChannelState& state = channel_states_[channel];
+            if (gap.dispatch_fence <= state.applied_dispatch_fence ||
+                gap.generation <= state.generation) {
+                SetFatal("Event GapOpen generation/fence is stale");
+                return false;
+            }
+            auto& ranges = gap_ranges_[channel];
+            if (!ranges.emplace(
+                    gap.generation,
+                    std::pair{gap.first_missing, gap.last_missing}).second) {
+                SetFatal("Event GapOpen generation is duplicated");
+                return false;
+            }
+            state.feed_session_epoch = config_.feed_session_epoch;
+            state.generation = gap.generation;
+            state.applied_dispatch_fence = gap.dispatch_fence;
+            state.gap_open = true;
+            return true;
+        } catch (...) {
+            SetFatal("Event GapOpen allocation failed");
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool ApplyChannelSeal(const ChannelSeal& seal) noexcept {
+        if (!healthy_) {
+            return false;
+        }
+        if (projection_input_fenced()) {
+            SetFatal("Event ChannelSeal overtook a projection fence");
+            return false;
+        }
+        if (seal.feed_session_epoch != config_.feed_session_epoch ||
+            (seal.market == Market::kShanghai && seal.channel == 0U) ||
+            seal.evict_before == 0U ||
+            seal.dispatch_fence == 0U ||
+            (seal.market != Market::kShanghai &&
+             seal.market != Market::kShenzhen)) {
+            SetFatal("Event ChannelSeal is invalid");
+            return false;
+        }
+        try {
+            const ChannelKey channel{
+                config_.trade_date, seal.market, seal.channel};
+            EventChannelState& state = channel_states_[channel];
+            if (seal.dispatch_fence <= state.applied_dispatch_fence ||
+                seal.generation != state.generation ||
+                seal.evict_before < state.sealed_before) {
+                SetFatal("Event ChannelSeal generation/fence is stale");
+                return false;
+            }
+            state.feed_session_epoch = config_.feed_session_epoch;
+            state.applied_dispatch_fence = seal.dispatch_fence;
+            QueueEviction(channel, seal.evict_before);
+            return ContinueEviction();
+        } catch (...) {
+            SetFatal("Event ChannelSeal allocation failed");
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool ContinueEviction() noexcept {
+        if (!healthy_) {
+            return false;
+        }
+        if (pending_projection_cut_.has_value() ||
+            active_repair_.has_value() || eviction_ready_.empty()) {
+            stats_.eviction_pending.store(
+                !eviction_tasks_.empty(), std::memory_order_release);
+            return true;
+        }
+        ++stats_.eviction_slices;
+        std::size_t nodes = 0U;
+        std::size_t bytes = 0U;
+        try {
+            while (!eviction_ready_.empty()) {
+                const ChannelKey channel = eviction_ready_.front();
+                eviction_ready_.pop_front();
+                eviction_ready_set_.erase(channel);
+                auto task_position = eviction_tasks_.find(channel);
+                if (task_position == eviction_tasks_.end()) {
+                    continue;
+                }
+                EvictionTask& task = task_position->second;
+                ChannelFactRangeIndex* channel_facts =
+                    channel_facts_.Find(channel);
+                bool complete = channel_facts == nullptr ||
+                    channel_facts->empty() ||
+                    channel_facts->begin()->first >=
+                        task.evict_before;
+                while (!complete) {
+                    auto fact_index = task.current_sequence.has_value()
+                        ? channel_facts->find(*task.current_sequence)
+                        : channel_facts->begin();
+                    if (fact_index == channel_facts->end() ||
+                        fact_index->first >= task.evict_before) {
+                        complete = true;
+                        break;
+                    }
+                    task.current_sequence = fact_index->first;
+                    const FactKey key = fact_index->second;
+                    const auto fact_position = facts_.find(key);
+                    if (fact_position == facts_.end()) {
+                        SetFatal("Event eviction FactIndex diverged");
+                        return false;
+                    }
+                    FactRecord& record = fact_position->second;
+                    while (!record.roles.empty()) {
+                        const OrderKey order = record.roles.front().first;
+                        const std::size_t order_bytes_before =
+                            order_history_bytes_;
+                        const std::size_t hot_bytes_before = hot_fact_bytes_;
+                        if (!CompactOrderUse(order, key.native_sequence)) {
+                            SetFatal("Event order baseline compaction failed");
+                            return false;
+                        }
+                        if (order_history_bytes_ > order_bytes_before) {
+                            SetFatal(
+                                "Event order compaction accounting increased");
+                            return false;
+                        }
+                        const std::size_t released_order_bytes =
+                            order_bytes_before - order_history_bytes_;
+                        record.roles.pop_front();
+                        if (!RefreshHotFactAccounting(key)) {
+                            SetFatal("Event eviction role accounting failed");
+                            return false;
+                        }
+                        if (hot_fact_bytes_ > hot_bytes_before) {
+                            SetFatal(
+                                "Event role eviction accounting increased");
+                            return false;
+                        }
+                        ++nodes;
+                        bytes = SaturatingAdd(
+                            bytes,
+                            SaturatingAdd(
+                                released_order_bytes,
+                                hot_bytes_before - hot_fact_bytes_));
+                        if (nodes >= config_.eviction_slice_max_nodes ||
+                            bytes >= config_.eviction_slice_max_bytes) {
+                            break;
+                        }
+                    }
+                    if (!record.roles.empty()) {
+                        break;
+                    }
+                    if (nodes >= config_.eviction_slice_max_nodes ||
+                        bytes >= config_.eviction_slice_max_bytes) {
+                        break;
+                    }
+
+                    auto bundle = bundle_cache_.find(key);
+                    while (bundle != bundle_cache_.end() &&
+                           !bundle->second.rows.empty()) {
+                        const std::size_t hot_bytes_before = hot_fact_bytes_;
+                        const EventKey event =
+                            bundle->second.rows.begin()->first;
+                        bundle->second.rows.erase(
+                            bundle->second.rows.begin());
+                        const std::size_t erased_hash =
+                            bundle->second.input_set_hashes.erase(event);
+                        if (erased_hash != 1U || cached_event_count_ == 0U ||
+                            !RefreshHotFactAccounting(key)) {
+                            SetFatal(
+                                "Event eviction bundle accounting failed");
+                            return false;
+                        }
+                        if (hot_fact_bytes_ > hot_bytes_before) {
+                            SetFatal(
+                                "Event bundle eviction accounting increased");
+                            return false;
+                        }
+                        --cached_event_count_;
+                        ++nodes;
+                        bytes = SaturatingAdd(
+                            bytes, hot_bytes_before - hot_fact_bytes_);
+                        if (nodes >= config_.eviction_slice_max_nodes ||
+                            bytes >= config_.eviction_slice_max_bytes) {
+                            break;
+                        }
+                    }
+                    if (bundle != bundle_cache_.end() &&
+                        !bundle->second.rows.empty()) {
+                        break;
+                    }
+                    if (bundle != bundle_cache_.end() &&
+                        !bundle->second.input_set_hashes.empty()) {
+                        SetFatal("Event eviction Bundle maps diverged");
+                        return false;
+                    }
+                    if (nodes >= config_.eviction_slice_max_nodes ||
+                        bytes >= config_.eviction_slice_max_bytes) {
+                        break;
+                    }
+
+                    auto heads = event_heads_.find(key);
+                    while (heads != event_heads_.end() &&
+                           !heads->second.empty()) {
+                        const std::size_t hot_bytes_before = hot_fact_bytes_;
+                        heads->second.erase(heads->second.begin());
+                        if (!RefreshHotFactAccounting(key)) {
+                            SetFatal("Event eviction head accounting failed");
+                            return false;
+                        }
+                        if (hot_fact_bytes_ > hot_bytes_before) {
+                            SetFatal(
+                                "Event head eviction accounting increased");
+                            return false;
+                        }
+                        ++nodes;
+                        bytes = SaturatingAdd(
+                            bytes, hot_bytes_before - hot_fact_bytes_);
+                        if (nodes >= config_.eviction_slice_max_nodes ||
+                            bytes >= config_.eviction_slice_max_bytes) {
+                            break;
+                        }
+                    }
+                    if (heads != event_heads_.end() &&
+                        !heads->second.empty()) {
+                        break;
+                    }
+                    if (nodes >= config_.eviction_slice_max_nodes ||
+                        bytes >= config_.eviction_slice_max_bytes) {
+                        break;
+                    }
+                    const std::size_t hot_bytes_before = hot_fact_bytes_;
+                    if (!EraseFactState(key, record)) {
+                        SetFatal("Event fact eviction failed");
+                        return false;
+                    }
+                    if (hot_fact_bytes_ > hot_bytes_before) {
+                        SetFatal(
+                            "Event fact eviction accounting increased");
+                        return false;
+                    }
+                    if (!EraseChannelFact(channel, key.native_sequence)) {
+                        SetFatal("Event channel fact eviction failed");
+                        return false;
+                    }
+                    channel_facts = channel_facts_.Find(channel);
+                    task.current_sequence.reset();
+                    ++nodes;
+                    bytes = SaturatingAdd(
+                        bytes, hot_bytes_before - hot_fact_bytes_);
+                    complete = channel_facts == nullptr ||
+                        channel_facts->empty() ||
+                        channel_facts->begin()->first >=
+                            task.evict_before;
+                    if (nodes >= config_.eviction_slice_max_nodes ||
+                        bytes >= config_.eviction_slice_max_bytes) {
+                        break;
+                    }
+                }
+
+                if (complete) {
+                    EventChannelState& state = channel_states_.at(channel);
+                    state.sealed_before = std::max(
+                        state.sealed_before, task.evict_before);
+                    state.eviction_target = state.sealed_before;
+                    const auto ranges = gap_ranges_.find(channel);
+                    if (ranges != gap_ranges_.end()) {
+                        auto range = ranges->second.begin();
+                        while (range != ranges->second.end()) {
+                            if (range->second.second < state.sealed_before) {
+                                range = ranges->second.erase(range);
+                            } else {
+                                ++range;
+                            }
+                        }
+                        state.gap_open = !ranges->second.empty();
+                        if (ranges->second.empty()) {
+                            gap_ranges_.erase(ranges);
+                        }
+                    } else {
+                        state.gap_open = false;
+                    }
+                    eviction_tasks_.erase(task_position);
+                } else if (eviction_ready_set_.insert(channel).second) {
+                    eviction_ready_.push_back(channel);
+                }
+
+                if (nodes >= config_.eviction_slice_max_nodes ||
+                    bytes >= config_.eviction_slice_max_bytes) {
+                    break;
+                }
+            }
+            stats_.eviction_pending.store(
+                !eviction_tasks_.empty(), std::memory_order_release);
+            return true;
+        } catch (...) {
+            SetFatal("Event eviction allocation failed");
+            return false;
         }
     }
 
@@ -2205,40 +2885,166 @@ public:
         }
     }
 
-    [[nodiscard]] bool DrainDurableCommits() noexcept {
+    [[nodiscard]] bool PendingCommitDurable(
+        const PendingCommit& commit) const noexcept {
+        return std::all_of(
+            commit.raw_dependencies.begin(),
+            commit.raw_dependencies.end(),
+            [this](const RawTickDependency& dependency) {
+                return acknowledged_raw_.contains(dependency);
+            });
+    }
+
+    [[nodiscard]] bool ReleaseFrontPendingCommit() noexcept {
+        if (pending_commits_.empty()) {
+            SetFatal("Event pending commit release underflow");
+            return false;
+        }
+        PendingCommit& commit = pending_commits_.front();
+        for (const RawTickDependency& dependency : commit.raw_dependencies) {
+            acknowledged_raw_.erase(dependency);
+        }
+        stats_.acknowledged_raw_dependencies.store(
+            acknowledged_raw_.size(), std::memory_order_relaxed);
+        const std::size_t old_queue =
+            DequeOwnedBytes<PendingCommit>(pending_commits_.size());
+        const std::size_t new_queue = DequeOwnedBytes<PendingCommit>(
+            pending_commits_.size() - 1U);
+        if (new_queue > old_queue) {
+            SetFatal("Event pending-commit deque accounting increased");
+            return false;
+        }
+        const std::size_t released_bytes = SaturatingAdd(
+            commit.owned_bytes, old_queue - new_queue);
+        if (released_bytes > pending_revision_bytes_) {
+            SetFatal("Event pending revision byte accounting diverged");
+            return false;
+        }
+        pending_revision_bytes_ -= released_bytes;
+        pending_commits_.pop_front();
+        stats_.pending_raw_commits.store(
+            pending_commits_.size(), std::memory_order_relaxed);
+        PublishPendingRevisionBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool ServiceDurableCommits(bool flush_partial) noexcept {
         if (!healthy_) {
             return false;
         }
-        while (!pending_commits_.empty()) {
-            PendingCommit& commit = pending_commits_.front();
-            const bool durable = std::all_of(
-                commit.raw_dependencies.begin(),
-                commit.raw_dependencies.end(),
-                [this](const RawTickDependency& dependency) {
-                    return acknowledged_raw_.contains(dependency);
-                });
-            if (!durable) {
-                break;
-            }
-            if (!commit.batch->revisions.empty()) {
-                if (!sink_->AppendRevisionBatch(commit.batch)) {
+        try {
+            while (!pending_commits_.empty()) {
+                PendingCommit& front = pending_commits_.front();
+                if (!PendingCommitDurable(front)) {
+                    return true;
+                }
+                if (front.batch->revisions.empty()) {
+                    if (!ReleaseFrontPendingCommit()) {
+                        return false;
+                    }
+                    continue;
+                }
+
+                std::size_t batch_count = 0U;
+                std::size_t row_count = 0U;
+                std::size_t byte_count = 0U;
+                bool closed = false;
+                for (const PendingCommit& commit : pending_commits_) {
+                    if (!PendingCommitDurable(commit)) {
+                        break;
+                    }
+                    if (commit.batch->revisions.empty()) {
+                        closed = true;
+                        break;
+                    }
+                    const std::size_t rows = commit.batch->revisions.size();
+                    const std::size_t bytes = commit.owned_bytes;
+                    const bool first = batch_count == 0U;
+                    const bool oversized =
+                        rows > config_.persistence_group_max_rows ||
+                        bytes > config_.persistence_group_max_bytes;
+                    if (first && oversized) {
+                        batch_count = 1U;
+                        row_count = rows;
+                        byte_count = bytes;
+                        closed = true;
+                        break;
+                    }
+                    if (batch_count >=
+                            config_.persistence_group_max_batches ||
+                        rows > config_.persistence_group_max_rows - row_count ||
+                        bytes >
+                            config_.persistence_group_max_bytes - byte_count) {
+                        closed = true;
+                        break;
+                    }
+                    ++batch_count;
+                    row_count += rows;
+                    byte_count += bytes;
+                }
+                if (batch_count == 0U) {
                     SetFatal(
-                        "Event revision sink rejected an immutable batch");
+                        "Event persistence group selection made no progress");
                     return false;
                 }
-                ++stats_.revision_batches_submitted;
+                closed = closed ||
+                    batch_count == config_.persistence_group_max_batches ||
+                    batch_count == config_.maximum_pending_commits ||
+                    row_count == config_.persistence_group_max_rows ||
+                    byte_count == config_.persistence_group_max_bytes;
+                if (!flush_partial && !closed) {
+                    const std::uint64_t now = ingest::MonotonicNowNs();
+                    const std::uint64_t queued =
+                        pending_commits_.front().queued_monotonic_ns;
+                    const std::uint64_t elapsed = now >= queued
+                        ? now - queued
+                        : 0U;
+                    if (elapsed < config_.persistence_group_max_delay_ns) {
+                        return true;
+                    }
+                }
+
+                std::vector<std::shared_ptr<const EventRevisionBatch>> group;
+                group.reserve(batch_count);
+                auto commit = pending_commits_.begin();
+                for (std::size_t index = 0U; index < batch_count;
+                     ++index, ++commit) {
+                    group.push_back(commit->batch);
+                }
+                if (!sink_->AppendRevisionGroup(std::move(group))) {
+                    SetFatal(
+                        "Event revision sink rejected an immutable group");
+                    return false;
+                }
+                stats_.persistence_groups_submitted.fetch_add(
+                    1U, std::memory_order_relaxed);
+                stats_.revision_batches_submitted.fetch_add(
+                    batch_count, std::memory_order_relaxed);
+                UpdateHighWatermark(
+                    &stats_.persistence_group_batches_max, batch_count);
+                UpdateHighWatermark(
+                    &stats_.persistence_group_rows_max, row_count);
+                UpdateHighWatermark(
+                    &stats_.persistence_group_bytes_max, byte_count);
+                for (std::size_t index = 0U; index < batch_count; ++index) {
+                    if (!ReleaseFrontPendingCommit()) {
+                        return false;
+                    }
+                }
             }
-            for (const RawTickDependency& dependency :
-                 commit.raw_dependencies) {
-                acknowledged_raw_.erase(dependency);
-            }
-            stats_.acknowledged_raw_dependencies.store(
-                acknowledged_raw_.size(), std::memory_order_relaxed);
-            pending_commits_.pop_front();
-            stats_.pending_raw_commits.store(
-                pending_commits_.size(), std::memory_order_relaxed);
+            return true;
+        } catch (...) {
+            SetFatal("Event persistence group allocation failed");
+            return false;
         }
-        return true;
+    }
+
+    [[nodiscard]] bool AdvanceDurableCommits() noexcept {
+        return ServiceDurableCommits(false);
+    }
+
+    [[nodiscard]] bool FlushDurableCommits() noexcept {
+        return ServiceDurableCommits(true);
     }
 
     [[nodiscard]] bool CopyBundle(
@@ -2264,17 +3070,24 @@ public:
         if (output == nullptr) {
             return false;
         }
-        const auto position = order_histories_.find(key);
-        if (position == order_histories_.end() ||
-            position->second.versions.empty()) {
+        const OrderHistory* const position = order_histories_.Find(key);
+        if (position == nullptr) {
             return false;
         }
-        const StateVersion& latest =
-            position->second.versions.rbegin()->second;
-        if (!latest.state.has_value()) {
+        const OrderHistory& history = *position;
+        const std::optional<OrderState>* latest =
+            &history.baseline.version.state;
+        for (auto node = history.suffix.rbegin();
+             node != history.suffix.rend(); ++node) {
+            if (node->second.evaluated) {
+                latest = &node->second.eval.post_state;
+                break;
+            }
+        }
+        if (!latest->has_value()) {
             return false;
         }
-        *output = latest.state->snapshot;
+        *output = latest->value().snapshot;
         return true;
     }
 
@@ -2282,7 +3095,8 @@ public:
         Market market,
         std::uint32_t channel,
         EventChannelState* output) const noexcept {
-        if (output == nullptr || channel == 0U ||
+        if (output == nullptr ||
+            (market == Market::kShanghai && channel == 0U) ||
             (market != Market::kShanghai && market != Market::kShenzhen)) {
             return false;
         }
@@ -2337,8 +3151,43 @@ public:
         result.revision_batches_submitted =
             stats_.revision_batches_submitted.load(
                 std::memory_order_relaxed);
+        result.persistence_groups_submitted =
+            stats_.persistence_groups_submitted.load(
+                std::memory_order_relaxed);
+        result.persistence_group_batches_max =
+            stats_.persistence_group_batches_max.load(
+                std::memory_order_relaxed);
+        result.persistence_group_rows_max =
+            stats_.persistence_group_rows_max.load(
+                std::memory_order_relaxed);
+        result.persistence_group_bytes_max =
+            stats_.persistence_group_bytes_max.load(
+                std::memory_order_relaxed);
+        result.pending_revision_bytes = stats_.pending_revision_bytes.load(
+            std::memory_order_relaxed);
+        result.pending_revision_bytes_high_watermark =
+            stats_.pending_revision_bytes_high_watermark.load(
+                std::memory_order_relaxed);
         result.active_repair_orders = stats_.active_repair_orders.load(
             std::memory_order_relaxed);
+        result.active_repair_bytes = stats_.active_repair_bytes.load(
+            std::memory_order_relaxed);
+        result.active_repair_bytes_high_watermark =
+            stats_.active_repair_bytes_high_watermark.load(
+                std::memory_order_relaxed);
+        result.phase_normalization_slices =
+            stats_.phase_normalization_slices.load(
+                std::memory_order_relaxed);
+        result.phase_facts_scanned = stats_.phase_facts_scanned.load(
+            std::memory_order_relaxed);
+        result.phase_dirty_roles_discovered =
+            stats_.phase_dirty_roles_discovered.load(
+                std::memory_order_relaxed);
+        result.pending_phase_bytes = stats_.pending_phase_bytes.load(
+            std::memory_order_relaxed);
+        result.pending_phase_bytes_high_watermark =
+            stats_.pending_phase_bytes_high_watermark.load(
+                std::memory_order_relaxed);
         result.ordered_batch_fast_path = stats_.ordered_batch_fast_path.load(
             std::memory_order_relaxed);
         result.unordered_batch_sorts = stats_.unordered_batch_sorts.load(
@@ -2346,30 +3195,640 @@ public:
         result.barrier_index_orders_visited =
             stats_.barrier_index_orders_visited.load(
                 std::memory_order_relaxed);
+        result.end_expansion_slices = stats_.end_expansion_slices.load(
+            std::memory_order_relaxed);
+        result.end_candidates_processed =
+            stats_.end_candidates_processed.load(
+                std::memory_order_relaxed);
         result.source_only_fast_path = stats_.source_only_fast_path.load(
             std::memory_order_relaxed);
+        result.order_uses_compacted = stats_.order_uses_compacted.load(
+            std::memory_order_relaxed);
+        result.facts_evicted = stats_.facts_evicted.load(
+            std::memory_order_relaxed);
+        result.eviction_slices = stats_.eviction_slices.load(
+            std::memory_order_relaxed);
+        result.hot_facts = stats_.hot_facts.load(
+            std::memory_order_relaxed);
+        result.hot_fact_bytes = stats_.hot_fact_bytes.load(
+            std::memory_order_relaxed);
+        result.hot_fact_bytes_high_watermark =
+            stats_.hot_fact_bytes_high_watermark.load(
+                std::memory_order_relaxed);
+        result.order_history_bytes = stats_.order_history_bytes.load(
+            std::memory_order_relaxed);
+        result.order_history_bytes_high_watermark =
+            stats_.order_history_bytes_high_watermark.load(
+                std::memory_order_relaxed);
         return result;
     }
     [[nodiscard]] bool repair_pending() const noexcept {
-        return stats_.repair_pending.load(std::memory_order_acquire);
+        return pending_projection_cut_.has_value() ||
+            stats_.repair_pending.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool eviction_pending() const noexcept {
+        return stats_.eviction_pending.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool projection_input_fenced() const noexcept {
+        return pending_projection_cut_.has_value() ||
+            (active_repair_.has_value() &&
+             !active_repair_->end_expansions.empty());
     }
     [[nodiscard]] const EventWorkerConfig& config() const noexcept {
         return config_;
     }
 
 private:
-    void QueueNoopDependencies(
+    static void UpdateHighWatermark(
+        std::atomic<std::uint64_t>* value,
+        std::uint64_t candidate) noexcept {
+        std::uint64_t observed = value->load(std::memory_order_relaxed);
+        while (observed < candidate &&
+               !value->compare_exchange_weak(
+                   observed, candidate, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    void PublishHotFactBytes() noexcept {
+        stats_.hot_fact_bytes.store(
+            hot_fact_bytes_, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.hot_fact_bytes_high_watermark,
+            static_cast<std::uint64_t>(hot_fact_bytes_));
+    }
+
+    [[nodiscard]] bool ReserveHotIndexGrowth(
+        std::size_t bytes,
+        EventApplyResult* result) noexcept {
+        if (bytes > config_.maximum_hot_fact_bytes ||
+            hot_fact_bytes_ > config_.maximum_hot_fact_bytes - bytes ||
+            hot_index_bytes_ >
+                std::numeric_limits<std::size_t>::max() - bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event hot-index byte capacity exhausted"));
+            return false;
+        }
+        hot_index_bytes_ += bytes;
+        hot_fact_bytes_ += bytes;
+        PublishHotFactBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool ReleaseHotIndexBytes(std::size_t bytes) noexcept {
+        if (bytes > hot_index_bytes_ || bytes > hot_fact_bytes_) {
+            return false;
+        }
+        hot_index_bytes_ -= bytes;
+        hot_fact_bytes_ -= bytes;
+        PublishHotFactBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool InsertChannelFact(
+        const ChannelKey& channel,
+        const FactKey& key,
+        EventApplyResult* result) {
+        if (channel_facts_.size() == channel_facts_.maximum_entries() &&
+            channel_facts_.Find(channel) == nullptr) {
+            static_cast<void>(CapacityFailure(
+                result, "Event channel range capacity exhausted"));
+            return false;
+        }
+        auto prepared = channel_facts_.PrepareInsert(channel);
+        ChannelFactRangeIndex* const existing = prepared.existing();
+        if (existing != nullptr &&
+            existing->contains(key.native_sequence)) {
+            static_cast<void>(Failure(
+                result, "Event channel fact index is duplicated"));
+            return false;
+        }
+        const std::size_t growth = SaturatingAdd(
+            prepared.owned_byte_delta(), ChannelFactEntryOwnedBytes());
+        if (!ReserveHotIndexGrowth(growth, result)) {
+            return false;
+        }
+
+        bool outer_inserted = false;
+        try {
+            ChannelFactRangeIndex* range = existing;
+            if (range == nullptr) {
+                auto inserted = channel_facts_.CommitInsert(
+                    std::move(prepared));
+                range = inserted.value;
+                outer_inserted = inserted.inserted;
+            }
+            const auto [position, inserted] = range->emplace(
+                key.native_sequence, key);
+            static_cast<void>(position);
+            if (!inserted) {
+                if (outer_inserted) {
+                    static_cast<void>(channel_facts_.Erase(channel));
+                }
+                static_cast<void>(ReleaseHotIndexBytes(growth));
+                static_cast<void>(Failure(
+                    result, "Event channel fact index insertion diverged"));
+                return false;
+            }
+            return true;
+        } catch (...) {
+            if (outer_inserted) {
+                static_cast<void>(channel_facts_.Erase(channel));
+            }
+            static_cast<void>(ReleaseHotIndexBytes(growth));
+            throw;
+        }
+    }
+
+    [[nodiscard]] bool InsertInstrumentFactIndex(
+        const InstrumentChannelKey& range,
+        std::uint64_t sequence,
+        EventApplyResult* result) {
+        if (instrument_facts_.size() ==
+                instrument_facts_.maximum_entries() &&
+            instrument_facts_.Find(range) == nullptr) {
+            static_cast<void>(CapacityFailure(
+                result, "Event instrument range capacity exhausted"));
+            return false;
+        }
+        auto prepared = instrument_facts_.PrepareInsert(range);
+        InstrumentFactIndex* const existing = prepared.existing();
+        const std::size_t before_count = existing == nullptr
+            ? 0U
+            : existing->ordered.size();
+        if (existing != nullptr && std::binary_search(
+                existing->ordered.begin(), existing->ordered.end(),
+                sequence)) {
+            static_cast<void>(Failure(
+                result, "Event instrument fact index is duplicated"));
+            return false;
+        }
+        const std::size_t before_bytes = existing == nullptr
+            ? 0U
+            : DequeOwnedBytes<std::uint64_t>(before_count);
+        const std::size_t after_bytes = DequeOwnedBytes<std::uint64_t>(
+            SaturatingAdd(before_count, 1U));
+        if (after_bytes < before_bytes) {
+            static_cast<void>(Failure(
+                result, "Event instrument fact byte accounting overflowed"));
+            return false;
+        }
+        const std::size_t growth = SaturatingAdd(
+            prepared.owned_byte_delta(), after_bytes - before_bytes);
+        if (!ReserveHotIndexGrowth(growth, result)) {
+            return false;
+        }
+
+        bool outer_inserted = false;
+        try {
+            InstrumentFactIndex* index = existing;
+            if (index == nullptr) {
+                auto inserted = instrument_facts_.CommitInsert(
+                    std::move(prepared));
+                index = inserted.value;
+                outer_inserted = inserted.inserted;
+            }
+            InsertInstrumentFact(index, sequence);
+            return true;
+        } catch (...) {
+            if (outer_inserted) {
+                static_cast<void>(instrument_facts_.Erase(range));
+            }
+            static_cast<void>(ReleaseHotIndexBytes(growth));
+            throw;
+        }
+    }
+
+    [[nodiscard]] bool InsertPhaseIndex(
+        const InstrumentChannelKey& range,
+        std::uint64_t sequence,
+        TradingPhase phase,
+        EventApplyResult* result) {
+        if (phase_statuses_.size() == phase_statuses_.maximum_entries() &&
+            phase_statuses_.Find(range) == nullptr) {
+            static_cast<void>(CapacityFailure(
+                result, "Event phase range capacity exhausted"));
+            return false;
+        }
+        auto prepared = phase_statuses_.PrepareInsert(range);
+        PhaseIndex* const existing = prepared.existing();
+        const std::size_t before_count = existing == nullptr
+            ? 0U
+            : existing->ordered.size();
+        if (existing != nullptr) {
+            const auto position = std::lower_bound(
+                existing->ordered.begin(), existing->ordered.end(), sequence,
+                [](const PhaseEntry& entry, std::uint64_t value) {
+                    return entry.first < value;
+                });
+            if (position != existing->ordered.end() &&
+                position->first == sequence) {
+                static_cast<void>(Failure(
+                    result, "Event phase index is duplicated"));
+                return false;
+            }
+        }
+        const std::size_t before_bytes = existing == nullptr
+            ? 0U
+            : DequeOwnedBytes<PhaseEntry>(before_count);
+        const std::size_t after_bytes = DequeOwnedBytes<PhaseEntry>(
+            SaturatingAdd(before_count, 1U));
+        if (after_bytes < before_bytes) {
+            static_cast<void>(Failure(
+                result, "Event phase index byte accounting overflowed"));
+            return false;
+        }
+        const std::size_t growth = SaturatingAdd(
+            prepared.owned_byte_delta(), after_bytes - before_bytes);
+        if (!ReserveHotIndexGrowth(growth, result)) {
+            return false;
+        }
+
+        bool outer_inserted = false;
+        try {
+            PhaseIndex* index = existing;
+            if (index == nullptr) {
+                auto inserted = phase_statuses_.CommitInsert(
+                    std::move(prepared));
+                index = inserted.value;
+                outer_inserted = inserted.inserted;
+            }
+            InsertPhase(index, sequence, phase);
+            return true;
+        } catch (...) {
+            if (outer_inserted) {
+                static_cast<void>(phase_statuses_.Erase(range));
+            }
+            static_cast<void>(ReleaseHotIndexBytes(growth));
+            throw;
+        }
+    }
+
+    [[nodiscard]] bool InsertBarrier(
+        const InstrumentChannelKey& range,
+        const FactKey& key,
+        EventApplyResult* result) {
+        if (barriers_.size() == barriers_.maximum_entries() &&
+            barriers_.Find(range) == nullptr) {
+            static_cast<void>(CapacityFailure(
+                result, "Event barrier range capacity exhausted"));
+            return false;
+        }
+        auto prepared = barriers_.PrepareInsert(range);
+        BarrierRangeIndex* const existing = prepared.existing();
+        if (existing != nullptr &&
+            existing->contains(key.native_sequence)) {
+            static_cast<void>(Failure(
+                result, "Event barrier index is duplicated"));
+            return false;
+        }
+        const std::size_t growth = SaturatingAdd(
+            prepared.owned_byte_delta(), BarrierEntryOwnedBytes());
+        if (!ReserveHotIndexGrowth(growth, result)) {
+            return false;
+        }
+
+        bool outer_inserted = false;
+        try {
+            BarrierRangeIndex* index = existing;
+            if (index == nullptr) {
+                auto inserted = barriers_.CommitInsert(std::move(prepared));
+                index = inserted.value;
+                outer_inserted = inserted.inserted;
+            }
+            const auto [position, inserted] = index->emplace(
+                key.native_sequence, key);
+            static_cast<void>(position);
+            if (!inserted) {
+                if (outer_inserted) {
+                    static_cast<void>(barriers_.Erase(range));
+                }
+                static_cast<void>(ReleaseHotIndexBytes(growth));
+                static_cast<void>(Failure(
+                    result, "Event barrier index insertion diverged"));
+                return false;
+            }
+            return true;
+        } catch (...) {
+            if (outer_inserted) {
+                static_cast<void>(barriers_.Erase(range));
+            }
+            static_cast<void>(ReleaseHotIndexBytes(growth));
+            throw;
+        }
+    }
+
+    [[nodiscard]] bool EraseInstrumentFactIndex(
+        const InstrumentChannelKey& range,
+        std::uint64_t sequence) {
+        InstrumentFactIndex* const index = instrument_facts_.Find(range);
+        if (index == nullptr) {
+            return false;
+        }
+        auto& ordered = index->ordered;
+        const auto position = std::lower_bound(
+            ordered.begin(), ordered.end(), sequence);
+        if (position == ordered.end() || *position != sequence) {
+            return false;
+        }
+        const std::size_t before =
+            DequeOwnedBytes<std::uint64_t>(ordered.size());
+        std::size_t released = 0U;
+        if (ordered.size() == 1U) {
+            const auto erased = instrument_facts_.Erase(range);
+            if (!erased.erased) {
+                return false;
+            }
+            released = SaturatingAdd(
+                erased.released_owned_bytes, before);
+        } else {
+            ordered.erase(position);
+            const std::size_t after =
+                DequeOwnedBytes<std::uint64_t>(ordered.size());
+            if (after > before) {
+                return false;
+            }
+            released = before - after;
+        }
+        return ReleaseHotIndexBytes(released);
+    }
+
+    [[nodiscard]] bool ErasePhaseIndex(
+        const InstrumentChannelKey& range,
+        std::uint64_t sequence) {
+        PhaseIndex* const index = phase_statuses_.Find(range);
+        if (index == nullptr) {
+            return false;
+        }
+        auto& ordered = index->ordered;
+        const auto position = std::lower_bound(
+            ordered.begin(), ordered.end(), sequence,
+            [](const PhaseEntry& entry, std::uint64_t value) {
+                return entry.first < value;
+            });
+        if (position == ordered.end() || position->first != sequence) {
+            return false;
+        }
+        const std::size_t before =
+            DequeOwnedBytes<PhaseEntry>(ordered.size());
+        index->anchor = *position;
+        ordered.erase(position);
+        const std::size_t after =
+            DequeOwnedBytes<PhaseEntry>(ordered.size());
+        return after <= before && ReleaseHotIndexBytes(before - after);
+    }
+
+    [[nodiscard]] bool EraseBarrier(
+        const InstrumentChannelKey& range,
+        std::uint64_t sequence) {
+        BarrierRangeIndex* const index = barriers_.Find(range);
+        if (index == nullptr) {
+            return false;
+        }
+        const auto position = index->find(sequence);
+        if (position == index->end()) {
+            return false;
+        }
+        std::size_t released = BarrierEntryOwnedBytes();
+        if (index->size() == 1U) {
+            const auto erased = barriers_.Erase(range);
+            if (!erased.erased) {
+                return false;
+            }
+            released = SaturatingAdd(
+                released, erased.released_owned_bytes);
+        } else {
+            index->erase(position);
+        }
+        return ReleaseHotIndexBytes(released);
+    }
+
+    [[nodiscard]] bool EraseChannelFact(
+        const ChannelKey& channel,
+        std::uint64_t sequence) {
+        ChannelFactRangeIndex* const index = channel_facts_.Find(channel);
+        if (index == nullptr) {
+            return false;
+        }
+        const auto position = index->find(sequence);
+        if (position == index->end()) {
+            return false;
+        }
+        std::size_t released = ChannelFactEntryOwnedBytes();
+        if (index->size() == 1U) {
+            const auto erased = channel_facts_.Erase(channel);
+            if (!erased.erased) {
+                return false;
+            }
+            released = SaturatingAdd(
+                released, erased.released_owned_bytes);
+        } else {
+            index->erase(position);
+        }
+        return ReleaseHotIndexBytes(released);
+    }
+
+    void PublishPendingRevisionBytes() noexcept {
+        stats_.pending_revision_bytes.store(
+            pending_revision_bytes_, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.pending_revision_bytes_high_watermark,
+            static_cast<std::uint64_t>(pending_revision_bytes_));
+    }
+
+    [[nodiscard]] std::size_t PendingCommitAdditionalBytes(
+        std::size_t revision_capacity,
+        std::size_t dependency_count) const noexcept {
+        const std::size_t old_queue =
+            DequeOwnedBytes<PendingCommit>(pending_commits_.size());
+        const std::size_t new_queue = DequeOwnedBytes<PendingCommit>(
+            SaturatingAdd(pending_commits_.size(), 1U));
+        const std::size_t queue_growth = new_queue > old_queue
+            ? new_queue - old_queue
+            : 0U;
+        return SaturatingAdd(
+            PendingCommitPayloadOwnedBytes(
+                revision_capacity, dependency_count),
+            queue_growth);
+    }
+
+    void PublishProjectionWorkspaceBytes() noexcept {
+        const std::size_t active_bytes = SaturatingAdd(
+            repair_accounted_bytes_,
+            projection_scratch_is_repair_ ? projection_scratch_bytes_ : 0U);
+        const std::size_t pending_bytes = SaturatingAdd(
+            pending_projection_cut_accounted_bytes_,
+            projection_scratch_is_repair_ ? 0U : projection_scratch_bytes_);
+        stats_.active_repair_bytes.store(
+            active_bytes, std::memory_order_relaxed);
+        stats_.pending_phase_bytes.store(
+            pending_bytes, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.active_repair_bytes_high_watermark,
+            static_cast<std::uint64_t>(active_bytes));
+        UpdateHighWatermark(
+            &stats_.pending_phase_bytes_high_watermark,
+            static_cast<std::uint64_t>(pending_bytes));
+    }
+
+    [[nodiscard]] bool ReserveProjectionScratch(
+        std::size_t bytes,
+        bool repair_commit,
+        EventApplyResult* result) noexcept {
+        if (projection_scratch_reserved_) {
+            static_cast<void>(Failure(
+                result, "Event projection scratch reservation is nested"));
+            return false;
+        }
+        const std::size_t used = SaturatingAdd(
+            repair_accounted_bytes_,
+            pending_projection_cut_accounted_bytes_);
+        if (bytes > config_.maximum_repair_bytes ||
+            used > config_.maximum_repair_bytes - bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event projection commit byte capacity exhausted"));
+            return false;
+        }
+        projection_scratch_bytes_ = bytes;
+        projection_scratch_is_repair_ = repair_commit;
+        projection_scratch_reserved_ = true;
+        PublishProjectionWorkspaceBytes();
+        return true;
+    }
+
+    void ReleaseProjectionScratch() noexcept {
+        projection_scratch_bytes_ = 0U;
+        projection_scratch_is_repair_ = false;
+        projection_scratch_reserved_ = false;
+        PublishProjectionWorkspaceBytes();
+    }
+
+    class ProjectionScratchGuard final {
+    public:
+        explicit ProjectionScratchGuard(Impl* owner) noexcept
+            : owner_(owner) {}
+        ~ProjectionScratchGuard() {
+            if (owner_ != nullptr) {
+                owner_->ReleaseProjectionScratch();
+            }
+        }
+
+        ProjectionScratchGuard(const ProjectionScratchGuard&) = delete;
+        ProjectionScratchGuard& operator=(
+            const ProjectionScratchGuard&) = delete;
+
+    private:
+        Impl* owner_;
+    };
+
+    void PublishOrderHistoryBytes() noexcept {
+        stats_.order_history_bytes.store(
+            order_history_bytes_, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.order_history_bytes_high_watermark,
+            static_cast<std::uint64_t>(order_history_bytes_));
+    }
+
+    [[nodiscard]] bool ReserveOrderHistoryGrowth(
+        std::size_t bytes,
+        EventApplyResult* result) noexcept {
+        if (bytes > config_.maximum_order_history_bytes ||
+            order_history_bytes_ >
+                config_.maximum_order_history_bytes - bytes) {
+            SetFatal("Event order-history byte capacity exhausted");
+            if (result != nullptr) {
+                result->code = EventApplyCode::kCapacityExhausted;
+            }
+            return false;
+        }
+        order_history_bytes_ += bytes;
+        PublishOrderHistoryBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool ReleaseOrderHistoryBytes(
+        std::size_t bytes) noexcept {
+        if (bytes > order_history_bytes_) {
+            return false;
+        }
+        order_history_bytes_ -= bytes;
+        stats_.order_history_bytes.store(
+            order_history_bytes_, std::memory_order_relaxed);
+        return true;
+    }
+
+    [[nodiscard]] bool SetAccountedOrderUse(
+        OrderHistory* history,
+        std::uint64_t sequence,
+        OrderRole role,
+        EventApplyResult* result) {
+        const bool inserted = !history->suffix.contains(sequence);
+        if (inserted &&
+            !ReserveOrderHistoryGrowth(
+                OrderUseNodeOwnedBytes(), result)) {
+            return false;
+        }
+        try {
+            if (SetOrderUse(history, sequence, role)) {
+                return true;
+            }
+        } catch (...) {
+            if (inserted) {
+                static_cast<void>(ReleaseOrderHistoryBytes(
+                    OrderUseNodeOwnedBytes()));
+            }
+            throw;
+        }
+        if (inserted) {
+            static_cast<void>(ReleaseOrderHistoryBytes(
+                OrderUseNodeOwnedBytes()));
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool QueuePendingCommit(
+        std::shared_ptr<const EventRevisionBatch> batch,
+        std::set<RawTickDependency> dependencies) {
+        if (batch == nullptr) {
+            SetFatal("Event pending revision batch is null");
+            return false;
+        }
+        if (batch->revisions.empty() && dependencies.empty()) {
+            return true;
+        }
+        if (pending_commits_.size() >= config_.maximum_pending_commits) {
+            SetFatal("Event pending raw commit capacity exhausted");
+            return false;
+        }
+        const std::size_t payload_bytes = PendingCommitPayloadOwnedBytes(
+            batch->revisions.capacity(), dependencies.size());
+        const std::size_t additional_bytes = PendingCommitAdditionalBytes(
+            batch->revisions.capacity(), dependencies.size());
+        if (additional_bytes > config_.maximum_pending_revision_bytes ||
+            pending_revision_bytes_ >
+                config_.maximum_pending_revision_bytes - additional_bytes) {
+            SetFatal("Event pending revision byte capacity exhausted");
+            return false;
+        }
+        pending_commits_.push_back(PendingCommit{
+            std::move(batch), std::move(dependencies), payload_bytes,
+            ingest::MonotonicNowNs()});
+        pending_revision_bytes_ += additional_bytes;
+        stats_.pending_raw_commits.store(
+            pending_commits_.size(), std::memory_order_relaxed);
+        PublishPendingRevisionBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool QueueNoopDependencies(
         std::set<RawTickDependency> dependencies) {
         if (dependencies.empty()) {
-            return;
+            return true;
         }
         auto empty = std::make_shared<EventRevisionBatch>();
         empty->calculation_run_id = config_.calculation_run_id;
         empty->owner = config_.owner;
-        pending_commits_.push_back(
-            PendingCommit{std::move(empty), std::move(dependencies)});
-        stats_.pending_raw_commits.store(
-            pending_commits_.size(), std::memory_order_relaxed);
+        return QueuePendingCommit(std::move(empty), std::move(dependencies));
     }
 
     [[nodiscard]] EventApplyResult CapacityFailure(
@@ -2398,6 +3857,352 @@ private:
         } catch (...) {
         }
         healthy_.store(false, std::memory_order_release);
+    }
+
+    void QueueEviction(const ChannelKey& channel,
+                       std::uint64_t evict_before) {
+        EventChannelState& state = channel_states_[channel];
+        state.feed_session_epoch = config_.feed_session_epoch;
+        state.eviction_target = std::max(
+            state.eviction_target, evict_before);
+        if (evict_before <= state.sealed_before) {
+            return;
+        }
+        auto [position, inserted] = eviction_tasks_.try_emplace(channel);
+        EvictionTask& task = position->second;
+        if (inserted) {
+            task.channel = channel;
+            task.evict_before = evict_before;
+        } else {
+            task.evict_before = std::max(task.evict_before, evict_before);
+        }
+        if (eviction_ready_set_.insert(channel).second) {
+            eviction_ready_.push_back(channel);
+        }
+        stats_.eviction_pending.store(true, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool AddActiveEndOrder(
+        const OrderKey& key,
+        OrderHistory* history,
+        EventApplyResult* result) {
+        if (key.market != Market::kShanghai) {
+            return true;
+        }
+        constexpr std::size_t kNoSlot =
+            std::numeric_limits<std::size_t>::max();
+        const InstrumentChannelKey range{
+            key.trade_date, key.market, key.instrument_id, key.channel};
+        if (history->active_end_slot != kNoSlot) {
+            const auto indexed = active_end_orders_.find(range);
+            return indexed != active_end_orders_.end() &&
+                history->active_end_slot < indexed->second.size() &&
+                indexed->second.values()[history->active_end_slot] == key;
+        }
+        auto indexed = active_end_orders_.find(range);
+        const bool new_index = indexed == active_end_orders_.end();
+        std::size_t reserved = 0U;
+        if (new_index) {
+            reserved = SaturatingAdd(
+                OrderIndexTreeNodeOwnedBytes(),
+                OrderIndexList::AllocationOwnedBytes(std::min(
+                    OrderIndexList::kInitialCapacity,
+                    config_.maximum_carry_orders)));
+            if (!ReserveOrderHistoryGrowth(reserved, result)) {
+                return false;
+            }
+            try {
+                indexed = active_end_orders_.try_emplace(
+                    range, config_.maximum_carry_orders).first;
+            } catch (...) {
+                static_cast<void>(ReleaseOrderHistoryBytes(reserved));
+                throw;
+            }
+        }
+        auto& orders = indexed->second;
+        std::optional<OrderIndexList::PreparedAppend> prepared;
+        try {
+            prepared.emplace(orders.PrepareAppend());
+        } catch (...) {
+            if (new_index) {
+                active_end_orders_.erase(indexed);
+                static_cast<void>(ReleaseOrderHistoryBytes(reserved));
+            }
+            throw;
+        }
+        if (!new_index) {
+            reserved = prepared->peak_allocation_owned_bytes();
+            if (!ReserveOrderHistoryGrowth(reserved, result)) {
+                return false;
+            }
+        }
+        try {
+            const auto appended = orders.CommitAppend(
+                std::move(*prepared), key);
+            if (new_index &&
+                appended.peak_allocation_owned_bytes +
+                        OrderIndexTreeNodeOwnedBytes() !=
+                    reserved) {
+                throw std::logic_error(
+                    "Event active END index layout changed");
+            }
+            if (!ReleaseOrderHistoryBytes(
+                    appended.released_owned_bytes)) {
+                return false;
+            }
+            history->active_end_slot = appended.index;
+        } catch (...) {
+            if (new_index) {
+                active_end_orders_.erase(indexed);
+            }
+            static_cast<void>(ReleaseOrderHistoryBytes(reserved));
+            throw;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool RemoveActiveEndOrder(
+        const OrderKey& key,
+        OrderHistory* history) {
+        constexpr std::size_t kNoSlot =
+            std::numeric_limits<std::size_t>::max();
+        if (history->active_end_slot == kNoSlot) {
+            return true;
+        }
+        const InstrumentChannelKey range{
+            key.trade_date, key.market, key.instrument_id, key.channel};
+        const auto indexed = active_end_orders_.find(range);
+        if (indexed == active_end_orders_.end()) {
+            return false;
+        }
+        OrderIndexList& orders = indexed->second;
+        const std::size_t slot = history->active_end_slot;
+        if (slot >= orders.size() || orders.values()[slot] != key) {
+            return false;
+        }
+        const auto erased = orders.EraseAtSwap(slot);
+        if (erased.moved.has_value()) {
+            OrderHistory* const moved =
+                order_histories_.Find(erased.moved->value);
+            if (moved == nullptr) {
+                return false;
+            }
+            moved->active_end_slot = erased.moved->current_index;
+        }
+        history->active_end_slot = kNoSlot;
+        if (orders.empty()) {
+            const std::size_t released = SaturatingAdd(
+                OrderIndexTreeNodeOwnedBytes(), orders.ReleaseStorage());
+            active_end_orders_.erase(indexed);
+            if (!ReleaseOrderHistoryBytes(released)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool SyncActiveEndOrder(
+        const OrderKey& key,
+        EventApplyResult* result) {
+        OrderHistory* const history = order_histories_.Find(key);
+        if (history == nullptr) {
+            return false;
+        }
+        const OrderState* const state = LatestOrderState(*history);
+        const bool active = key.market == Market::kShanghai &&
+            state != nullptr && !state->finalization_emitted;
+        return active
+            ? AddActiveEndOrder(key, history, result)
+            : RemoveActiveEndOrder(key, history);
+    }
+
+    [[nodiscard]] bool RetireEmptyOrder(const OrderKey& key) {
+        OrderHistory* const history = order_histories_.Find(key);
+        if (history == nullptr || !history->suffix.empty() ||
+            history->baseline.version.state.has_value()) {
+            return true;
+        }
+        if (!RemoveActiveEndOrder(key, history)) {
+            return false;
+        }
+        const InstrumentChannelKey range{
+            key.trade_date, key.market, key.instrument_id, key.channel};
+        const auto indexed = orders_by_instrument_channel_.find(range);
+        if (indexed == orders_by_instrument_channel_.end()) {
+            return false;
+        }
+        OrderIndexList& orders = indexed->second;
+        const std::size_t slot = history->instrument_order_slot;
+        if (slot >= orders.size() || orders.values()[slot] != key) {
+            return false;
+        }
+        const auto erased_index = orders.EraseAtSwap(slot);
+        if (erased_index.moved.has_value()) {
+            OrderHistory* const moved =
+                order_histories_.Find(erased_index.moved->value);
+            if (moved == nullptr) {
+                return false;
+            }
+            moved->instrument_order_slot =
+                erased_index.moved->current_index;
+        }
+        if (orders.empty()) {
+            const std::size_t released = SaturatingAdd(
+                OrderIndexTreeNodeOwnedBytes(), orders.ReleaseStorage());
+            orders_by_instrument_channel_.erase(indexed);
+            if (!ReleaseOrderHistoryBytes(released)) {
+                return false;
+            }
+        }
+        const auto erased_history = order_histories_.Erase(key);
+        if (!erased_history.erased ||
+            !ReleaseOrderHistoryBytes(
+                erased_history.released_owned_bytes)) {
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool CompactOrderUse(const OrderKey& order,
+                                       std::uint64_t sequence) {
+        OrderHistory* const history_position = order_histories_.Find(order);
+        if (history_position == nullptr) {
+            return false;
+        }
+        OrderHistory& history = *history_position;
+        auto use = history.suffix.find(sequence);
+        if (use == history.suffix.end() ||
+            !use->second.evaluated || use != history.suffix.begin()) {
+            return false;
+        }
+        history.baseline.compacted_before = std::max(
+            history.baseline.compacted_before, sequence + 1U);
+        history.baseline.last_sequence = sequence;
+        history.baseline.version = StateVersion{
+            use->second.eval.post_state,
+            use->second.eval.input_set_hash};
+        history.suffix.erase(use);
+        if (!ReleaseOrderHistoryBytes(OrderUseNodeOwnedBytes())) {
+            return false;
+        }
+        ++stats_.order_uses_compacted;
+        return RetireEmptyOrder(order);
+    }
+
+    [[nodiscard]] std::size_t FactOwnedBytes(
+        const FactRecord& record,
+        const Bundle* bundle,
+        std::size_t head_count) const noexcept {
+        using FactRole = std::pair<OrderKey, OrderRole>;
+        std::size_t bytes =
+            TreeNodeOwnedBytes<std::pair<const FactKey, FactRecord>>();
+        bytes = SaturatingAdd(
+            bytes, DequeOwnedBytes<FactRole>(record.roles.size()));
+        if (bundle != nullptr) {
+            bytes = SaturatingAdd(
+                bytes,
+                TreeNodeOwnedBytes<std::pair<const FactKey, Bundle>>());
+            bytes = SaturatingAdd(
+                bytes,
+                SaturatingMultiply(
+                    bundle->rows.size(),
+                    TreeNodeOwnedBytes<
+                        std::pair<const EventKey, EventPayload>>()));
+            bytes = SaturatingAdd(
+                bytes,
+                SaturatingMultiply(
+                    bundle->input_set_hashes.size(),
+                    TreeNodeOwnedBytes<
+                        std::pair<const EventKey, Identifier128>>()));
+        }
+        if (head_count != 0U) {
+            bytes = SaturatingAdd(
+                bytes,
+                TreeNodeOwnedBytes<
+                    std::pair<const FactKey,
+                              std::map<EventKey, EventHead>>>());
+            bytes = SaturatingAdd(
+                bytes,
+                SaturatingMultiply(
+                    head_count,
+                    TreeNodeOwnedBytes<
+                        std::pair<const EventKey, EventHead>>()));
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] std::size_t FactOwnedBytes(
+        const FactKey& key,
+        const FactRecord& record) const noexcept {
+        const auto bundle = bundle_cache_.find(key);
+        const auto heads = event_heads_.find(key);
+        return FactOwnedBytes(
+            record,
+            bundle == bundle_cache_.end() ? nullptr : &bundle->second,
+            heads == event_heads_.end() ? 0U : heads->second.size());
+    }
+
+    [[nodiscard]] bool RefreshHotFactAccounting(
+        const FactKey& key) noexcept {
+        const auto position = facts_.find(key);
+        if (position == facts_.end()) {
+            return false;
+        }
+        FactRecord& record = position->second;
+        const std::size_t next = FactOwnedBytes(key, record);
+        std::size_t projected = hot_fact_bytes_;
+        if (record.accounted_bytes > projected) {
+            return false;
+        }
+        projected -= record.accounted_bytes;
+        projected = SaturatingAdd(projected, next);
+        if (projected > config_.maximum_hot_fact_bytes) {
+            SetFatal("Event hot fact byte capacity exhausted");
+            return false;
+        }
+        record.accounted_bytes = next;
+        hot_fact_bytes_ = projected;
+        stats_.hot_fact_bytes.store(
+            hot_fact_bytes_, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.hot_fact_bytes_high_watermark,
+            static_cast<std::uint64_t>(hot_fact_bytes_));
+        return true;
+    }
+
+    [[nodiscard]] bool EraseFactState(const FactKey& key,
+                                      const FactRecord& record) {
+        const InstrumentChannelKey range = InstrumentChannel(key, record);
+        if (!EraseInstrumentFactIndex(range, key.native_sequence)) {
+            return false;
+        }
+
+        if (record.phase_status &&
+            !ErasePhaseIndex(range, key.native_sequence)) {
+            return false;
+        }
+
+        if (record.barrier && !EraseBarrier(range, key.native_sequence)) {
+            return false;
+        }
+        const auto bundle = bundle_cache_.find(key);
+        if (bundle != bundle_cache_.end()) {
+            if (cached_event_count_ < bundle->second.rows.size()) {
+                return false;
+            }
+            cached_event_count_ -= bundle->second.rows.size();
+            bundle_cache_.erase(bundle);
+        }
+        event_heads_.erase(key);
+        if (record.accounted_bytes > hot_fact_bytes_) {
+            return false;
+        }
+        hot_fact_bytes_ -= record.accounted_bytes;
+        facts_.erase(key);
+        stats_.hot_facts.store(facts_.size(), std::memory_order_relaxed);
+        PublishHotFactBytes();
+        ++stats_.facts_evicted;
+        return true;
     }
 
     [[nodiscard]] bool LoadSourceTick(const FactKey& key,
@@ -2435,14 +4240,84 @@ private:
         return true;
     }
 
-    void ClearRepairEvalPatch(RepairTransaction* repair,
-                              const OrderKey& order) noexcept {
-        auto position = repair->eval_patch.lower_bound(
-            RoleCacheKey{order, 0U});
-        while (position != repair->eval_patch.end() &&
-               position->first.order == order) {
-            position = repair->eval_patch.erase(position);
+    [[nodiscard]] bool RefreshRepairCapacity(
+        EventApplyResult* result) noexcept {
+        if (!active_repair_.has_value()) {
+            repair_accounted_bytes_ = 0U;
+            PublishProjectionWorkspaceBytes();
+            return true;
         }
+        repair_accounted_bytes_ = RepairOwnedBytes(*active_repair_);
+        PublishProjectionWorkspaceBytes();
+        if (SaturatingAdd(
+                SaturatingAdd(
+                    repair_accounted_bytes_,
+                    pending_projection_cut_accounted_bytes_),
+                projection_scratch_bytes_) <=
+            config_.maximum_repair_bytes) {
+            return true;
+        }
+        SetFatal("Event repair byte capacity exhausted");
+        if (result != nullptr) {
+            result->code = EventApplyCode::kCapacityExhausted;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool CheckRepairCapacity(
+        EventApplyResult* result) noexcept {
+        PublishProjectionWorkspaceBytes();
+        if (SaturatingAdd(
+                SaturatingAdd(
+                    repair_accounted_bytes_,
+                    pending_projection_cut_accounted_bytes_),
+                projection_scratch_bytes_) <=
+            config_.maximum_repair_bytes) {
+            return true;
+        }
+        SetFatal("Event repair byte capacity exhausted");
+        if (result != nullptr) {
+            result->code = EventApplyCode::kCapacityExhausted;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool ReserveRepairGrowth(
+        std::size_t bytes,
+        EventApplyResult* result) noexcept {
+        const std::size_t used = SaturatingAdd(
+            SaturatingAdd(
+                repair_accounted_bytes_,
+                pending_projection_cut_accounted_bytes_),
+            projection_scratch_bytes_);
+        if (bytes > config_.maximum_repair_bytes ||
+            used > config_.maximum_repair_bytes - bytes) {
+            SetFatal("Event repair byte capacity exhausted");
+            if (result != nullptr) {
+                result->code = EventApplyCode::kCapacityExhausted;
+            }
+            return false;
+        }
+        repair_accounted_bytes_ += bytes;
+        PublishProjectionWorkspaceBytes();
+        return true;
+    }
+
+    [[nodiscard]] std::size_t RepairQueueGrowth(
+        const RepairTransaction& repair,
+        const OrderKey& order) const noexcept {
+        if (repair.ready_order_set.contains(order)) {
+            return 0U;
+        }
+        const std::size_t old_deque_bytes =
+            DequeOwnedBytes<OrderKey>(repair.ready_orders.size());
+        const std::size_t new_deque_bytes = DequeOwnedBytes<OrderKey>(
+            SaturatingAdd(repair.ready_orders.size(), 1U));
+        return SaturatingAdd(
+            TreeNodeOwnedBytes<OrderKey>(),
+            new_deque_bytes > old_deque_bytes
+                ? new_deque_bytes - old_deque_bytes
+                : 0U);
     }
 
     void QueueRepairOrder(RepairTransaction* repair,
@@ -2464,11 +4339,9 @@ private:
         if (count_restart && task->initialized) {
             ++stats_.repair_order_restarts;
         }
-        ClearRepairEvalPatch(repair, task->key);
-        task->history = {};
         task->previous = {};
         task->cursor.reset();
-        task->observed_generation = 0U;
+        task->observed_live_generation = 0U;
         task->initialized = false;
         task->complete = false;
         repair->next_order = task->key;
@@ -2479,7 +4352,136 @@ private:
         const std::map<OrderKey, DirtyOrder>& dirty_orders,
         const std::map<FactKey, bool>& dirty_bundles,
         std::span<const FactKey> inserted,
-        std::set<RawTickDependency> dependencies) {
+        std::span<const EndExpansionTask> end_expansions,
+        std::set<RawTickDependency> dependencies,
+        EventApplyResult* result) {
+        const RepairTransaction* const current = active_repair_.has_value()
+            ? &*active_repair_
+            : nullptr;
+        std::size_t projected_bytes = current != nullptr
+            ? RepairOwnedBytes(*current)
+            : SaturatingAdd(
+                  sizeof(RepairTransaction),
+                  SaturatingAdd(
+                      DequeOwnedBytes<OrderKey>(0U),
+                      DequeOwnedBytes<EndExpansionTask>(0U)));
+        const auto add_nodes = [&projected_bytes](
+                                   std::size_t count,
+                                   std::size_t bytes) noexcept {
+            projected_bytes = SaturatingAdd(
+                projected_bytes, SaturatingMultiply(count, bytes));
+        };
+
+        for (const RawTickDependency& dependency : dependencies) {
+            if (current == nullptr ||
+                !current->raw_dependencies.contains(dependency)) {
+                add_nodes(1U, TreeNodeOwnedBytes<RawTickDependency>());
+            }
+        }
+        for (const FactKey& key : inserted) {
+            if (current == nullptr ||
+                !current->inserted_facts.contains(key)) {
+                add_nodes(1U, TreeNodeOwnedBytes<FactKey>());
+            }
+        }
+        for (const auto& [key, late] : dirty_bundles) {
+            static_cast<void>(late);
+            if (current == nullptr ||
+                !current->dirty_bundles.contains(key)) {
+                add_nodes(
+                    1U,
+                    TreeNodeOwnedBytes<std::pair<const FactKey, bool>>());
+            }
+        }
+
+        std::size_t new_ready_orders = 0U;
+        for (const auto& [order, dirty] : dirty_orders) {
+            const auto task = current == nullptr
+                ? std::map<OrderKey, RepairOrderTask>::const_iterator{}
+                : current->tasks.find(order);
+            const bool new_task = current == nullptr ||
+                task == current->tasks.end();
+            if (new_task) {
+                add_nodes(
+                    1U,
+                    TreeNodeOwnedBytes<std::pair<
+                        const OrderKey, RepairOrderTask>>());
+                add_nodes(
+                    dirty.new_sequences.size(),
+                    TreeNodeOwnedBytes<std::uint64_t>());
+            } else {
+                for (const std::uint64_t sequence :
+                     dirty.new_sequences) {
+                    if (!task->second.dirty.new_sequences.contains(
+                            sequence)) {
+                        add_nodes(
+                            1U,
+                            TreeNodeOwnedBytes<std::uint64_t>());
+                    }
+                }
+            }
+            if (current == nullptr ||
+                !current->ready_order_set.contains(order)) {
+                ++new_ready_orders;
+                add_nodes(1U, TreeNodeOwnedBytes<OrderKey>());
+            }
+        }
+        const std::size_t old_ready_count = current == nullptr
+            ? 0U
+            : current->ready_orders.size();
+        const std::size_t old_ready_bytes =
+            DequeOwnedBytes<OrderKey>(old_ready_count);
+        const std::size_t next_ready_bytes = DequeOwnedBytes<OrderKey>(
+            SaturatingAdd(old_ready_count, new_ready_orders));
+        projected_bytes = SaturatingAdd(
+            projected_bytes,
+            next_ready_bytes >= old_ready_bytes
+                ? next_ready_bytes - old_ready_bytes
+                : 0U);
+
+        const std::size_t old_end_count = current == nullptr
+            ? 0U
+            : current->end_expansions.size();
+        const std::size_t old_end_bytes =
+            DequeOwnedBytes<EndExpansionTask>(old_end_count);
+        const std::size_t next_end_bytes =
+            DequeOwnedBytes<EndExpansionTask>(SaturatingAdd(
+                old_end_count, end_expansions.size()));
+        projected_bytes = SaturatingAdd(
+            projected_bytes,
+            next_end_bytes >= old_end_bytes
+                ? next_end_bytes - old_end_bytes
+                : 0U);
+
+        std::size_t projected_end_staging = current == nullptr
+            ? 0U
+            : current->end_staging_bytes;
+        std::size_t projected_end_rows = current == nullptr
+            ? 0U
+            : current->end_projected_rows;
+        for (const EndExpansionTask& expansion : end_expansions) {
+            projected_end_staging = SaturatingAdd(
+                projected_end_staging, expansion.staging_bytes);
+            projected_end_rows = SaturatingAdd(
+                projected_end_rows,
+                SaturatingAdd(expansion.candidate_count, 1U));
+        }
+        if (SaturatingAdd(
+                projected_bytes,
+                pending_projection_cut_accounted_bytes_) >
+            config_.maximum_repair_bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event repair byte capacity exhausted"));
+            return false;
+        }
+        if (projected_end_staging >
+                config_.maximum_end_staging_bytes ||
+            projected_end_rows > config_.maximum_end_projected_rows) {
+            static_cast<void>(CapacityFailure(
+                result, "Event Shanghai END staging capacity exhausted"));
+            return false;
+        }
+
         if (!active_repair_.has_value()) {
             active_repair_.emplace();
         }
@@ -2494,7 +4496,7 @@ private:
             if (!was_inserted) {
                 position->second = position->second || late;
             }
-            repair.late_recovery = repair.late_recovery || late;
+            repair.hole_fill = repair.hole_fill || late;
         }
         for (const auto& [order, dirty] : dirty_orders) {
             auto [position, was_inserted] = repair.tasks.try_emplace(order);
@@ -2508,7 +4510,13 @@ private:
             task.dirty.new_sequences.insert(dirty.new_sequences.begin(),
                                             dirty.new_sequences.end());
             task.dirty.late = task.dirty.late || dirty.late;
-            repair.late_recovery = repair.late_recovery || dirty.late;
+            repair.hole_fill = repair.hole_fill || dirty.late;
+        }
+        for (const EndExpansionTask& expansion : end_expansions) {
+            repair.end_staging_bytes += expansion.staging_bytes;
+            repair.end_projected_rows += SaturatingAdd(
+                expansion.candidate_count, 1U);
+            repair.end_expansions.push_back(expansion);
         }
         if (!repair.next_order.has_value() && !repair.tasks.empty() &&
             repair.ready_orders.empty()) {
@@ -2517,7 +4525,145 @@ private:
         }
         stats_.active_repair_orders.store(
             repair.tasks.size(), std::memory_order_release);
+        return RefreshRepairCapacity(result);
+    }
+
+    [[nodiscard]] bool AttachEndCandidate(
+        RepairTransaction* repair,
+        const EndExpansionTask& expansion,
+        const OrderKey& order,
+        EventApplyResult* result) {
+        OrderHistory* const history_position = order_histories_.Find(order);
+        const auto fact_position = facts_.find(expansion.fact);
+        if (history_position == nullptr ||
+            fact_position == facts_.end()) {
+            return false;
+        }
+
+        auto repair_position = repair->tasks.find(order);
+        std::size_t growth = 0U;
+        if (repair_position == repair->tasks.end()) {
+            growth = SaturatingAdd(
+                growth,
+                TreeNodeOwnedBytes<
+                    std::pair<const OrderKey, RepairOrderTask>>());
+            growth = SaturatingAdd(
+                growth, TreeNodeOwnedBytes<std::uint64_t>());
+        } else if (!repair_position->second.dirty.new_sequences.contains(
+                       expansion.fact.native_sequence)) {
+            growth = SaturatingAdd(
+                growth, TreeNodeOwnedBytes<std::uint64_t>());
+        }
+        growth = SaturatingAdd(growth, RepairQueueGrowth(*repair, order));
+        if (!ReserveRepairGrowth(growth, result)) {
+            return false;
+        }
+        if (repair_position != repair->tasks.end() &&
+            repair_position->second.initialized) {
+            ResetRepairOrder(repair, &repair_position->second, true);
+        }
+
+        OrderHistory& history = *history_position;
+        const ChannelKey channel{
+            expansion.fact.trade_date, expansion.fact.market,
+            expansion.fact.channel};
+        const auto channel_state = channel_states_.find(channel);
+        if (channel_state != channel_states_.end()) {
+            history.baseline.compacted_before = std::max(
+                history.baseline.compacted_before,
+                channel_state->second.sealed_before);
+        }
+        OrderUseNode* const existing = FindOrderUse(
+            &history, expansion.fact.native_sequence);
+        if (existing != nullptr && existing->role != OrderRole::kBarrier) {
+            return false;
+        }
+        if (existing == nullptr) {
+            if (!SetAccountedOrderUse(
+                    &history, expansion.fact.native_sequence,
+                    OrderRole::kBarrier, result)) {
+                return false;
+            }
+            AppendUniqueFactRole(
+                &fact_position->second, order, OrderRole::kBarrier);
+            if (!RefreshHotFactAccounting(expansion.fact)) {
+                if (!healthy_) {
+                    result->code = EventApplyCode::kCapacityExhausted;
+                }
+                return false;
+            }
+        }
+
+        auto [task_position, task_inserted] =
+            repair->tasks.try_emplace(order);
+        RepairOrderTask& task = task_position->second;
+        if (task_inserted) {
+            task.key = order;
+        }
+        task.dirty.new_sequences.insert(
+            expansion.fact.native_sequence);
+        task.dirty.late = task.dirty.late || fact_position->second.late;
+        QueueRepairOrder(repair, order);
+        stats_.active_repair_orders.store(
+            repair->tasks.size(), std::memory_order_release);
         return true;
+    }
+
+    [[nodiscard]] bool AdvanceEndExpansionSlice(
+        EventApplyResult* result) {
+        RepairTransaction& repair = *active_repair_;
+        if (repair.end_expansions.empty()) {
+            return true;
+        }
+
+        ++stats_.end_expansion_slices;
+        const auto started = std::chrono::steady_clock::now();
+        std::size_t processed = 0U;
+        while (!repair.end_expansions.empty()) {
+            EndExpansionTask& expansion = repair.end_expansions.front();
+            const auto& candidate_index = expansion.active_only
+                ? active_end_orders_
+                : orders_by_instrument_channel_;
+            const auto indexed = candidate_index.find(expansion.range);
+            if (indexed == candidate_index.end() ||
+                indexed->second.size() < expansion.candidate_count ||
+                expansion.next_candidate >= expansion.candidate_count) {
+                SetFatal("Event Shanghai END candidate index diverged");
+                result->code = EventApplyCode::kFailed;
+                return false;
+            }
+            const OrderKey order = indexed->second.values()[
+                expansion.next_candidate];
+            if (!AttachEndCandidate(&repair, expansion, order, result)) {
+                if (healthy_) {
+                    SetFatal("Event Shanghai END expansion failed");
+                    result->code = EventApplyCode::kFailed;
+                }
+                return false;
+            }
+            ++expansion.next_candidate;
+            ++processed;
+            ++stats_.barrier_index_orders_visited;
+            ++stats_.end_candidates_processed;
+            if (expansion.next_candidate == expansion.candidate_count) {
+                repair.end_expansions.pop_front();
+            }
+
+            const auto elapsed_signed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count();
+            const std::uint64_t elapsed = elapsed_signed <= 0
+                ? 0U
+                : static_cast<std::uint64_t>(elapsed_signed);
+            if (!repair.end_expansions.empty() &&
+                (processed >= config_.end_slice_max_candidates ||
+                 elapsed >= config_.end_slice_max_cpu_ns)) {
+                result->repair_pending = true;
+                return CheckRepairCapacity(result);
+            }
+        }
+        return CheckRepairCapacity(result);
     }
 
     [[nodiscard]] RepairOrderTask* NextRepairOrder(
@@ -2537,19 +4683,58 @@ private:
         return nullptr;
     }
 
+    [[nodiscard]] StateVersion LatestRepairBefore(
+        const RepairTransaction& repair,
+        const RepairOrderTask& task,
+        const OrderHistory& history,
+        std::uint64_t sequence) const noexcept {
+        const auto position = history.suffix.lower_bound(sequence);
+        if (position != history.suffix.begin()) {
+            const auto previous = std::prev(position);
+            const auto patched = repair.eval_patch.find(
+                RoleCacheKey{task.key, previous->first});
+            if (patched != repair.eval_patch.end() &&
+                patched->second.attempt_generation ==
+                    task.attempt_generation) {
+                return StateVersion{
+                    patched->second.eval.post_state,
+                    patched->second.eval.input_set_hash};
+            }
+            if (previous->second.evaluated) {
+                return StateVersion{
+                    previous->second.eval.post_state,
+                    previous->second.eval.input_set_hash};
+            }
+        }
+        if (history.baseline.last_sequence != 0U &&
+            history.baseline.last_sequence < sequence) {
+            return history.baseline.version;
+        }
+        return {};
+    }
+
     [[nodiscard]] bool InitializeRepairOrder(
-        RepairOrderTask* task) {
-        const auto live = order_histories_.find(task->key);
-        if (live == order_histories_.end() ||
+        RepairTransaction* repair,
+        RepairOrderTask* task,
+        EventApplyResult* result) {
+        const OrderHistory* const live = order_histories_.Find(task->key);
+        if (live == nullptr ||
             task->dirty.new_sequences.empty()) {
             return false;
         }
-        task->history = live->second;
-        task->observed_generation = live->second.generation;
+        if (task->attempt_generation ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            static_cast<void>(Failure(
+                result, "Event repair attempt generation exhausted"));
+            return false;
+        }
+        ++task->attempt_generation;
+        task->observed_live_generation = live->generation;
         const std::uint64_t first = *task->dirty.new_sequences.begin();
-        task->previous = LatestBefore(task->history, first);
-        const auto use = task->history.uses.lower_bound(first);
-        task->cursor = use == task->history.uses.end()
+        task->previous = LatestRepairBefore(
+            *repair, *task, *live, first);
+        const auto use = live->suffix.lower_bound(first);
+        task->cursor = use == live->suffix.end()
             ? std::optional<std::uint64_t>{}
             : std::optional<std::uint64_t>{use->first};
         task->initialized = true;
@@ -2563,26 +4748,33 @@ private:
         EventApplyResult* result,
         bool* processed_use) {
         *processed_use = false;
-        const auto live = order_histories_.find(task->key);
-        if (live == order_histories_.end()) {
+        const OrderHistory* const live = order_histories_.Find(task->key);
+        if (live == nullptr) {
             return false;
         }
         if (task->initialized &&
-            task->observed_generation != live->second.generation) {
+            task->observed_live_generation != live->generation) {
+            if (!ReserveRepairGrowth(
+                    RepairQueueGrowth(*repair, task->key), result)) {
+                return false;
+            }
             ResetRepairOrder(repair, task, true);
         }
-        if (!task->initialized && !InitializeRepairOrder(task)) {
+        if (!task->initialized &&
+            !InitializeRepairOrder(repair, task, result)) {
             return false;
         }
         if (task->complete) {
             return true;
         }
 
-        const auto use = task->history.uses.find(*task->cursor);
-        if (use == task->history.uses.end()) {
+        const OrderHistory& history = *live;
+        const OrderUseNode* const use = FindOrderUse(
+            history, *task->cursor);
+        if (use == nullptr) {
             return false;
         }
-        const std::uint64_t sequence = use->first;
+        const std::uint64_t sequence = *task->cursor;
         const FactKey fact_key{task->key.trade_date, task->key.market,
                                task->key.channel, sequence};
         const auto fact_position = facts_.find(fact_key);
@@ -2595,13 +4787,10 @@ private:
             return false;
         }
         const RoleCacheKey cache_key{task->key, sequence};
-        const auto old_position = role_cache_.find(cache_key);
-        const RoleEval* old_eval = old_position == role_cache_.end()
-            ? nullptr
-            : &old_position->second;
+        const RoleEval* old_eval = use->evaluated ? &use->eval : nullptr;
         const std::optional<OrderState> prior_state = task->previous.state;
         const ApplyRoleResult applied = ApplyOrderRole(
-            task->previous.state, projected_tick, use->second,
+            task->previous.state, projected_tick, use->role,
             task->previous.input_set_hash, fact.fact_hash);
         if (!applied.ok) {
             return false;
@@ -2618,22 +4807,39 @@ private:
             observable_changed ||
             old_eval->input_set_hash != applied.eval.input_set_hash ||
             old_eval->post_state_hash != applied.eval.post_state_hash;
+        std::size_t patch_growth = 0U;
+        if (cache_changed && !repair->eval_patch.contains(cache_key)) {
+            patch_growth = SaturatingAdd(
+                patch_growth,
+                TreeNodeOwnedBytes<
+                    std::pair<const RoleCacheKey, RepairEvalPatch>>());
+        }
+        if (observable_changed &&
+            !repair->dirty_bundles.contains(fact_key)) {
+            patch_growth = SaturatingAdd(
+                patch_growth,
+                TreeNodeOwnedBytes<std::pair<const FactKey, bool>>());
+        }
+        if (!ReserveRepairGrowth(patch_growth, result)) {
+            return false;
+        }
         if (cache_changed) {
-            repair->eval_patch[cache_key] = applied.eval;
+            repair->eval_patch.insert_or_assign(
+                cache_key,
+                RepairEvalPatch{applied.eval, task->attempt_generation});
         }
         if (observable_changed) {
             auto [position, was_inserted] =
                 repair->dirty_bundles.try_emplace(
                     fact_key,
-                    repair->late_recovery || task->dirty.late);
+                    repair->hole_fill || task->dirty.late);
             if (!was_inserted) {
                 position->second = position->second ||
-                    repair->late_recovery || task->dirty.late;
+                    repair->hole_fill || task->dirty.late;
             }
         }
-        task->history.versions[sequence] = StateVersion{
+        task->previous = StateVersion{
             applied.eval.post_state, applied.eval.input_set_hash};
-        task->previous = task->history.versions.at(sequence);
         ++stats_.repaired_order_uses;
         if (result != nullptr) {
             ++result->repaired_order_uses;
@@ -2649,18 +4855,18 @@ private:
                 task->complete = true;
                 return true;
             }
-            task->previous = LatestBefore(task->history, *next_new);
-            const auto next_use =
-                task->history.uses.lower_bound(*next_new);
-            task->cursor = next_use == task->history.uses.end()
+            task->previous = LatestRepairBefore(
+                *repair, *task, history, *next_new);
+            const auto next_use = history.suffix.lower_bound(*next_new);
+            task->cursor = next_use == history.suffix.end()
                 ? std::optional<std::uint64_t>{}
                 : std::optional<std::uint64_t>{next_use->first};
             task->complete = !task->cursor.has_value();
             return true;
         }
 
-        const auto next_use = std::next(use);
-        task->cursor = next_use == task->history.uses.end()
+        const auto next_use = history.suffix.upper_bound(sequence);
+        task->cursor = next_use == history.suffix.end()
             ? std::optional<std::uint64_t>{}
             : std::optional<std::uint64_t>{next_use->first};
         task->complete = !task->cursor.has_value();
@@ -2668,19 +4874,30 @@ private:
     }
 
     [[nodiscard]] bool RepairGenerationsStable(
-        RepairTransaction* repair) {
+        RepairTransaction* repair,
+        EventApplyResult* result) {
         bool stable = true;
         for (auto& [order, task] : repair->tasks) {
-            const auto live = order_histories_.find(order);
-            if (live == order_histories_.end()) {
+            const OrderHistory* const live = order_histories_.Find(order);
+            if (live == nullptr) {
                 SetFatal("Event repair OrderUseIndex disappeared");
                 return false;
             }
-            if (!task.initialized || !task.complete ||
-                task.observed_generation != live->second.generation) {
-                if (task.initialized && task.complete &&
-                    task.observed_generation != live->second.generation) {
-                    ResetRepairOrder(repair, &task, true);
+            if (task.initialized &&
+                task.observed_live_generation != live->generation) {
+                if (!ReserveRepairGrowth(
+                        RepairQueueGrowth(*repair, order), result)) {
+                    return false;
+                }
+                ResetRepairOrder(repair, &task, true);
+                stable = false;
+                continue;
+            }
+            if (!task.initialized || !task.complete) {
+                if (!repair->ready_order_set.contains(order)) {
+                    SetFatal("Event repair worklist diverged");
+                    result->code = EventApplyCode::kFailed;
+                    return false;
                 }
                 stable = false;
             }
@@ -2688,26 +4905,146 @@ private:
         return stable;
     }
 
+    [[nodiscard]] bool ValidateRepairOverlay(
+        const RepairTransaction& repair,
+        EventApplyResult* result) {
+        for (const auto& [order, task] : repair.tasks) {
+            const OrderHistory* const live = order_histories_.Find(order);
+            if (live == nullptr || !task.initialized ||
+                !task.complete || task.attempt_generation == 0U ||
+                task.observed_live_generation != live->generation) {
+                static_cast<void>(Failure(
+                    result, "Event repair generation changed before commit"));
+                return false;
+            }
+        }
+        for (const auto& [key, patch] : repair.eval_patch) {
+            const auto task = repair.tasks.find(key.order);
+            if (task == repair.tasks.end() ||
+                patch.attempt_generation !=
+                    task->second.attempt_generation) {
+                continue;
+            }
+            const OrderHistory* const live = order_histories_.Find(key.order);
+            if (live == nullptr ||
+                FindOrderUse(*live, key.native_sequence) == nullptr) {
+                static_cast<void>(Failure(
+                    result, "Event repair eval patch target disappeared"));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void ApplyRepairOverlay(const RepairTransaction& repair) noexcept {
+        for (const auto& [key, patch] : repair.eval_patch) {
+            const auto task = repair.tasks.find(key.order);
+            if (task == repair.tasks.end() ||
+                patch.attempt_generation !=
+                    task->second.attempt_generation) {
+                continue;
+            }
+            OrderUseNode* const use = FindOrderUse(
+                order_histories_.Find(key.order), key.native_sequence);
+            use->eval = patch.eval;
+            use->evaluated = true;
+        }
+    }
+
+    [[nodiscard]] bool ProjectionCommitScratchUpperBound(
+        const std::map<FactKey, bool>& dirty_bundles,
+        std::size_t* output,
+        EventApplyResult* result) noexcept {
+        std::size_t new_rows = 0U;
+        std::size_t old_rows = 0U;
+        for (const auto& [key, late] : dirty_bundles) {
+            static_cast<void>(late);
+            const auto fact = facts_.find(key);
+            if (fact == facts_.end()) {
+                static_cast<void>(Failure(
+                    result, "Event projection scratch fact is missing"));
+                return false;
+            }
+            if (fact->second.projectable) {
+                new_rows = SaturatingAdd(
+                    new_rows,
+                    SaturatingAdd(fact->second.roles.size(), 1U));
+            }
+            const auto old = bundle_cache_.find(key);
+            if (old != bundle_cache_.end()) {
+                old_rows = SaturatingAdd(
+                    old_rows, old->second.rows.size());
+            }
+        }
+
+        using BundlePatchNode = std::pair<const FactKey, Bundle>;
+        using RowNode = std::pair<const EventKey, EventPayload>;
+        using HashNode = std::pair<const EventKey, Identifier128>;
+        using HeadNode = std::pair<const EventKey, EventHead>;
+        using CountNode = std::pair<const FactKey, std::size_t>;
+        std::size_t bytes = SaturatingMultiply(
+            dirty_bundles.size(), TreeNodeOwnedBytes<BundlePatchNode>());
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                new_rows,
+                SaturatingAdd(
+                    TreeNodeOwnedBytes<RowNode>(),
+                    TreeNodeOwnedBytes<HashNode>())));
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                SaturatingAdd(old_rows, new_rows),
+                TreeNodeOwnedBytes<HeadNode>()));
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                dirty_bundles.size(),
+                SaturatingMultiply(2U, TreeNodeOwnedBytes<CountNode>())));
+        *output = bytes;
+        return true;
+    }
+
     [[nodiscard]] bool CommitProjection(
-        std::vector<OrderPatch>* order_patches,
-        std::map<RoleCacheKey, RoleEval>* eval_patch,
+        std::span<const OrderKey> touched_orders,
+        const std::map<RoleCacheKey, RoleEval>* live_eval_patch,
+        RepairTransaction* repair_overlay,
         std::map<FactKey, bool>* dirty_bundles,
         std::span<const FactKey> inserted,
         std::set<RawTickDependency> dependencies,
         bool repair_commit,
         EventApplyResult* result) {
+        if ((live_eval_patch == nullptr) == (repair_overlay == nullptr)) {
+            static_cast<void>(Failure(
+                result, "Event projection eval source is ambiguous"));
+            return false;
+        }
+        if (repair_overlay != nullptr &&
+            !ValidateRepairOverlay(*repair_overlay, result)) {
+            return false;
+        }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
             static_cast<void>(CapacityFailure(
                 result, "Event pending raw commit capacity exhausted"));
             return false;
         }
 
+        std::size_t projection_scratch = 0U;
+        if (!ProjectionCommitScratchUpperBound(
+                *dirty_bundles, &projection_scratch, result) ||
+            !ReserveProjectionScratch(
+                projection_scratch, repair_commit, result)) {
+            return false;
+        }
+        ProjectionScratchGuard projection_scratch_guard(this);
+
         std::map<FactKey, Bundle> bundle_patch;
         std::size_t projected_event_count = cached_event_count_;
         for (const auto& [key, late_reason] : *dirty_bundles) {
             static_cast<void>(late_reason);
             Bundle assembled{};
-            if (!AssembleBundle(key, *eval_patch, &assembled)) {
+            if (!AssembleBundle(
+                    key, live_eval_patch, repair_overlay, &assembled)) {
                 static_cast<void>(Failure(
                     result, "Event bundle source fact read failed"));
                 return false;
@@ -2732,6 +5069,27 @@ private:
             bundle_patch.emplace(key, std::move(assembled));
         }
 
+        std::size_t pending_revision_count = 0U;
+        for (const auto& [key, bundle] : bundle_patch) {
+            const auto old = bundle_cache_.find(key);
+            const Bundle empty{};
+            pending_revision_count = SaturatingAdd(
+                pending_revision_count,
+                BundleRevisionCount(
+                    old == bundle_cache_.end() ? empty : old->second,
+                    bundle));
+        }
+        const std::size_t pending_owned_bytes = PendingCommitAdditionalBytes(
+            pending_revision_count, dependencies.size());
+        if (pending_owned_bytes > config_.maximum_pending_revision_bytes ||
+            pending_revision_bytes_ >
+                config_.maximum_pending_revision_bytes -
+                    pending_owned_bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event pending revision byte capacity exhausted"));
+            return false;
+        }
+
         const std::uint64_t calculation_batch_sequence =
             next_calculation_batch_sequence_;
         if (calculation_batch_sequence == 0U ||
@@ -2749,9 +5107,10 @@ private:
         revision_batch->recovery_run_id = recovery_run_id;
         revision_batch->owner = config_.owner;
         revision_batch->batch_sequence = calculation_batch_sequence;
+        revision_batch->revisions.reserve(pending_revision_count);
 
         std::map<EventKey, EventHead> head_patch;
-        bool batch_has_late = repair_commit;
+        bool batch_has_late = false;
         std::uint32_t revision_counter = next_revision_counter_;
         for (const auto& [fact_key, new_bundle] : bundle_patch) {
             const auto old_position = bundle_cache_.find(fact_key);
@@ -2759,8 +5118,7 @@ private:
             const Bundle& old_bundle = old_position == bundle_cache_.end()
                 ? empty
                 : old_position->second;
-            const bool late_reason = repair_commit ||
-                dirty_bundles->at(fact_key);
+            const bool late_reason = dirty_bundles->at(fact_key);
             batch_has_late = batch_has_late || late_reason;
             if (!DiffBundle(old_bundle, new_bundle, late_reason,
                             recovery_run_id, &revision_counter,
@@ -2773,21 +5131,85 @@ private:
             ++stats_.bundles_reassembled;
         }
         revision_batch->reason = batch_has_late
-            ? RevisionReason::kLateRecovery
+            ? RevisionReason::kHoleFill
             : RevisionReason::kLiveProjection;
-
-        for (OrderPatch& patch : *order_patches) {
-            order_histories_[patch.key] = std::move(patch.history);
+        if (revision_batch->revisions.size() != pending_revision_count) {
+            static_cast<void>(Failure(
+                result, "Event revision byte preflight diverged"));
+            return false;
         }
-        for (auto& [key, eval] : *eval_patch) {
-            role_cache_[key] = std::move(eval);
+
+        std::map<FactKey, std::size_t> projected_head_counts;
+        for (const auto& [fact_key, bundle] : bundle_patch) {
+            static_cast<void>(bundle);
+            const auto current = event_heads_.find(fact_key);
+            projected_head_counts.emplace(
+                fact_key,
+                current == event_heads_.end() ? 0U : current->second.size());
+        }
+        for (const auto& [event_key, head] : head_patch) {
+            static_cast<void>(head);
+            const FactKey fact_key = MakeFactKey(event_key);
+            auto count = projected_head_counts.find(fact_key);
+            if (count == projected_head_counts.end()) {
+                static_cast<void>(Failure(
+                    result, "Event head patch fact diverged"));
+                return false;
+            }
+            const auto current = event_heads_.find(fact_key);
+            if (current == event_heads_.end() ||
+                !current->second.contains(event_key)) {
+                ++count->second;
+            }
+        }
+        std::map<FactKey, std::size_t> projected_fact_bytes;
+        std::size_t projected_hot_fact_bytes = hot_fact_bytes_;
+        for (const auto& [fact_key, bundle] : bundle_patch) {
+            const auto fact = facts_.find(fact_key);
+            if (fact == facts_.end() ||
+                fact->second.accounted_bytes > projected_hot_fact_bytes) {
+                static_cast<void>(Failure(
+                    result, "Event hot fact accounting diverged"));
+                return false;
+            }
+            const std::size_t owned = FactOwnedBytes(
+                fact->second, &bundle, projected_head_counts.at(fact_key));
+            projected_hot_fact_bytes -= fact->second.accounted_bytes;
+            projected_hot_fact_bytes = SaturatingAdd(
+                projected_hot_fact_bytes, owned);
+            projected_fact_bytes.emplace(fact_key, owned);
+        }
+        if (projected_hot_fact_bytes > config_.maximum_hot_fact_bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event hot fact byte capacity exhausted"));
+            return false;
+        }
+
+        if (repair_overlay != nullptr) {
+            ApplyRepairOverlay(*repair_overlay);
+        }
+        for (const OrderKey& order : touched_orders) {
+            if (!SyncActiveEndOrder(order, result)) {
+                static_cast<void>(Failure(
+                    result, "Event active END order index diverged"));
+                return false;
+            }
         }
         for (auto& [key, bundle] : bundle_patch) {
             bundle_cache_[key] = std::move(bundle);
         }
         for (const auto& [key, head] : head_patch) {
-            event_heads_[key] = head;
+            event_heads_[MakeFactKey(key)][key] = head;
         }
+        for (const auto& [key, owned] : projected_fact_bytes) {
+            facts_.at(key).accounted_bytes = owned;
+        }
+        hot_fact_bytes_ = projected_hot_fact_bytes;
+        stats_.hot_fact_bytes.store(
+            hot_fact_bytes_, std::memory_order_relaxed);
+        UpdateHighWatermark(
+            &stats_.hot_fact_bytes_high_watermark,
+            static_cast<std::uint64_t>(hot_fact_bytes_));
         cached_event_count_ = projected_event_count;
         next_revision_counter_ = revision_counter;
         ++next_calculation_batch_sequence_;
@@ -2801,17 +5223,13 @@ private:
 
         const std::size_t revision_count =
             revision_batch->revisions.size();
-        pending_commits_.push_back(PendingCommit{
-            std::move(revision_batch), std::move(dependencies)});
-        stats_.pending_raw_commits.store(
-            pending_commits_.size(), std::memory_order_relaxed);
-        stats_.revisions_created += revision_count;
-        if (pending_commits_.back().raw_dependencies.empty() &&
-            pending_commits_.back().batch->revisions.empty()) {
-            pending_commits_.pop_back();
-            stats_.pending_raw_commits.store(
-                pending_commits_.size(), std::memory_order_relaxed);
+        if (!QueuePendingCommit(
+                std::move(revision_batch), std::move(dependencies))) {
+            static_cast<void>(CapacityFailure(
+                result, "Event pending revision byte capacity exhausted"));
+            return false;
         }
+        stats_.revisions_created += revision_count;
         if (repair_commit) {
             ++stats_.repair_commits;
         }
@@ -2820,28 +5238,37 @@ private:
 
     [[nodiscard]] bool CommitRepair(EventApplyResult* result) {
         RepairTransaction& repair = *active_repair_;
-        if (repair.late_recovery) {
+        if (repair.hole_fill) {
             for (auto& [key, late] : repair.dirty_bundles) {
                 static_cast<void>(key);
                 late = true;
             }
         }
-        std::vector<OrderPatch> order_patches;
-        order_patches.reserve(repair.tasks.size());
-        for (auto& [order, task] : repair.tasks) {
-            order_patches.push_back(
-                OrderPatch{order, std::move(task.history)});
+        const std::size_t commit_scratch = SaturatingAdd(
+            SaturatingMultiply(repair.tasks.size(), sizeof(OrderKey)),
+            SaturatingMultiply(
+                repair.inserted_facts.size(), sizeof(FactKey)));
+        if (!ReserveRepairGrowth(commit_scratch, result)) {
+            return false;
+        }
+        std::vector<OrderKey> touched_orders;
+        touched_orders.reserve(repair.tasks.size());
+        for (const auto& [order, task] : repair.tasks) {
+            static_cast<void>(task);
+            touched_orders.push_back(order);
         }
         std::vector<FactKey> inserted(repair.inserted_facts.begin(),
                                       repair.inserted_facts.end());
         if (!CommitProjection(
-                &order_patches, &repair.eval_patch,
+                touched_orders, nullptr, &repair,
                 &repair.dirty_bundles, inserted,
                 std::move(repair.raw_dependencies), true, result)) {
             return false;
         }
         active_repair_.reset();
+        repair_accounted_bytes_ = 0U;
         stats_.active_repair_orders.store(0U, std::memory_order_release);
+        stats_.active_repair_bytes.store(0U, std::memory_order_release);
         stats_.repair_pending.store(false, std::memory_order_release);
         return true;
     }
@@ -2856,26 +5283,61 @@ private:
             result->code = EventApplyCode::kFailed;
             return false;
         }
-        if (!DrainDurableCommits()) {
+        if (!AdvanceDurableCommits()) {
             result->code = EventApplyCode::kSinkFailed;
             return false;
+        }
+        if (pending_projection_cut_.has_value()) {
+            try {
+                const bool advanced = AdvancePendingProjectionCut(result);
+                result->repair_pending = repair_pending();
+                return advanced;
+            } catch (const std::bad_alloc&) {
+                static_cast<void>(CapacityFailure(
+                    result, "Event phase normalization allocation failed"));
+                return false;
+            } catch (const std::exception& exception) {
+                static_cast<void>(Failure(
+                    result, std::string("Event phase normalization failed: ") +
+                                exception.what()));
+                return false;
+            } catch (...) {
+                static_cast<void>(Failure(
+                    result,
+                    "Event phase normalization failed with unknown exception"));
+                return false;
+            }
         }
         if (!active_repair_.has_value()) {
             result->repair_pending = false;
             return true;
+        }
+        if (!CheckRepairCapacity(result)) {
+            return false;
         }
 
         ++stats_.repair_slices;
         const auto started = std::chrono::steady_clock::now();
         std::size_t processed_uses = 0U;
         try {
+            if (!active_repair_->end_expansions.empty()) {
+                if (!AdvanceEndExpansionSlice(result)) {
+                    return false;
+                }
+                if (!active_repair_->end_expansions.empty()) {
+                    result->repair_pending = true;
+                    return true;
+                }
+            }
             while (active_repair_.has_value()) {
                 RepairTransaction& repair = *active_repair_;
                 RepairOrderTask* task = NextRepairOrder(&repair);
                 if (task == nullptr) {
-                    if (!RepairGenerationsStable(&repair)) {
+                    if (!RepairGenerationsStable(&repair, result)) {
                         if (!healthy_) {
-                            result->code = EventApplyCode::kFailed;
+                            if (result->code == EventApplyCode::kApplied) {
+                                result->code = EventApplyCode::kFailed;
+                            }
                             return false;
                         }
                         continue;
@@ -2889,7 +5351,7 @@ private:
                         return false;
                     }
                     result->repair_pending = false;
-                    return DrainDurableCommits();
+                    return AdvanceDurableCommits();
                 }
 
                 bool processed_use = false;
@@ -2943,29 +5405,224 @@ private:
     [[nodiscard]] std::optional<TradingPhase> PhaseAt(
         const InstrumentChannelKey& range,
         std::uint64_t sequence) const noexcept {
-        const auto statuses = phase_statuses_.find(range);
-        if (statuses == phase_statuses_.end()) {
+        const PhaseIndex* const statuses = phase_statuses_.Find(range);
+        if (statuses == nullptr) {
             return std::nullopt;
         }
-        const auto& values = statuses->second.ordered;
+        const auto& values = statuses->ordered;
         const auto position = std::upper_bound(
             values.begin(), values.end(), sequence,
             [](std::uint64_t value, const auto& entry) {
                 return value < entry.first;
             });
         if (position == values.begin()) {
-            return std::nullopt;
+            const auto& anchor = statuses->anchor;
+            return anchor.has_value() && anchor->first <= sequence
+                ? std::optional<TradingPhase>{anchor->second}
+                : std::nullopt;
         }
         return std::prev(position)->second;
     }
 
-    [[nodiscard]] bool NormalizeOneShanghaiPhase(
+    void PublishPendingPhaseBytes() noexcept {
+        PublishProjectionWorkspaceBytes();
+    }
+
+    [[nodiscard]] bool ReservePendingProjectionGrowth(
+        std::size_t bytes,
+        EventApplyResult* result) noexcept {
+        const std::size_t used = SaturatingAdd(
+            SaturatingAdd(
+                repair_accounted_bytes_,
+                pending_projection_cut_accounted_bytes_),
+            projection_scratch_bytes_);
+        if (bytes > config_.maximum_repair_bytes ||
+            used > config_.maximum_repair_bytes - bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event phase normalization byte capacity exhausted"));
+            return false;
+        }
+        pending_projection_cut_accounted_bytes_ += bytes;
+        if (pending_projection_cut_.has_value()) {
+            pending_projection_cut_->accounted_bytes += bytes;
+        }
+        PublishPendingPhaseBytes();
+        return true;
+    }
+
+    [[nodiscard]] bool InstallPendingProjectionCut(
+        PendingProjectionCut cut,
+        EventApplyResult* result) {
+        if (pending_projection_cut_.has_value()) {
+            static_cast<void>(Failure(
+                result, "Event pending phase cut is duplicated"));
+            return false;
+        }
+        const std::size_t used = SaturatingAdd(
+            SaturatingAdd(repair_accounted_bytes_, cut.accounted_bytes),
+            projection_scratch_bytes_);
+        if (used > config_.maximum_repair_bytes) {
+            static_cast<void>(CapacityFailure(
+                result, "Event phase normalization byte capacity exhausted"));
+            return false;
+        }
+        pending_projection_cut_accounted_bytes_ = cut.accounted_bytes;
+        pending_projection_cut_.emplace(std::move(cut));
+        PublishPendingPhaseBytes();
+        stats_.repair_pending.store(true, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] bool BuildPhaseScanSpans(
+        PendingProjectionCut* cut,
+        EventApplyResult* result) {
+        if (cut->source_only_fast) {
+            return true;
+        }
+        cut->phase_spans.reserve(cut->inserted.size());
+        cut->end_expansions.reserve(cut->inserted.size());
+        for (const FactKey& key : cut->inserted) {
+            const auto fact = facts_.find(key);
+            if (fact == facts_.end()) {
+                static_cast<void>(Failure(
+                    result, "Event phase scan fact is missing"));
+                return false;
+            }
+            if (key.market != Market::kShanghai) {
+                continue;
+            }
+            CanonicalTick source{};
+            if (!LoadSourceTick(key, fact->second, &source)) {
+                static_cast<void>(Failure(
+                    result, "Event phase scan source read failed"));
+                return false;
+            }
+            const InstrumentChannelKey range =
+                InstrumentChannel(key, fact->second);
+            const InstrumentFactIndex* const journal =
+                instrument_facts_.Find(range);
+            if (journal == nullptr) {
+                static_cast<void>(Failure(
+                    result, "Event phase instrument index is missing"));
+                return false;
+            }
+            const auto& facts = journal->ordered;
+            std::size_t first_index = 0U;
+            std::size_t end_index = 0U;
+            if (source.action == TickAction::kStatus) {
+                if ((source.validity & ingest::kTickPhaseValid) == 0U) {
+                    continue;
+                }
+                const PhaseIndex* const statuses =
+                    phase_statuses_.Find(range);
+                if (statuses == nullptr) {
+                    static_cast<void>(Failure(
+                        result, "Event phase status index is missing"));
+                    return false;
+                }
+                const auto& values = statuses->ordered;
+                const auto next_status = std::upper_bound(
+                    values.begin(), values.end(), key.native_sequence,
+                    [](std::uint64_t value, const auto& entry) {
+                        return value < entry.first;
+                    });
+                const auto first = std::upper_bound(
+                    facts.begin(), facts.end(), key.native_sequence);
+                const auto end = next_status == values.end()
+                    ? facts.end()
+                    : std::lower_bound(
+                          facts.begin(), facts.end(), next_status->first);
+                first_index = static_cast<std::size_t>(
+                    std::distance(facts.begin(), first));
+                end_index = static_cast<std::size_t>(
+                    std::distance(facts.begin(), end));
+            } else {
+                const auto position = std::lower_bound(
+                    facts.begin(), facts.end(), key.native_sequence);
+                if (position == facts.end() ||
+                    *position != key.native_sequence) {
+                    static_cast<void>(Failure(
+                        result, "Event phase fact index diverged"));
+                    return false;
+                }
+                first_index = static_cast<std::size_t>(
+                    std::distance(facts.begin(), position));
+                end_index = first_index + 1U;
+            }
+            if (first_index < end_index) {
+                cut->phase_spans.push_back(
+                    PhaseScanSpan{range, first_index, end_index});
+            }
+        }
+
+        std::sort(
+            cut->phase_spans.begin(), cut->phase_spans.end(),
+            [](const PhaseScanSpan& left, const PhaseScanSpan& right) {
+                return std::tie(left.range, left.next_index,
+                                left.end_index) <
+                    std::tie(right.range, right.next_index,
+                             right.end_index);
+            });
+        std::size_t merged = 0U;
+        for (const PhaseScanSpan& span : cut->phase_spans) {
+            if (merged != 0U &&
+                cut->phase_spans[merged - 1U].range == span.range &&
+                span.next_index <=
+                    cut->phase_spans[merged - 1U].end_index) {
+                cut->phase_spans[merged - 1U].end_index = std::max(
+                    cut->phase_spans[merged - 1U].end_index,
+                    span.end_index);
+                continue;
+            }
+            cut->phase_spans[merged++] = span;
+        }
+        cut->phase_spans.resize(merged);
+        return true;
+    }
+
+    [[nodiscard]] std::size_t PendingPhaseDirtyGrowth(
+        const PendingProjectionCut& cut,
         const FactKey& key,
-        bool* changed) {
-        *changed = false;
-        FactRecord& record = facts_.at(key);
+        const FactRecord& record) const noexcept {
+        std::size_t bytes = cut.phase_dirty_bundles.contains(key)
+            ? 0U
+            : TreeNodeOwnedBytes<std::pair<const FactKey, bool>>();
+        for (const auto& [order, role] : record.roles) {
+            static_cast<void>(role);
+            const auto dirty = cut.phase_dirty_orders.find(order);
+            if (dirty == cut.phase_dirty_orders.end()) {
+                bytes = SaturatingAdd(
+                    bytes,
+                    TreeNodeOwnedBytes<
+                        std::pair<const OrderKey, DirtyOrder>>());
+                bytes = SaturatingAdd(
+                    bytes, TreeNodeOwnedBytes<std::uint64_t>());
+            } else if (!dirty->second.new_sequences.contains(
+                           key.native_sequence)) {
+                bytes = SaturatingAdd(
+                    bytes, TreeNodeOwnedBytes<std::uint64_t>());
+            }
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] bool NormalizePendingPhaseFact(
+        const FactKey& key,
+        EventApplyResult* result,
+        std::size_t* work_bytes) {
+        PendingProjectionCut& cut = *pending_projection_cut_;
+        const auto fact = facts_.find(key);
+        if (fact == facts_.end()) {
+            static_cast<void>(Failure(
+                result, "Event pending phase fact disappeared"));
+            return false;
+        }
+        FactRecord& record = fact->second;
+        *work_bytes = PhaseFactWorkBytes(record);
         CanonicalTick projected{};
         if (!LoadProjectedTick(key, record, &projected)) {
+            static_cast<void>(Failure(
+                result, "Event pending phase fact read failed"));
             return false;
         }
         if (projected.common.identity.market != Market::kShanghai ||
@@ -2976,12 +5633,29 @@ private:
             InstrumentChannel(key, record), key.native_sequence);
         const TradingPhase next = phase.value_or(TradingPhase::kUnknown);
         const bool next_valid = phase.has_value() &&
-                                next != TradingPhase::kUnknown;
+            next != TradingPhase::kUnknown;
         const bool old_valid =
             (projected.validity & ingest::kTickPhaseValid) != 0U;
         if (projected.phase == next && old_valid == next_valid) {
             return true;
         }
+
+        const bool inserted = std::binary_search(
+            cut.inserted.begin(), cut.inserted.end(), key);
+        if (!inserted) {
+            if (record.roles.size() > 2U) {
+                static_cast<void>(Failure(
+                    result,
+                    "Event non-status phase fact has unbounded role fanout"));
+                return false;
+            }
+            const std::size_t growth = PendingPhaseDirtyGrowth(
+                cut, key, record);
+            if (!ReservePendingProjectionGrowth(growth, result)) {
+                return false;
+            }
+        }
+
         projected.phase = next;
         if (next_valid) {
             projected.validity |= ingest::kTickPhaseValid;
@@ -2991,102 +5665,849 @@ private:
         record.projected_phase = projected.phase;
         record.projected_phase_valid = next_valid;
         record.fact_hash = HashFact(projected);
-        *changed = true;
+        if (!inserted) {
+            cut.phase_dirty_bundles[key] = true;
+            for (const auto& [order, role] : record.roles) {
+                static_cast<void>(role);
+                DirtyOrder& dirty = cut.phase_dirty_orders[order];
+                dirty.new_sequences.insert(key.native_sequence);
+                dirty.late = true;
+                ++stats_.phase_dirty_roles_discovered;
+            }
+        }
         return true;
     }
 
-    [[nodiscard]] bool NormalizeShanghaiPhases(
-        std::span<const FactKey> inserted,
-        std::set<FactKey>* changed) {
-        std::set<FactKey> candidates;
-        for (const FactKey& key : inserted) {
-            const FactRecord& record = facts_.at(key);
-            if (key.market != Market::kShanghai) {
-                continue;
-            }
-            CanonicalTick source{};
-            if (!LoadSourceTick(key, record, &source)) {
-                return false;
-            }
-            const InstrumentChannelKey range =
-                InstrumentChannel(key, record);
-            const auto journal = instrument_facts_.find(range);
-            if (journal == instrument_facts_.end()) {
-                continue;
-            }
-            if (source.action != TickAction::kStatus ||
-                (source.validity & ingest::kTickPhaseValid) == 0U) {
-                candidates.insert(key);
-                continue;
-            }
-            const auto statuses = phase_statuses_.find(range);
-            std::uint64_t end =
-                std::numeric_limits<std::uint64_t>::max();
-            if (statuses != phase_statuses_.end()) {
-                const auto& values = statuses->second.ordered;
-                const auto next = std::upper_bound(
-                    values.begin(), values.end(), key.native_sequence,
-                    [](std::uint64_t value, const auto& entry) {
-                        return value < entry.first;
-                    });
-                if (next != values.end()) {
-                    end = next->first;
+    [[nodiscard]] bool ReconcilePendingProjectionBytes(
+        EventApplyResult* result) noexcept {
+        const std::size_t actual = PendingProjectionCutOwnedBytes(
+            *pending_projection_cut_);
+        const std::size_t accounted =
+            pending_projection_cut_->accounted_bytes;
+        return actual <= accounted || ReservePendingProjectionGrowth(
+            actual - accounted, result);
+    }
+
+    [[nodiscard]] bool QueuePendingRepairOrder(
+        const OrderKey& order,
+        EventApplyResult* result) {
+        PendingProjectionCut& cut = *pending_projection_cut_;
+        if (cut.repair_orders.contains(order)) {
+            return true;
+        }
+        const std::size_t old_deque = DequeOwnedBytes<OrderKey>(
+            cut.order_frontier.size());
+        const std::size_t next_deque = DequeOwnedBytes<OrderKey>(
+            cut.order_frontier.size() + 1U);
+        std::size_t growth = TreeNodeOwnedBytes<OrderKey>();
+        if (next_deque > old_deque) {
+            growth = SaturatingAdd(growth, next_deque - old_deque);
+        }
+        if (!ReservePendingProjectionGrowth(growth, result)) {
+            return false;
+        }
+        cut.repair_orders.insert(order);
+        cut.order_frontier.push_back(order);
+        return true;
+    }
+
+    [[nodiscard]] bool QueuePendingRepairFact(
+        const FactKey& fact,
+        EventApplyResult* result) {
+        PendingProjectionCut& cut = *pending_projection_cut_;
+        if (cut.repair_facts.contains(fact)) {
+            return true;
+        }
+        const std::size_t old_deque = DequeOwnedBytes<FactKey>(
+            cut.fact_frontier.size());
+        const std::size_t next_deque = DequeOwnedBytes<FactKey>(
+            cut.fact_frontier.size() + 1U);
+        std::size_t growth = TreeNodeOwnedBytes<FactKey>();
+        if (next_deque > old_deque) {
+            growth = SaturatingAdd(growth, next_deque - old_deque);
+        }
+        if (!ReservePendingProjectionGrowth(growth, result)) {
+            return false;
+        }
+        cut.repair_facts.insert(fact);
+        cut.fact_frontier.push_back(fact);
+        return true;
+    }
+
+    [[nodiscard]] bool PendingPhaseSliceExhausted(
+        std::size_t nodes,
+        std::size_t bytes,
+        std::chrono::steady_clock::time_point started) const noexcept {
+        if (nodes >= config_.phase_slice_max_nodes ||
+            bytes >= config_.phase_slice_max_bytes) {
+            return true;
+        }
+        const auto elapsed_signed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        const std::uint64_t elapsed = elapsed_signed <= 0
+            ? 0U
+            : static_cast<std::uint64_t>(elapsed_signed);
+        return elapsed >= config_.phase_slice_max_cpu_ns;
+    }
+
+    [[nodiscard]] bool AdvancePendingProjectionCut(
+        EventApplyResult* result) {
+        if (!pending_projection_cut_.has_value()) {
+            return true;
+        }
+        ++stats_.phase_normalization_slices;
+        const auto started = std::chrono::steady_clock::now();
+        std::size_t processed_nodes = 0U;
+        std::size_t processed_bytes = 0U;
+        while (pending_projection_cut_.has_value()) {
+            PendingProjectionCut& cut = *pending_projection_cut_;
+            std::size_t one_bytes = 0U;
+            if (cut.stage == PendingCutStage::kNormalize) {
+                while (cut.next_phase_span < cut.phase_spans.size() &&
+                       cut.phase_spans[cut.next_phase_span].next_index >=
+                           cut.phase_spans[cut.next_phase_span].end_index) {
+                    ++cut.next_phase_span;
                 }
+                if (cut.next_phase_span == cut.phase_spans.size()) {
+                    cut.stage = PendingCutStage::kRegisterInserted;
+                    continue;
+                }
+                PhaseScanSpan& span = cut.phase_spans[cut.next_phase_span];
+                const InstrumentFactIndex* const journal =
+                    instrument_facts_.Find(span.range);
+                if (journal == nullptr ||
+                    journal->ordered.size() < span.end_index) {
+                    static_cast<void>(Failure(
+                        result, "Event pending phase cursor diverged"));
+                    return false;
+                }
+                const std::uint64_t sequence =
+                    journal->ordered[span.next_index];
+                const FactKey key{
+                    span.range.trade_date, span.range.market,
+                    span.range.channel, sequence};
+                if (!NormalizePendingPhaseFact(
+                        key, result, &one_bytes)) {
+                    return false;
+                }
+                ++span.next_index;
+                ++stats_.phase_facts_scanned;
+            } else if (cut.stage ==
+                       PendingCutStage::kRegisterInserted) {
+                if (cut.next_inserted == cut.inserted.size()) {
+                    cut.stage = PendingCutStage::kSeedOrders;
+                    cut.seed_order = cut.phase_dirty_orders.empty()
+                        ? std::optional<OrderKey>{}
+                        : std::optional<OrderKey>{
+                              cut.phase_dirty_orders.begin()->first};
+                    continue;
+                }
+                const FactKey key = cut.inserted[cut.next_inserted++];
+                FactRecord& record = facts_.at(key);
+                cut.phase_dirty_bundles[key] = record.late;
+                if (!record.projectable) {
+                    cut.saw_invalid = true;
+                } else if (!cut.source_only_fast) {
+                    if (!RegisterFactUses(
+                            key, &record, &cut.phase_dirty_orders,
+                            &cut.end_expansions, result)) {
+                        if (healthy_) {
+                            static_cast<void>(CapacityFailure(
+                                result,
+                                "Event OrderUseIndex capacity exhausted"));
+                        }
+                        return false;
+                    }
+                } else if (record.barrier &&
+                           !InsertBarrier(
+                               InstrumentChannel(key, record), key,
+                               result)) {
+                    return false;
+                }
+                if (!RefreshHotFactAccounting(key)) {
+                    if (healthy_) {
+                        static_cast<void>(Failure(
+                            result, "Event hot fact accounting failed"));
+                    } else {
+                        result->code = EventApplyCode::kCapacityExhausted;
+                    }
+                    return false;
+                }
+                if (!ReconcilePendingProjectionBytes(result)) {
+                    return false;
+                }
+                one_bytes = PhaseFactWorkBytes(record);
+            } else if (cut.stage == PendingCutStage::kSeedOrders) {
+                if (!cut.seed_order.has_value()) {
+                    cut.stage = PendingCutStage::kSeedEndOrders;
+                    cut.seed_end_expansion = 0U;
+                    cut.seed_end_order = cut.phase_dirty_orders.empty()
+                        ? std::optional<OrderKey>{}
+                        : std::optional<OrderKey>{
+                              cut.phase_dirty_orders.begin()->first};
+                    continue;
+                }
+                const auto dirty = cut.phase_dirty_orders.find(
+                    *cut.seed_order);
+                if (dirty == cut.phase_dirty_orders.end()) {
+                    static_cast<void>(Failure(
+                        result, "Event pending dirty-order cursor diverged"));
+                    return false;
+                }
+                const auto next = std::next(dirty);
+                cut.seed_order = next == cut.phase_dirty_orders.end()
+                    ? std::optional<OrderKey>{}
+                    : std::optional<OrderKey>{next->first};
+                if (dirty->second.late ||
+                    (active_repair_.has_value() &&
+                     active_repair_->tasks.contains(dirty->first))) {
+                    if (!QueuePendingRepairOrder(dirty->first, result)) {
+                        return false;
+                    }
+                }
+                one_bytes = TreeNodeOwnedBytes<
+                    std::pair<const OrderKey, DirtyOrder>>();
+            } else if (cut.stage == PendingCutStage::kSeedEndOrders) {
+                if (cut.seed_end_expansion ==
+                    cut.end_expansions.size()) {
+                    cut.stage = PendingCutStage::kSeedBundles;
+                    cut.seed_bundle = cut.phase_dirty_bundles.empty()
+                        ? std::optional<FactKey>{}
+                        : std::optional<FactKey>{
+                              cut.phase_dirty_bundles.begin()->first};
+                    continue;
+                }
+                const EndExpansionTask& expansion =
+                    cut.end_expansions[cut.seed_end_expansion];
+                if (!cut.seed_end_order.has_value()) {
+                    if (!QueuePendingRepairFact(
+                            expansion.fact, result)) {
+                        return false;
+                    }
+                    ++cut.seed_end_expansion;
+                    cut.seed_end_order = cut.phase_dirty_orders.empty()
+                        ? std::optional<OrderKey>{}
+                        : std::optional<OrderKey>{
+                              cut.phase_dirty_orders.begin()->first};
+                    one_bytes = sizeof(EndExpansionTask);
+                } else {
+                    const auto dirty = cut.phase_dirty_orders.find(
+                        *cut.seed_end_order);
+                    if (dirty == cut.phase_dirty_orders.end()) {
+                        static_cast<void>(Failure(
+                            result,
+                            "Event END dirty-order cursor diverged"));
+                        return false;
+                    }
+                    const auto next = std::next(dirty);
+                    cut.seed_end_order =
+                        next == cut.phase_dirty_orders.end()
+                        ? std::optional<OrderKey>{}
+                        : std::optional<OrderKey>{next->first};
+                    const OrderKey& order = dirty->first;
+                    const InstrumentChannelKey range{
+                        order.trade_date, order.market,
+                        order.instrument_id, order.channel};
+                    const OrderHistory* const history =
+                        order_histories_.Find(order);
+                    const std::size_t candidate_slot =
+                        expansion.active_only && history != nullptr
+                            ? history->active_end_slot
+                            : history != nullptr
+                                  ? history->instrument_order_slot
+                                  : std::numeric_limits<std::size_t>::max();
+                    if (range == expansion.range &&
+                        history != nullptr &&
+                        candidate_slot < expansion.candidate_count &&
+                        !QueuePendingRepairOrder(order, result)) {
+                        return false;
+                    }
+                    one_bytes = sizeof(OrderKey);
+                }
+            } else if (cut.stage == PendingCutStage::kSeedBundles) {
+                if (!cut.seed_bundle.has_value()) {
+                    cut.stage = PendingCutStage::kExpandComponents;
+                    continue;
+                }
+                const auto dirty = cut.phase_dirty_bundles.find(
+                    *cut.seed_bundle);
+                if (dirty == cut.phase_dirty_bundles.end()) {
+                    static_cast<void>(Failure(
+                        result, "Event pending dirty-bundle cursor diverged"));
+                    return false;
+                }
+                const auto next = std::next(dirty);
+                cut.seed_bundle = next == cut.phase_dirty_bundles.end()
+                    ? std::optional<FactKey>{}
+                    : std::optional<FactKey>{next->first};
+                if (dirty->second &&
+                    !QueuePendingRepairFact(dirty->first, result)) {
+                    return false;
+                }
+                one_bytes = TreeNodeOwnedBytes<
+                    std::pair<const FactKey, bool>>();
+            } else if (cut.stage ==
+                       PendingCutStage::kExpandComponents) {
+                if (!cut.active_fact.has_value() &&
+                    !cut.fact_frontier.empty()) {
+                    cut.active_fact = cut.fact_frontier.front();
+                    cut.fact_frontier.pop_front();
+                    cut.active_fact_role = 0U;
+                }
+                if (cut.active_fact.has_value()) {
+                    const FactRecord& record = facts_.at(*cut.active_fact);
+                    if (cut.active_fact_role == record.roles.size()) {
+                        cut.active_fact.reset();
+                        continue;
+                    }
+                    const OrderKey order =
+                        record.roles[cut.active_fact_role++].first;
+                    if (cut.phase_dirty_orders.contains(order) &&
+                        !QueuePendingRepairOrder(order, result)) {
+                        return false;
+                    }
+                    one_bytes = sizeof(std::pair<OrderKey, OrderRole>);
+                } else {
+                    if (!cut.active_order.has_value() &&
+                        !cut.order_frontier.empty()) {
+                        cut.active_order = cut.order_frontier.front();
+                        cut.order_frontier.pop_front();
+                        const auto dirty = cut.phase_dirty_orders.find(
+                            *cut.active_order);
+                        cut.active_order_sequence =
+                            dirty == cut.phase_dirty_orders.end() ||
+                                    dirty->second.new_sequences.empty()
+                                ? std::optional<std::uint64_t>{}
+                                : std::optional<std::uint64_t>{
+                                      *dirty->second.new_sequences.begin()};
+                    }
+                    if (cut.active_order.has_value() &&
+                        cut.active_order_sequence.has_value()) {
+                        const OrderKey order = *cut.active_order;
+                        const std::uint64_t sequence =
+                            *cut.active_order_sequence;
+                        const DirtyOrder& dirty =
+                            cut.phase_dirty_orders.at(order);
+                        const auto next =
+                            dirty.new_sequences.upper_bound(sequence);
+                        cut.active_order_sequence =
+                            next == dirty.new_sequences.end()
+                                ? std::optional<std::uint64_t>{}
+                                : std::optional<std::uint64_t>{*next};
+                        const FactKey key{
+                            order.trade_date, order.market,
+                            order.channel, sequence};
+                        if (cut.phase_dirty_bundles.contains(key) &&
+                            !QueuePendingRepairFact(key, result)) {
+                            return false;
+                        }
+                        one_bytes = sizeof(std::uint64_t);
+                    } else if (cut.active_order.has_value()) {
+                        cut.active_order.reset();
+                        continue;
+                    } else if (cut.fact_frontier.empty() &&
+                               cut.order_frontier.empty()) {
+                        cut.stage = PendingCutStage::kFinalize;
+                        continue;
+                    }
+                }
+            } else {
+                return FinalizePendingProjectionCut(result);
             }
-            const auto& values = journal->second.ordered;
-            const auto position = std::upper_bound(
-                values.begin(), values.end(), key.native_sequence);
-            for (auto cursor = position;
-                 cursor != values.end() && *cursor < end;
-                 ++cursor) {
-                candidates.insert(FactKey{
-                    range.trade_date, range.market, range.channel, *cursor});
+
+            ++processed_nodes;
+            processed_bytes = SaturatingAdd(processed_bytes, one_bytes);
+            if (PendingPhaseSliceExhausted(
+                    processed_nodes, processed_bytes, started)) {
+                result->repair_pending = true;
+                return true;
             }
         }
-        for (const FactKey& key : candidates) {
-            bool one_changed = false;
-            if (!NormalizeOneShanghaiPhase(key, &one_changed)) {
+        return true;
+    }
+
+    [[nodiscard]] bool ReservePendingFinalizeScratch(
+        EventApplyResult* result) noexcept {
+        const PendingProjectionCut& cut = *pending_projection_cut_;
+        std::size_t live_order_count = 0U;
+        std::size_t maximum_live_evals = 0U;
+        for (const auto& [order, dirty] : cut.phase_dirty_orders) {
+            if (cut.repair_orders.contains(order)) {
+                continue;
+            }
+            const OrderHistory* const history = order_histories_.Find(order);
+            if (history == nullptr ||
+                dirty.new_sequences.empty()) {
+                static_cast<void>(Failure(
+                    result, "Event live projection order disappeared"));
                 return false;
             }
-            if (one_changed) {
-                changed->insert(key);
+            ++live_order_count;
+            // RecomputeOrder can stop early on convergence. Charging the whole
+            // retained suffix avoids an unbounded counting pass before the
+            // one-shot projection commit.
+            maximum_live_evals = SaturatingAdd(
+                maximum_live_evals, history->suffix.size());
+        }
+
+        std::size_t bytes = SaturatingMultiply(
+            cut.inserted.size(), sizeof(FactKey));
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(live_order_count, sizeof(OrderKey)));
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                maximum_live_evals,
+                TreeNodeOwnedBytes<
+                    std::pair<const RoleCacheKey, RoleEval>>()));
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                maximum_live_evals,
+                TreeNodeOwnedBytes<std::pair<const FactKey, bool>>()));
+        // Dependency classification copies at most one node per inserted fact
+        // plus every cut dependency. The deliberate over-count also covers a
+        // malformed duplicate dependency until its consistency check fails.
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(
+                SaturatingAdd(cut.inserted.size(), cut.dependencies.size()),
+                TreeNodeOwnedBytes<RawTickDependency>()));
+        return ReservePendingProjectionGrowth(bytes, result);
+    }
+
+    [[nodiscard]] bool FinalizePendingProjectionCut(
+        EventApplyResult* result) {
+        PendingProjectionCut& cut = *pending_projection_cut_;
+        if (!ReservePendingFinalizeScratch(result)) {
+            return false;
+        }
+        std::map<OrderKey, DirtyOrder> dirty_orders =
+            std::move(cut.phase_dirty_orders);
+        std::map<FactKey, bool> dirty_bundles =
+            std::move(cut.phase_dirty_bundles);
+        std::vector<EndExpansionTask> end_expansions =
+            std::move(cut.end_expansions);
+        const std::set<OrderKey>& repair_orders = cut.repair_orders;
+        const std::set<FactKey>& repair_facts = cut.repair_facts;
+
+        std::map<OrderKey, DirtyOrder> repair_dirty_orders;
+        std::map<OrderKey, DirtyOrder> live_dirty_orders;
+        while (!dirty_orders.empty()) {
+            auto node = dirty_orders.extract(dirty_orders.begin());
+            auto& output = repair_orders.contains(node.key())
+                ? repair_dirty_orders
+                : live_dirty_orders;
+            output.insert(output.end(), std::move(node));
+        }
+        std::map<FactKey, bool> repair_dirty_bundles;
+        std::map<FactKey, bool> live_dirty_bundles;
+        while (!dirty_bundles.empty()) {
+            auto node = dirty_bundles.extract(dirty_bundles.begin());
+            auto& output = repair_facts.contains(node.key())
+                ? repair_dirty_bundles
+                : live_dirty_bundles;
+            output.insert(output.end(), std::move(node));
+        }
+        std::vector<FactKey> repair_inserted;
+        std::vector<FactKey> live_inserted;
+        const std::size_t repair_inserted_count =
+            static_cast<std::size_t>(std::count_if(
+                cut.inserted.begin(), cut.inserted.end(),
+                [&repair_facts](const FactKey& key) {
+                    return repair_facts.contains(key);
+                }));
+        repair_inserted.reserve(repair_inserted_count);
+        live_inserted.reserve(cut.inserted.size() - repair_inserted_count);
+        for (const FactKey& key : cut.inserted) {
+            (repair_facts.contains(key)
+                 ? repair_inserted
+                 : live_inserted)
+                .push_back(key);
+        }
+
+        std::set<RawTickDependency> repair_dependencies;
+        std::set<RawTickDependency> live_dependencies;
+        const auto add_fact_dependency = [&cut](
+            const FactKey& key,
+            std::set<RawTickDependency>* output) -> bool {
+            const auto dependency = std::lower_bound(
+                cut.inserted_dependencies.begin(),
+                cut.inserted_dependencies.end(), key,
+                [](const auto& entry, const FactKey& value) {
+                    return entry.first < value;
+                });
+            if (dependency == cut.inserted_dependencies.end() ||
+                dependency->first != key) {
+                return false;
+            }
+            output->insert(dependency->second);
+            return true;
+        };
+        for (const FactKey& key : repair_inserted) {
+            if (!add_fact_dependency(key, &repair_dependencies)) {
+                static_cast<void>(Failure(
+                    result, "Event raw dependency fact read failed"));
+                return false;
             }
         }
+        for (const FactKey& key : live_inserted) {
+            if (!add_fact_dependency(key, &live_dependencies)) {
+                static_cast<void>(Failure(
+                    result, "Event raw dependency fact read failed"));
+                return false;
+            }
+        }
+        for (const RawTickDependency& dependency : cut.dependencies) {
+            if (!repair_dependencies.contains(dependency) &&
+                !live_dependencies.contains(dependency)) {
+                (!live_inserted.empty()
+                     ? live_dependencies
+                     : repair_dependencies)
+                    .insert(dependency);
+            }
+        }
+
+        const bool has_repair_work =
+            !repair_dirty_orders.empty() ||
+            !repair_dirty_bundles.empty() ||
+            !end_expansions.empty();
+        if (has_repair_work &&
+            !MergeRepair(
+                repair_dirty_orders, repair_dirty_bundles,
+                repair_inserted, end_expansions,
+                std::move(repair_dependencies), result)) {
+            if (healthy_) {
+                static_cast<void>(Failure(
+                    result, "Event repair transaction merge failed"));
+            }
+            return false;
+        }
+
+        std::map<RoleCacheKey, RoleEval> eval_patch;
+        std::vector<OrderKey> touched_orders;
+        touched_orders.reserve(live_dirty_orders.size());
+        for (const auto& [order, dirty] : live_dirty_orders) {
+            if (!RecomputeOrder(
+                    order, dirty, &eval_patch,
+                    &live_dirty_bundles, result)) {
+                static_cast<void>(Failure(
+                    result, "Event order-role projection failed"));
+                return false;
+            }
+            touched_orders.push_back(order);
+        }
+        if (!live_dirty_bundles.empty() || !live_inserted.empty()) {
+            if (!CommitProjection(
+                    touched_orders, &eval_patch, nullptr,
+                    &live_dirty_bundles, live_inserted,
+                    std::move(live_dependencies), false, result)) {
+                return false;
+            }
+        } else if (!live_dependencies.empty()) {
+            if (!QueueNoopDependencies(std::move(live_dependencies))) {
+                static_cast<void>(CapacityFailure(
+                    result,
+                    "Event pending revision byte capacity exhausted"));
+                return false;
+            }
+        }
+        result->code = cut.saw_conflict
+            ? EventApplyCode::kSourceConflict
+            : (cut.saw_invalid ? EventApplyCode::kInvalidInput
+                               : EventApplyCode::kApplied);
+        if (!AdvanceDurableCommits()) {
+            result->code = EventApplyCode::kSinkFailed;
+            return false;
+        }
+        for (const auto& [channel, floor] : cut.retention_requests) {
+            QueueEviction(channel, floor);
+        }
+
+        pending_projection_cut_.reset();
+        pending_projection_cut_accounted_bytes_ = 0U;
+        PublishPendingPhaseBytes();
+        stats_.repair_pending.store(
+            active_repair_.has_value(), std::memory_order_release);
+        if (!ContinueEviction()) {
+            result->code = EventApplyCode::kFailed;
+            return false;
+        }
+        result->repair_pending = active_repair_.has_value();
         return true;
     }
 
     [[nodiscard]] bool EnsureOrder(
         const OrderKey& order,
+        std::uint64_t first_use_sequence,
+        std::map<OrderKey, DirtyOrder>* dirty_orders,
+        EventApplyResult* result,
         OrderHistory** output) {
-        auto position = order_histories_.find(order);
-        if (position == order_histories_.end()) {
-            if (order_histories_.size() >= config_.maximum_orders) {
+        OrderHistory* position = order_histories_.Find(order);
+        if (position == nullptr) {
+            if (order_histories_.size() >= config_.maximum_carry_orders) {
                 return false;
             }
-            auto inserted = order_histories_.try_emplace(order);
-            position = inserted.first;
+
+            auto prepared_history = order_histories_.PrepareInsert(order);
+            if (prepared_history.is_duplicate()) {
+                return false;
+            }
+            const std::size_t history_peak =
+                prepared_history.owned_byte_delta();
             const InstrumentChannelKey range{
                 order.trade_date, order.market, order.instrument_id,
                 order.channel};
-            // Orders never leave the intraday state.  Keep a direct
-            // instrument/channel index so a Shanghai END barrier visits only
-            // the security it actually closes, instead of every order owned
-            // by this actor.
-            orders_by_instrument_channel_[range].push_back(order);
-            const auto barriers = barriers_.find(range);
-            if (barriers != barriers_.end()) {
-                for (const auto& [sequence, fact_key] : barriers->second) {
-                    if (!SetOrderUse(
-                            &position->second, sequence,
-                            OrderRole::kBarrier)) {
-                        return false;
-                    }
-                    AppendUniqueFactRole(
-                        &facts_.at(fact_key), order, OrderRole::kBarrier);
+            auto instrument_index =
+                orders_by_instrument_channel_.find(range);
+            const bool new_instrument_index =
+                instrument_index == orders_by_instrument_channel_.end();
+            std::optional<OrderIndexList::PreparedAppend>
+                prepared_instrument;
+            const std::size_t initial_list_bytes =
+                OrderIndexList::AllocationOwnedBytes(std::min(
+                    OrderIndexList::kInitialCapacity,
+                    config_.maximum_carry_orders));
+            std::size_t instrument_peak = initial_list_bytes;
+            if (!new_instrument_index) {
+                prepared_instrument.emplace(
+                    instrument_index->second.PrepareAppend());
+                instrument_peak =
+                    prepared_instrument->peak_allocation_owned_bytes();
+            }
+
+            auto active_index = active_end_orders_.end();
+            const bool needs_active_index =
+                order.market == Market::kShanghai;
+            bool new_active_index = false;
+            std::optional<OrderIndexList::PreparedAppend> prepared_active;
+            std::size_t active_peak = 0U;
+            if (needs_active_index) {
+                active_index = active_end_orders_.find(range);
+                new_active_index = active_index == active_end_orders_.end();
+                if (new_active_index) {
+                    active_peak = initial_list_bytes;
+                } else {
+                    prepared_active.emplace(
+                        active_index->second.PrepareAppend());
+                    active_peak =
+                        prepared_active->peak_allocation_owned_bytes();
                 }
             }
+
+            std::size_t reserved = history_peak;
+            reserved = SaturatingAdd(reserved, instrument_peak);
+            if (new_instrument_index) {
+                reserved = SaturatingAdd(
+                    reserved, OrderIndexTreeNodeOwnedBytes());
+            }
+            reserved = SaturatingAdd(reserved, active_peak);
+            if (new_active_index) {
+                reserved = SaturatingAdd(
+                    reserved, OrderIndexTreeNodeOwnedBytes());
+            }
+            if (!ReserveOrderHistoryGrowth(reserved, result)) {
+                return false;
+            }
+
+            bool history_inserted = false;
+            bool instrument_node_inserted = false;
+            bool instrument_appended = false;
+            bool active_node_inserted = false;
+            bool active_appended = false;
+            OrderIndexList::AppendResult instrument_result{};
+            OrderIndexList::AppendResult active_result{};
+            const auto rollback = [&]() noexcept {
+                std::size_t retained_reserved = 0U;
+                std::size_t released_old_storage = 0U;
+                bool consistent = true;
+                try {
+                    if (active_appended) {
+                        const auto erased =
+                            active_index->second.EraseAtSwap(
+                                active_result.index);
+                        consistent = consistent && !erased.moved.has_value();
+                        if (!new_active_index && active_result.grew) {
+                            retained_reserved = SaturatingAdd(
+                                retained_reserved,
+                                active_result.peak_allocation_owned_bytes);
+                            released_old_storage = SaturatingAdd(
+                                released_old_storage,
+                                active_result.released_owned_bytes);
+                        }
+                    }
+                    if (active_node_inserted) {
+                        consistent = consistent &&
+                            active_index->second.empty();
+                        static_cast<void>(
+                            active_index->second.ReleaseStorage());
+                        active_end_orders_.erase(active_index);
+                    }
+                    if (instrument_appended) {
+                        const auto erased =
+                            instrument_index->second.EraseAtSwap(
+                                instrument_result.index);
+                        consistent = consistent && !erased.moved.has_value();
+                        if (!new_instrument_index &&
+                            instrument_result.grew) {
+                            retained_reserved = SaturatingAdd(
+                                retained_reserved,
+                                instrument_result.
+                                    peak_allocation_owned_bytes);
+                            released_old_storage = SaturatingAdd(
+                                released_old_storage,
+                                instrument_result.released_owned_bytes);
+                        }
+                    }
+                    if (instrument_node_inserted) {
+                        consistent = consistent &&
+                            instrument_index->second.empty();
+                        static_cast<void>(
+                            instrument_index->second.ReleaseStorage());
+                        orders_by_instrument_channel_.erase(
+                            instrument_index);
+                    }
+                    if (history_inserted) {
+                        const auto erased = order_histories_.Erase(order);
+                        consistent = consistent && erased.erased &&
+                            erased.released_owned_bytes ==
+                                history_peak;
+                    }
+                    consistent = consistent &&
+                        retained_reserved <= reserved;
+                    const std::size_t release = SaturatingAdd(
+                        retained_reserved <= reserved
+                            ? reserved - retained_reserved
+                            : 0U,
+                        released_old_storage);
+                    consistent = consistent &&
+                        ReleaseOrderHistoryBytes(release);
+                } catch (...) {
+                    consistent = false;
+                }
+                if (!consistent) {
+                    SetFatal("Event order insertion rollback diverged");
+                }
+            };
+
+            try {
+                const auto inserted_history = order_histories_.CommitInsert(
+                    std::move(prepared_history));
+                if (!inserted_history.inserted ||
+                    inserted_history.owned_byte_delta == 0U) {
+                    throw std::logic_error(
+                        "Event order table insertion diverged");
+                }
+                position = inserted_history.value;
+                history_inserted = true;
+
+                if (new_instrument_index) {
+                    const auto [inserted, was_inserted] =
+                        orders_by_instrument_channel_.try_emplace(
+                            range, config_.maximum_carry_orders);
+                    if (!was_inserted) {
+                        throw std::logic_error(
+                            "Event instrument order index insertion diverged");
+                    }
+                    instrument_index = inserted;
+                    instrument_node_inserted = true;
+                    prepared_instrument.emplace(
+                        instrument_index->second.PrepareAppend());
+                }
+                if (prepared_instrument->peak_allocation_owned_bytes() !=
+                    instrument_peak) {
+                    throw std::logic_error(
+                        "Event instrument order index layout changed");
+                }
+                instrument_result =
+                    instrument_index->second.CommitAppend(
+                        std::move(*prepared_instrument), order);
+                instrument_appended = true;
+                position->instrument_order_slot = instrument_result.index;
+
+                if (needs_active_index) {
+                    if (new_active_index) {
+                        const auto [inserted, was_inserted] =
+                            active_end_orders_.try_emplace(
+                                range, config_.maximum_carry_orders);
+                        if (!was_inserted) {
+                            throw std::logic_error(
+                                "Event active END index insertion diverged");
+                        }
+                        active_index = inserted;
+                        active_node_inserted = true;
+                        prepared_active.emplace(
+                            active_index->second.PrepareAppend());
+                    }
+                    if (prepared_active->peak_allocation_owned_bytes() !=
+                        active_peak) {
+                        throw std::logic_error(
+                            "Event active END index layout changed");
+                    }
+                    active_result = active_index->second.CommitAppend(
+                        std::move(*prepared_active), order);
+                    active_appended = true;
+                    position->active_end_slot = active_result.index;
+                }
+            } catch (...) {
+                rollback();
+                throw;
+            }
+
+            const std::size_t released_old_storage = SaturatingAdd(
+                instrument_result.released_owned_bytes,
+                active_result.released_owned_bytes);
+            if (!ReleaseOrderHistoryBytes(released_old_storage)) {
+                return false;
+            }
+            const ChannelKey channel{
+                order.trade_date, order.market, order.channel};
+            const auto channel_state = channel_states_.find(channel);
+            if (channel_state != channel_states_.end()) {
+                position->baseline.compacted_before =
+                    channel_state->second.sealed_before;
+            }
         }
-        *output = &position->second;
+        const ChannelKey channel{
+            order.trade_date, order.market, order.channel};
+        const auto channel_state = channel_states_.find(channel);
+        if (channel_state != channel_states_.end()) {
+            position->baseline.compacted_before = std::max(
+                position->baseline.compacted_before,
+                channel_state->second.sealed_before);
+        }
+
+        const InstrumentChannelKey range{
+            order.trade_date, order.market, order.instrument_id,
+            order.channel};
+        const BarrierRangeIndex* const barriers = barriers_.Find(range);
+        if (barriers != nullptr) {
+            for (auto barrier = barriers->lower_bound(
+                     first_use_sequence);
+                 barrier != barriers->end(); ++barrier) {
+                if (FindOrderUse(
+                        position, barrier->first) != nullptr) {
+                    continue;
+                }
+                if (!SetAccountedOrderUse(
+                        position, barrier->first,
+                        OrderRole::kBarrier, result)) {
+                    return false;
+                }
+                FactRecord& barrier_fact = facts_.at(barrier->second);
+                AppendUniqueFactRole(
+                    &barrier_fact, order, OrderRole::kBarrier);
+                if (!RefreshHotFactAccounting(barrier->second)) {
+                    return false;
+                }
+                DirtyOrder& dirty = (*dirty_orders)[order];
+                dirty.new_sequences.insert(barrier->first);
+                dirty.late = dirty.late || barrier_fact.late;
+            }
+        }
+        *output = position;
         return true;
     }
 
@@ -3098,11 +6519,12 @@ private:
         std::map<OrderKey, DirtyOrder>* dirty_orders,
         EventApplyResult* result) {
         OrderHistory* history = nullptr;
-        if (!EnsureOrder(order, &history)) {
+        if (!EnsureOrder(
+                order, native_sequence, dirty_orders, result, &history)) {
             return false;
         }
-        if (!SetOrderUse(
-                history, native_sequence, role)) {
+        if (!SetAccountedOrderUse(
+                history, native_sequence, role, result)) {
             return false;
         }
         UpsertFactRole(record, order, role);
@@ -3117,6 +6539,7 @@ private:
         const FactKey& fact_key,
         FactRecord* record,
         std::map<OrderKey, DirtyOrder>* dirty_orders,
+        std::vector<EndExpansionTask>* end_expansions,
         EventApplyResult* result) {
         CanonicalTick fact{};
         if (!LoadProjectedTick(fact_key, *record, &fact)) {
@@ -3157,66 +6580,88 @@ private:
 
         if (record->barrier) {
             const InstrumentChannelKey range = InstrumentChannel(fact);
-            barriers_[range][fact_key.native_sequence] = fact_key;
-            const auto indexed_orders =
-                orders_by_instrument_channel_.find(range);
-            if (indexed_orders == orders_by_instrument_channel_.end()) {
-                return order_histories_.size() <= config_.maximum_orders;
+            const ChannelKey channel{
+                fact.common.trade_date, fact.common.identity.market,
+                fact.common.channel};
+            const auto channel_state = channel_states_.find(channel);
+            const bool active_only = channel_state == channel_states_.end() ||
+                !channel_state->second.gap_open;
+            const auto& candidate_index = active_only
+                ? active_end_orders_
+                : orders_by_instrument_channel_;
+            const auto indexed_orders = candidate_index.find(range);
+            const std::size_t candidate_count =
+                indexed_orders == candidate_index.end()
+                ? 0U
+                : indexed_orders->second.size();
+            const std::size_t projected_rows = SaturatingAdd(
+                candidate_count, 1U);
+            const std::size_t staging_bytes = SaturatingMultiply(
+                candidate_count, EndCandidateStagingBytes());
+            if (candidate_count > config_.maximum_end_candidates ||
+                projected_rows > config_.maximum_end_projected_rows ||
+                staging_bytes > config_.maximum_end_staging_bytes) {
+                static_cast<void>(CapacityFailure(
+                    result, "Event Shanghai END capacity exhausted"));
+                return false;
             }
-            stats_.barrier_index_orders_visited.fetch_add(
-                static_cast<std::uint64_t>(indexed_orders->second.size()),
-                std::memory_order_relaxed);
-            record->roles.reserve(
-                record->roles.size() + indexed_orders->second.size());
-            for (const OrderKey& order : indexed_orders->second) {
-                auto history_position = order_histories_.find(order);
-                if (history_position == order_histories_.end()) {
-                    return false;
-                }
-                OrderHistory& history = history_position->second;
-                if (!SetOrderUse(
-                        &history, fact_key.native_sequence,
-                        OrderRole::kBarrier)) {
-                    return false;
-                }
-                AppendUniqueFactRole(record, order, OrderRole::kBarrier);
-                DirtyOrder& dirty = (*dirty_orders)[order];
-                dirty.new_sequences.insert(fact_key.native_sequence);
-                dirty.late = dirty.late || record->late;
+            if (!InsertBarrier(range, fact_key, result)) {
+                return false;
+            }
+            if (candidate_count != 0U) {
+                end_expansions->push_back(EndExpansionTask{
+                    fact_key, range, candidate_count, 0U, staging_bytes,
+                    active_only});
             }
         }
-        return order_histories_.size() <= config_.maximum_orders;
+        return order_histories_.size() <= config_.maximum_carry_orders;
     }
 
     [[nodiscard]] const RoleEval* FindEval(
         const RoleCacheKey& key,
-        const std::map<RoleCacheKey, RoleEval>& patch) const noexcept {
-        const auto patched = patch.find(key);
-        if (patched != patch.end()) {
-            return &patched->second;
+        const std::map<RoleCacheKey, RoleEval>* live_patch,
+        const RepairTransaction* repair_overlay) const noexcept {
+        if (repair_overlay != nullptr) {
+            const auto task = repair_overlay->tasks.find(key.order);
+            const auto patched = repair_overlay->eval_patch.find(key);
+            if (task != repair_overlay->tasks.end() &&
+                patched != repair_overlay->eval_patch.end() &&
+                patched->second.attempt_generation ==
+                    task->second.attempt_generation) {
+                return &patched->second.eval;
+            }
         }
-        const auto existing = role_cache_.find(key);
-        return existing == role_cache_.end() ? nullptr : &existing->second;
+        if (live_patch != nullptr) {
+            const auto patched = live_patch->find(key);
+            if (patched != live_patch->end()) {
+                return &patched->second;
+            }
+        }
+        const OrderHistory* const history = order_histories_.Find(key.order);
+        if (history == nullptr) {
+            return nullptr;
+        }
+        const OrderUseNode* use = FindOrderUse(
+            *history, key.native_sequence);
+        return use != nullptr && use->evaluated ? &use->eval : nullptr;
     }
 
     [[nodiscard]] bool RecomputeOrder(
         const OrderKey& order,
         const DirtyOrder& dirty,
-        OrderPatch* output,
         std::map<RoleCacheKey, RoleEval>* eval_patch,
         std::map<FactKey, bool>* dirty_bundles,
         EventApplyResult* result) {
-        const auto live = order_histories_.find(order);
-        if (live == order_histories_.end() ||
+        OrderHistory* const live = order_histories_.Find(order);
+        if (live == nullptr ||
             dirty.new_sequences.empty()) {
             return false;
         }
-        output->key = order;
-        output->history = live->second;
+        OrderHistory& history = *live;
         const std::uint64_t first = *dirty.new_sequences.begin();
-        StateVersion previous = LatestBefore(output->history, first);
-        auto use = output->history.uses.lower_bound(first);
-        while (use != output->history.uses.end()) {
+        StateVersion previous = LatestBefore(history, first);
+        auto use = history.suffix.lower_bound(first);
+        while (use != history.suffix.end()) {
             const std::uint64_t sequence = use->first;
             const FactKey fact_key{order.trade_date, order.market,
                                    order.channel, sequence};
@@ -3230,12 +6675,10 @@ private:
                 return false;
             }
             const RoleCacheKey cache_key{order, sequence};
-            const auto old_position = role_cache_.find(cache_key);
-            const RoleEval* old_eval = old_position == role_cache_.end()
-                ? nullptr
-                : &old_position->second;
+            OrderUseNode& node = use->second;
+            const RoleEval* old_eval = node.evaluated ? &node.eval : nullptr;
             const ApplyRoleResult applied = ApplyOrderRole(
-                previous.state, projected_tick, use->second,
+                previous.state, projected_tick, node.role,
                 previous.input_set_hash, fact.fact_hash);
             if (!applied.ok) {
                 return false;
@@ -3262,8 +6705,8 @@ private:
                     position->second = position->second || dirty.late;
                 }
             }
-            output->history.versions[sequence] = StateVersion{
-                applied.eval.post_state, applied.eval.input_set_hash};
+            node.eval = applied.eval;
+            node.evaluated = true;
 
             if (dirty.late) {
                 ++stats_.repaired_order_uses;
@@ -3272,7 +6715,8 @@ private:
                 ++stats_.live_order_uses;
             }
 
-            previous = output->history.versions.at(sequence);
+            previous = StateVersion{
+                node.eval.post_state, node.eval.input_set_hash};
             if (state_converged || state_unchanged_new_use) {
                 const auto next_new = dirty.new_sequences.upper_bound(sequence);
                 if (next_new == dirty.new_sequences.end()) {
@@ -3281,8 +6725,8 @@ private:
                     }
                     break;
                 }
-                previous = LatestBefore(output->history, *next_new);
-                use = output->history.uses.lower_bound(*next_new);
+                previous = LatestBefore(history, *next_new);
+                use = history.suffix.lower_bound(*next_new);
                 continue;
             }
             ++use;
@@ -3292,7 +6736,8 @@ private:
 
     [[nodiscard]] bool AssembleBundle(
         const FactKey& fact_key,
-        const std::map<RoleCacheKey, RoleEval>& eval_patch,
+        const std::map<RoleCacheKey, RoleEval>* live_eval_patch,
+        const RepairTransaction* repair_overlay,
         Bundle* output) {
         *output = {};
         FactRecord& fact = facts_.at(fact_key);
@@ -3309,7 +6754,8 @@ private:
         EnsureFactRolesOrdered(&fact);
         for (const auto& [order, role] : fact.roles) {
             const RoleEval* eval = FindEval(
-                RoleCacheKey{order, fact_key.native_sequence}, eval_patch);
+                RoleCacheKey{order, fact_key.native_sequence},
+                live_eval_patch, repair_overlay);
             if (eval == nullptr) {
                 continue;
             }
@@ -3330,7 +6776,8 @@ private:
                     }
                 }
             }
-            if (eval->order_fragment.has_value()) {
+            if (eval->order_operation.has_value() &&
+                eval->post_state.has_value()) {
                 EventKey key{fact_key.trade_date,
                              fact_key.market,
                              fact.instrument_id,
@@ -3344,7 +6791,11 @@ private:
                 while (bundle.rows.contains(key)) {
                     ++key.occurrence;
                 }
-                bundle.rows.emplace(key, *eval->order_fragment);
+                bundle.rows.emplace(
+                    key,
+                    MakeOrderPayload(
+                        projected_tick, *eval->post_state,
+                        *eval->order_operation));
                 bundle.input_set_hashes.emplace(
                     key, eval->input_set_hash);
             }
@@ -3384,8 +6835,12 @@ private:
         if (patched != patch.end()) {
             return &patched->second;
         }
-        const auto live = event_heads_.find(key);
-        return live == event_heads_.end() ? nullptr : &live->second;
+        const auto ledger = event_heads_.find(MakeFactKey(key));
+        if (ledger == event_heads_.end()) {
+            return nullptr;
+        }
+        const auto live = ledger->second.find(key);
+        return live == ledger->second.end() ? nullptr : &live->second;
     }
 
     [[nodiscard]] bool AddRevision(
@@ -3442,7 +6897,7 @@ private:
         std::map<EventKey, EventHead>* head_patch,
         EventApplyResult* result) {
         const RevisionReason reason = late
-            ? RevisionReason::kLateRecovery
+            ? RevisionReason::kHoleFill
             : RevisionReason::kLiveProjection;
         auto old_row = old_bundle.rows.begin();
         auto new_row = new_bundle.rows.begin();
@@ -3503,31 +6958,40 @@ private:
     std::vector<std::pair<FactKey, CanonicalTick>> batch_tick_cache_;
     std::unordered_map<ChannelKey, EventChannelState, ChannelKeyHash>
         channel_states_;
-    std::unordered_map<InstrumentChannelKey,
-                       std::map<std::uint64_t, FactKey>,
-                       InstrumentChannelKeyHash>
-        barriers_;
-    std::unordered_map<InstrumentChannelKey,
-                       InstrumentFactIndex,
-                       InstrumentChannelKeyHash>
-        instrument_facts_;
-    std::unordered_map<InstrumentChannelKey,
-                       PhaseIndex,
-                       InstrumentChannelKeyHash>
-        phase_statuses_;
-    std::unordered_map<InstrumentChannelKey, std::vector<OrderKey>,
-                       InstrumentChannelKeyHash>
-        orders_by_instrument_channel_;
-    std::unordered_map<OrderKey, OrderHistory, OrderKeyHash>
-        order_histories_;
-    std::unordered_map<RoleCacheKey, RoleEval, RoleCacheKeyHash>
-        role_cache_;
+    BarrierTable barriers_;
+    InstrumentFactTable instrument_facts_;
+    PhaseTable phase_statuses_;
+    OrderRangeIndex orders_by_instrument_channel_;
+    OrderRangeIndex active_end_orders_;
+    OrderHistoryTable order_histories_;
     std::unordered_map<FactKey, Bundle, FactKeyHash> bundle_cache_;
-    std::unordered_map<EventKey, EventHead, EventKeyHash> event_heads_;
+    std::unordered_map<FactKey, std::map<EventKey, EventHead>, FactKeyHash>
+        event_heads_;
+    ChannelFactTable channel_facts_;
+    std::unordered_map<ChannelKey,
+                       std::map<std::uint64_t,
+                                std::pair<std::uint64_t, std::uint64_t>>,
+                       ChannelKeyHash>
+        gap_ranges_;
+    std::map<ChannelKey, EvictionTask> eviction_tasks_;
+    std::deque<ChannelKey> eviction_ready_;
+    std::set<ChannelKey> eviction_ready_set_;
     std::unordered_set<RawTickDependency, RawTickDependencyHash>
         acknowledged_raw_;
     std::deque<PendingCommit> pending_commits_;
     std::optional<RepairTransaction> active_repair_;
+    std::optional<PendingProjectionCut> pending_projection_cut_;
+    std::size_t pending_revision_bytes_ = 0U;
+    std::size_t repair_accounted_bytes_ = 0U;
+    std::size_t pending_projection_cut_accounted_bytes_ = 0U;
+    std::size_t projection_scratch_bytes_ = 0U;
+    bool projection_scratch_is_repair_ = false;
+    bool projection_scratch_reserved_ = false;
+    std::size_t hot_fact_bytes_ = 0U;
+    // Fixed directories, lazy hash pages/nodes and conservative inner
+    // deque/map ownership. This is a logical cap, not allocator RSS.
+    std::size_t hot_index_bytes_ = 0U;
+    std::size_t order_history_bytes_ = 0U;
     std::size_t cached_event_count_ = 0U;
     std::uint32_t next_revision_counter_ = 1U;
     std::uint64_t next_calculation_batch_sequence_ = 1U;
@@ -3550,14 +7014,66 @@ bool ValidateEventWorkerConfig(const EventWorkerConfig& config,
     };
     if (!ValidTradeDate(config.trade_date) || config.owner_count == 0U ||
         config.owner >= config.owner_count || config.revision_epoch == 0U ||
-        config.logic_version == 0U || IsZero(config.calculation_run_id) ||
-        config.maximum_orders == 0U ||
+        config.logic_version == 0U || config.feed_session_epoch == 0U ||
+        IsZero(config.calculation_run_id) ||
+        config.maximum_carry_orders == 0U ||
+        config.maximum_order_history_bytes == 0U ||
+        config.maximum_hot_facts == 0U ||
+        config.maximum_hot_fact_bytes == 0U ||
         config.maximum_cached_events == 0U ||
         config.maximum_pending_commits == 0U ||
+        config.maximum_pending_revision_bytes == 0U ||
         config.maximum_acknowledged_raw_dependencies == 0U ||
+        config.persistence_group_max_batches == 0U ||
+        config.persistence_group_max_rows == 0U ||
+        config.persistence_group_max_bytes == 0U ||
+        config.persistence_group_max_delay_ns == 0U ||
+        config.maximum_repair_bytes == 0U ||
+        config.maximum_end_candidates == 0U ||
+        config.maximum_end_projected_rows == 0U ||
+        config.maximum_end_staging_bytes == 0U ||
+        config.end_slice_max_candidates == 0U ||
+        config.end_slice_max_cpu_ns == 0U ||
+        config.eviction_slice_max_nodes == 0U ||
+        config.eviction_slice_max_bytes == 0U ||
         config.repair_slice_max_order_uses == 0U ||
-        config.repair_slice_max_cpu_ns == 0U) {
+        config.repair_slice_max_cpu_ns == 0U ||
+        config.phase_slice_max_nodes == 0U ||
+        config.phase_slice_max_bytes == 0U ||
+        config.phase_slice_max_cpu_ns == 0U) {
         return fail("invalid Event worker configuration");
+    }
+    try {
+        const std::array<std::size_t, 4U> hot_index_directories{
+            BarrierTable::RequiredDirectoryOwnedBytes(
+                config.maximum_hot_facts),
+            InstrumentFactTable::RequiredDirectoryOwnedBytes(
+                config.maximum_hot_facts),
+            PhaseTable::RequiredDirectoryOwnedBytes(
+                config.maximum_hot_facts),
+            ChannelFactTable::RequiredDirectoryOwnedBytes(
+                config.maximum_hot_facts)};
+        std::size_t hot_index_directory_bytes = 0U;
+        for (const std::size_t directory : hot_index_directories) {
+            if (directory > std::numeric_limits<std::size_t>::max() -
+                    hot_index_directory_bytes) {
+                return fail("invalid Event hot-index directory layout");
+            }
+            hot_index_directory_bytes += directory;
+        }
+        if (hot_index_directory_bytes >
+            config.maximum_hot_fact_bytes) {
+            return fail(
+                "Event hot-index directory exceeds byte capacity");
+        }
+        if (OrderHistoryTable::RequiredDirectoryOwnedBytes(
+                config.maximum_carry_orders) >
+            config.maximum_order_history_bytes) {
+            return fail(
+                "Event order-history directory exceeds byte capacity");
+        }
+    } catch (...) {
+        return fail("invalid Event fixed-table layout");
     }
     if (error != nullptr) {
         error->clear();
@@ -3613,6 +7129,18 @@ EventApplyResult EventWorker::ApplyBatch(
     return impl_->ApplyBatch(inputs);
 }
 
+bool EventWorker::ApplyGapOpen(const GapOpen& gap) noexcept {
+    return impl_->ApplyGapOpen(gap);
+}
+
+bool EventWorker::ApplyChannelSeal(const ChannelSeal& seal) noexcept {
+    return impl_->ApplyChannelSeal(seal);
+}
+
+bool EventWorker::ContinueEviction() noexcept {
+    return impl_->ContinueEviction();
+}
+
 bool EventWorker::AdvanceRepair() noexcept {
     return impl_->AdvanceRepair();
 }
@@ -3622,12 +7150,24 @@ void EventWorker::AcknowledgeRawTicks(
     impl_->AcknowledgeRawTicks(dependencies);
 }
 
-bool EventWorker::DrainDurableCommits() noexcept {
-    return impl_->DrainDurableCommits();
+bool EventWorker::AdvanceDurableCommits() noexcept {
+    return impl_->AdvanceDurableCommits();
+}
+
+bool EventWorker::FlushDurableCommits() noexcept {
+    return impl_->FlushDurableCommits();
 }
 
 bool EventWorker::repair_pending() const noexcept {
     return impl_->repair_pending();
+}
+
+bool EventWorker::eviction_pending() const noexcept {
+    return impl_->eviction_pending();
+}
+
+bool EventWorker::projection_input_fenced() const noexcept {
+    return impl_->projection_input_fenced();
 }
 
 bool EventWorker::CopyBundle(

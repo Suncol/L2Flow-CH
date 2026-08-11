@@ -69,8 +69,8 @@ struct KLinePayload final {
     TradeAnchor first_trade{};
     TradeAnchor last_trade{};
     std::uint64_t source_quality_flags = 0U;
-    bool has_late_recovery = false;
-    // Realtime sequence frontiers do not close historical LateRecovery, so a
+    bool has_hole_fill = false;
+    // Realtime sequence frontiers do not close historical hole fills, so a
     // live row remains provisional until an explicit reconciliation/finalize.
     bool provisional = true;
 
@@ -86,7 +86,7 @@ enum class RevisionOperation : std::uint8_t {
 
 enum class RevisionReason : std::uint8_t {
     kLiveProjection = 0U,
-    kLateRecovery,
+    kHoleFill,
     kReconciliation,
     kSessionFinalize,
 };

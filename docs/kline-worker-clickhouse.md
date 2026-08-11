@@ -2,26 +2,20 @@
 
 ## 1. Implemented path
 
-The optional KLine plane is a sibling of the Event plane. It consumes each
-post-`SequenceRecovery` Tick once from the existing owner thread and also
-consumes the explicit `LateRecoveryTick` branch:
+The optional KLine plane is a sibling of the Event plane. It consumes the same
+unified owner-local `TickDispatch` FIFO:
 
 ```text
-ordered owner Tick -----------------------+
-                                            v
-LateRecovery Tick -> owner inbox -> KLine micro-batch
-                                            |
-                                  journal accepted facts
-                                            |
-                              update every configured interval
-                                            |
-                              immutable KLineRevisionBatch
-                                            |
-raw_tick ClickHouse ACK --------------------+ -> KLine sink queue
-                                                   |
-                                      kline_revision_log + current MV
-                                                   |
-                                      kline_recovery_run commit marker
+GapOpen / ChannelSeal -> validate owner FIFO control
+REJECT_LATE_FACT ------+
+                       +--> bounded ACK/disposition join -> reject + ACK: settle
+                       |
+PROJECT_* -------------+--> project + ACK: durable dependency
+          |
+          +-> micro-batch -> journal winner -> update intervals
+                                            -> immutable pending batch
+                                                          |
+                                     durable dependency --+-> KLine sink
 ```
 
 The worker may calculate an in-memory revision before its raw occurrence is
@@ -32,6 +26,14 @@ a WAL. Event and KLine must share one local disk-backed canonical FactJournal;
 that file is a process-lifetime spill/cache and is not reopened after a crash.
 See [fact-journal.md](fact-journal.md) for its capacity, I/O, and recovery
 contract.
+
+The runtime joins either arrival order by `(feed_session_epoch,
+ingress_sequence, canonical_kind)`. `REJECT_LATE_FACT + raw ACK` erases the join
+entry directly and never reaches KLine or the FactJournal. The join, ACK inbox,
+worker ACK index, pending FIFO, bar map, and sink queues are independently
+bounded and fail closed on exhaustion. `GapOpen` and `ChannelSeal` remain in the
+same producer-to-owner FIFO and are validated by KLine, but this worker does not
+use Event's retention frontier to reclaim bar state.
 
 ## 2. Exchange-time-only windows
 
@@ -116,14 +118,19 @@ that the exchange publishes a total order across channels. The ingress
 sequence is retained in the first/last anchors for provenance but does not
 control OHLC.
 
-Normal Tick output has passed the existing `(market, channel)` native sequence
-recovery. Once that recovery has advanced past a gap, an older body is emitted
-as `LateRecoveryTick` rather than inserted backward into the realtime queue.
-The KLine runtime routes it to the same instrument owner. A newly accepted
-late trade updates the historical bar and emits a higher-version `UPDATE` for
-the same KLine key. A late trade that precedes the current first anchor changes
-open; one after the last anchor changes close; an interior trade can still
-change high, low, volume, notional, and count.
+For channel next-expected `E`, origin, and `maximum_reorder_span=W`, recovery
+captures `A=max(origin,E-W)` at first arrival. A record at or beyond `E` follows
+the ordered/reorder path. A record in `[A,E)` is projected only when it
+atomically claims a still-open exact hole; a record below `A` or a
+behind-frontier position absent from the hole ledger is rejected. The boundary
+is exact (`sequence == A` can fill an open hole), and owner queueing never
+recomputes the captured token.
+
+The KLine runtime routes an accepted hole fill to the same instrument owner. A
+hole-filled trade updates the historical bar and emits a higher-version
+`UPDATE` for the same KLine key. A fill that precedes the current first anchor
+changes open; one after the last anchor changes close; an interior fill can
+still change high, low, volume, notional, and count.
 
 The fact key is:
 
@@ -132,13 +139,13 @@ The fact key is:
 ```
 
 This matches the sequence domain already used by `SequenceRecovery` and has
-the same documented Shenzhen joint 6.33/6.36 caveat. Every structurally valid
-Tick action is journaled, not only trades, so a later conflicting trade cannot
-reuse an already occupied native position. The first business payload wins:
-
-- an equal later payload is a duplicate;
-- a different payload is a source conflict and is not projected;
-- `kPendingCanonicalConflict` contributes only its raw durability dependency.
+the same documented Shenzhen joint 6.33/6.36 caveat. Every accepted
+structurally valid Tick action is journaled, not only trades.
+`SequenceRecovery` applies strict first-wins to `(trade_date, market, channel,
+feed_session_epoch, native_sequence)`: every later occurrence at the same
+position is rejected without payload comparison and cannot reach KLine. The
+FactJournal's duplicate/conflict result remains a defensive invariant check,
+not a second winner-selection policy.
 
 The raw table retains independently acknowledged occurrences. Choosing a
 different winner for a source conflict requires explicit reconciliation; the
@@ -172,10 +179,11 @@ provide a unique nonzero `calculation_run_id`; this executable validates but
 does not allocate or persist either value.
 
 Realtime rows remain `provisional=true`. Observing a later exchange timestamp,
-a higher native sequence, a Shanghai `Ended` status, or a local timer does not
-prove that historical `LateRecovery` is finished. This implementation does not
-expose an end-of-day reconciliation/finalize API and therefore does not write
-`provisional=false` on its own.
+a higher native sequence, an empty current hole ledger, a Shanghai `Ended`
+status, or a local timer does not prove that durable historical reconciliation
+is complete. This implementation does not expose an end-of-day
+reconciliation/finalize API and therefore does not write `provisional=false`
+on its own.
 
 ## 6. ClickHouse contract
 
@@ -223,6 +231,12 @@ Enable the path on top of durable raw ClickHouse output:
 Intervals are repeatable, sorted, deduplicated at startup, and restricted to
 `[1, 86400]`. They are immutable for a runtime. Capacity, micro-batch, sink
 chunk, queue, and writer-lane flags are listed by `mdl_ingestd --help`.
+
+KLine does not retain a full in-memory Tick history after each batch, but its
+bar/head maps are bounded independently by `maximum_bars` and are not reclaimed
+from the `ChannelSeal` controls it receives. The shared FactJournal's physical
+file and directory also remain process-lifetime state. Event fact compaction
+therefore does not imply KLine or whole-process RSS compaction.
 
 The current implementation is intraday and process-local. It has no cold
 bootstrap from `raw_tick`, checkpoint restore, local WAL, crash replay, or

@@ -19,7 +19,6 @@ inline constexpr std::size_t kMaximumArrowRingSchemaBytes =
 enum class RingStreamKind : std::uint32_t {
     kOrderedTick = 1U,
     kSnapshot = 2U,
-    kLateRecoveryTick = 3U,
     kControl = 4U,
     kEvent = 5U,
     kKline = 6U,

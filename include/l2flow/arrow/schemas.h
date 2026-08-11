@@ -13,13 +13,13 @@
 
 namespace l2flow::arrow_hot {
 
-inline constexpr std::uint32_t kTickArrowSchemaVersion = 1U;
+inline constexpr std::uint32_t kTickArrowSchemaVersion = 2U;
 inline constexpr std::uint32_t kSnapshotArrowSchemaVersion = 1U;
 inline constexpr std::uint32_t kControlArrowSchemaVersion = 2U;
 
 enum class TickStreamRole : std::uint8_t {
     kRealtimeOrdered = 0U,
-    kLateRecovery = 1U,
+    kHoleFill = 1U,
 };
 
 enum class ControlKind : std::uint8_t {
@@ -76,8 +76,8 @@ public:
     [[nodiscard]] bool AppendOrdered(
         const ingest::CanonicalTick& tick,
         std::string* error) noexcept;
-    [[nodiscard]] bool AppendLateRecovery(
-        const ingest::LateRecoveryTick& record,
+    [[nodiscard]] bool AppendHoleFill(
+        const ingest::TickDispatch& dispatch,
         std::string* error) noexcept;
     [[nodiscard]] BuiltRecordBatch Finish(std::string* error) noexcept;
 

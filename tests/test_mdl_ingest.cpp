@@ -72,6 +72,13 @@ public:
             ticks.size() == ticks.capacity()) {
             return false;
         }
+        if (tick.common.native_sequence == block_tick_sequence_ &&
+            !tick_block_entered_.exchange(true,
+                                          std::memory_order_acq_rel)) {
+            while (!release_tick_block_.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
         ticks.push_back(tick);
         return true;
     }
@@ -113,6 +120,9 @@ public:
 
     bool reject_tick_ = false;
     bool reject_snapshot_ = false;
+    std::uint64_t block_tick_sequence_ = 0U;
+    std::atomic<bool> tick_block_entered_{false};
+    std::atomic<bool> release_tick_block_{false};
     std::vector<CanonicalTick> ticks;
     std::vector<CanonicalSnapshot> snapshots;
 };
@@ -422,6 +432,7 @@ void DeliverToHandler(MdlMessageHandler* handler,
 [[nodiscard]] EngineConfig MakeConfig(StartMode mode) {
     EngineConfig config{};
     config.trade_date = 20260806U;
+    config.feed_session_epoch = 1U;
     config.start_mode = mode;
     config.tick_decoder_lanes = 1U;
     config.snapshot_decoder_lanes = 1U;
@@ -432,7 +443,6 @@ void DeliverToHandler(MdlMessageHandler* handler,
     config.maximum_snapshot_body_bytes = 4'096U;
     config.dispatch_queue_capacity = 64U;
     config.diagnostic_queue_capacity = 64U;
-    config.late_recovery_queue_capacity = 64U;
     config.maximum_channels_per_tick_lane = 8U;
     config.reorder_entries_per_channel = 16U;
     config.maximum_reorder_span = 15U;
@@ -473,6 +483,34 @@ template <typename Poll>
             return true;
         }
         std::this_thread::yield();
+    }
+    return false;
+}
+
+[[nodiscard]] bool TryPollProjectedTick(IngestEngine* engine,
+                                        std::size_t owner,
+                                        CanonicalTick* tick) {
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(owner, &dispatch)) {
+        if (dispatch.kind == TickDispatchKind::kProjectOrdered ||
+            dispatch.kind == TickDispatchKind::kProjectHoleFill) {
+            *tick = dispatch.tick;
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool TryPollDispatchKind(IngestEngine* engine,
+                                       std::size_t owner,
+                                       TickDispatchKind kind,
+                                       TickDispatch* output) {
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(owner, &dispatch)) {
+        if (dispatch.kind == kind) {
+            *output = dispatch;
+            return true;
+        }
     }
     return false;
 }
@@ -520,15 +558,15 @@ void TestFromOpenReordersShanghai() {
           MakeShTick(2, "600000"), base_time);
     CanonicalTick tick{};
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(!engine->TryPollTick(0U, &tick));
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &tick));
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(1, "600000"), base_time + 1U);
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 1U);
     CHECK(tick.price.p6_valid);
     CHECK(tick.price.p6 == 12'345'000);
     CHECK((tick.validity & kTickChannelHistoryValid) != 0U);
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 2U);
     engine->Stop();
 }
@@ -539,7 +577,7 @@ void TestGapWaitDefaultsAreEqual() {
     CHECK(config.from_open_gap_wait_ns == UINT64_C(500'000));
 }
 
-void TestFromOpenGapTimeoutAdvancesAndRoutesLateBackfill() {
+void TestFromOpenGapTimeoutAcceptsOpenHoleFill() {
     EngineConfig config = MakeConfig(StartMode::kFromOpen);
     config.from_open_gap_wait_ns = 0U;
     std::string error;
@@ -557,24 +595,33 @@ void TestFromOpenGapTimeoutAdvancesAndRoutesLateBackfill() {
     CHECK(gap.last_missing == 1U);
 
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 2U);
     CHECK((tick.validity & kTickChannelHistoryValid) == 0U);
 
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(1, "600000"), base_time + 1U);
-    LateRecoveryTick late{};
-    CHECK(WaitFor([&] { return engine->TryPollLateRecovery(&late); }));
-    CHECK(late.tick.common.native_sequence == 1U);
-    CHECK(late.committed_next_sequence == 3U);
+    TickDispatch fill{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kProjectHoleFill, &fill);
+    }));
+    CHECK(fill.tick.common.native_sequence == 1U);
+    CHECK(fill.expected_sequence == 3U);
+    CHECK(fill.admission_floor == 1U);
+    CHECK(fill.evict_before == 3U);
+    CHECK(fill.generation == 1U);
+    CHECK(fill.feed_session_epoch == 1U);
+    CHECK((fill.tick.common.quality_flags & kQualityHoleFill) != 0U);
     CHECK(engine->healthy());
     engine->Stop();
 }
 
-void TestFromOpenCapacityAdvancesWithoutLossAndRoutesBackfill() {
+void TestFromOpenCapacityExpiresBackfillOutsideWindow() {
     EngineConfig config = MakeConfig(StartMode::kFromOpen);
     config.reorder_entries_per_channel = 4U;
     config.maximum_reorder_span = 4U;
+    config.instrument_workers = 2U;
     std::string error;
     std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
         config, MakeCatalog(), &error);
@@ -595,26 +642,488 @@ void TestFromOpenCapacityAdvancesWithoutLossAndRoutesBackfill() {
     CHECK(gap.first_present_after_gap == 2U);
     CHECK(gap.gap_epoch == 1U);
 
+    TickDispatch opened{};
+    TickDispatch sealed{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 1U, TickDispatchKind::kGapOpen, &opened);
+    }));
+    CHECK(opened.first_missing == 1U);
+    CHECK(opened.last_missing == 1U);
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 1U, TickDispatchKind::kChannelSeal, &sealed);
+    }));
+    CHECK(sealed.evict_before == 6U);
+    CHECK(sealed.generation == 1U);
+    const EngineStats control_stats = engine->stats();
+    CHECK(control_stats.source_channel_controls >= 2U);
+    CHECK(control_stats.owner_control_deliveries ==
+          control_stats.source_channel_controls * config.instrument_workers);
+
     CanonicalTick tick{};
     for (std::uint64_t expected = 2U; expected <= 6U; ++expected) {
-        CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+        CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
         CHECK(tick.common.native_sequence == expected);
         CHECK((tick.validity & kTickChannelHistoryValid) == 0U);
     }
 
-    // A network backfill that arrives after the committed advance cannot be
-    // inserted backward; preserve its canonical body for reconciliation.
+    // expected=7 and W=4 close admission below A=3.
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(1, "600000"), base_time + 7U);
-    LateRecoveryTick late{};
-    CHECK(WaitFor([&] { return engine->TryPollLateRecovery(&late); }));
-    CHECK(late.tick.common.native_sequence == 1U);
-    CHECK(late.committed_next_sequence == 7U);
-    CHECK(late.reason ==
-          LateRecoveryReason::kBehindCommittedFrontier);
+    TickDispatch rejected{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kRejectLateFact, &rejected);
+    }));
+    CHECK(rejected.tick.common.native_sequence == 1U);
+    CHECK(rejected.expected_sequence == 7U);
+    CHECK(rejected.admission_floor == 3U);
+    CHECK(engine->stats().expired_hole_sequences == 1U);
+    CHECK(engine->stats().hole_fills_dispatched == 0U);
     CHECK(engine->stats().from_open_channels_frozen == 0U);
+
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(7, "600000"), base_time + 8U);
+    TickDispatch after_loss{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kProjectOrdered,
+            &after_loss);
+    }));
+    CHECK((after_loss.tick.validity & kTickChannelHistoryValid) == 0U);
+    CHECK((after_loss.tick.common.quality_flags &
+           kQualityChannelHistoryIncomplete) != 0U);
     CHECK(engine->healthy());
     engine->Stop();
+}
+
+void TestFilledGapRestoresCompletePrefix() {
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.reorder_entries_per_channel = 4U;
+    config.maximum_reorder_span = 4U;
+    config.from_open_gap_wait_ns = 0U;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(3, "600000"), base_time);
+    TickDispatch ordered{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kProjectOrdered, &ordered);
+    }));
+    CHECK((ordered.tick.validity & kTickChannelHistoryValid) == 0U);
+
+    for (std::uint64_t sequence : {1U, 2U}) {
+        Admit(engine.get(), {4U, 101U, 24U},
+              MakeShTick(static_cast<std::int64_t>(sequence), "600000"),
+              base_time + sequence);
+        TickDispatch fill{};
+        CHECK(WaitFor([&] {
+            return TryPollDispatchKind(
+                engine.get(), 0U, TickDispatchKind::kProjectHoleFill,
+                &fill);
+        }));
+        CHECK(fill.tick.common.native_sequence == sequence);
+    }
+
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(4, "600000"), base_time + 4U);
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kProjectOrdered, &ordered);
+    }));
+    CHECK(ordered.tick.common.native_sequence == 4U);
+    CHECK((ordered.tick.validity & kTickChannelHistoryValid) != 0U);
+    CHECK((ordered.tick.common.quality_flags &
+           kQualityChannelHistoryIncomplete) == 0U);
+    CHECK(engine->stats().expired_hole_sequences == 0U);
+    CHECK(engine->healthy());
+    engine->Stop();
+}
+
+void TestExactHoleLedgerBoundaryAndArrivalToken() {
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.reorder_entries_per_channel = 4U;
+    config.maximum_reorder_span = 4U;
+    config.from_open_gap_wait_ns = 0U;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(5, "600000"), base_time);
+    CHECK(WaitFor([&] { return engine->stats().gaps_skipped == 1U; }));
+
+    // expected=6, A=2. Claiming a middle position splits the exact interval;
+    // the second occurrence at the same position is rejected first-wins.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(3, "600000"), base_time + 1U);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(3, "600000"), base_time + 2U);
+    // sequence==A is admissible while the exact hole remains open.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time + 3U);
+
+    for (std::uint64_t sequence = 6U; sequence <= 9U; ++sequence) {
+        Admit(engine.get(), {4U, 101U, 24U},
+              MakeShTick(static_cast<std::int64_t>(sequence), "600000"),
+              base_time + sequence);
+    }
+    // Classification has now advanced to expected=10, A=6.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600000"), base_time + 10U);
+
+    CHECK(WaitFor([&] {
+        const EngineStats stats = engine->stats();
+        return stats.dispatched_ticks == 7U &&
+               stats.hole_fills_dispatched == 2U &&
+               stats.rejected_late_facts == 2U;
+    }));
+
+    std::vector<TickDispatch> dispatches;
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(0U, &dispatch)) {
+        dispatches.push_back(dispatch);
+    }
+    CHECK(dispatches.size() == 13U);
+    for (std::size_t index = 0U; index < dispatches.size(); ++index) {
+        CHECK(dispatches[index].owner == 0U);
+        CHECK(dispatches[index].dispatch_fence == index + 1U);
+        CHECK(dispatches[index].feed_session_epoch == 1U);
+    }
+    CHECK(dispatches[0U].kind == TickDispatchKind::kGapOpen);
+    CHECK(dispatches[0U].first_missing == 1U);
+    CHECK(dispatches[0U].last_missing == 4U);
+    CHECK(dispatches[1U].kind == TickDispatchKind::kProjectOrdered);
+    CHECK(dispatches[1U].tick.common.native_sequence == 5U);
+    // The row arrived while E/A were 1/1. GapOpen changes generation, but it
+    // must not retroactively change the admission token.
+    CHECK(dispatches[1U].expected_sequence == 1U);
+    CHECK(dispatches[1U].admission_floor == 1U);
+    CHECK(dispatches[1U].generation == 1U);
+    CHECK(dispatches[1U].evict_before == 2U);
+    CHECK(dispatches[2U].kind == TickDispatchKind::kChannelSeal);
+    CHECK(dispatches[2U].evict_before == 2U);
+
+    CHECK(dispatches[3U].kind == TickDispatchKind::kProjectHoleFill);
+    CHECK(dispatches[3U].tick.common.native_sequence == 3U);
+    CHECK(dispatches[3U].expected_sequence == 6U);
+    CHECK(dispatches[3U].admission_floor == 2U);
+    CHECK(dispatches[3U].generation == 1U);
+    CHECK(dispatches[4U].kind == TickDispatchKind::kRejectLateFact);
+    CHECK(dispatches[4U].tick.common.native_sequence == 3U);
+    CHECK(dispatches[5U].kind == TickDispatchKind::kProjectHoleFill);
+    CHECK(dispatches[5U].tick.common.native_sequence == 2U);
+    CHECK(dispatches[5U].expected_sequence == 6U);
+    CHECK(dispatches[5U].admission_floor == 2U);
+    CHECK(dispatches[5U].evict_before == 4U);
+    CHECK(dispatches[6U].kind == TickDispatchKind::kChannelSeal);
+    CHECK(dispatches[6U].evict_before == 4U);
+
+    CHECK(dispatches[9U].kind == TickDispatchKind::kProjectOrdered);
+    CHECK(dispatches[9U].tick.common.native_sequence == 8U);
+    CHECK(dispatches[9U].expected_sequence == 8U);
+    CHECK(dispatches[9U].admission_floor == 4U);
+    CHECK(dispatches[9U].evict_before == 9U);
+    CHECK(dispatches[10U].kind == TickDispatchKind::kChannelSeal);
+    CHECK(dispatches[10U].evict_before == 9U);
+    CHECK(dispatches[11U].kind == TickDispatchKind::kProjectOrdered);
+    CHECK(dispatches[11U].tick.common.native_sequence == 9U);
+    CHECK(dispatches[11U].evict_before == 10U);
+    CHECK(dispatches[12U].kind == TickDispatchKind::kRejectLateFact);
+    CHECK(dispatches[12U].tick.common.native_sequence == 1U);
+    CHECK(dispatches[12U].expected_sequence == 10U);
+    CHECK(dispatches[12U].admission_floor == 6U);
+    CHECK(engine->stats().expired_hole_sequences == 2U);
+    CHECK(engine->healthy());
+    engine->Stop();
+}
+
+void TestPartialDiscoveryFixesOriginTokensAndCurrentGeneration() {
+    EngineConfig config = MakeConfig(StartMode::kPartial);
+    config.partial_initial_hold_ns = UINT64_C(50'000'000);
+    config.partial_gap_wait_ns = 0U;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    std::vector<std::byte> first_three = MakeShTick(3, "600000");
+    std::vector<std::byte> later_three = first_three;
+    PutI32(later_three, 44U, 12'346);
+    Admit(engine.get(), {4U, 101U, 24U}, first_three, base_time);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600000"), base_time + 1U);
+    Admit(engine.get(), {4U, 101U, 24U}, later_three, base_time + 2U);
+
+    CHECK(WaitFor([&] {
+        const EngineStats stats = engine->stats();
+        return stats.dispatched_ticks == 2U &&
+               stats.rejected_late_facts == 1U &&
+               stats.gaps_skipped == 1U;
+    }));
+
+    std::vector<TickDispatch> dispatches;
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(0U, &dispatch)) {
+        dispatches.push_back(dispatch);
+    }
+    CHECK(dispatches.size() == 4U);
+    for (std::size_t index = 0U; index < dispatches.size(); ++index) {
+        CHECK(dispatches[index].dispatch_fence == index + 1U);
+    }
+
+    const auto rejected = std::find_if(
+        dispatches.begin(), dispatches.end(), [](const TickDispatch& value) {
+            return value.kind == TickDispatchKind::kRejectLateFact;
+        });
+    CHECK(rejected != dispatches.end());
+    CHECK(rejected->tick.common.native_sequence == 3U);
+    CHECK(rejected->tick.price.p6 == 12'346'000);
+    CHECK(rejected->expected_sequence == 3U);
+    CHECK(rejected->admission_floor == 3U);
+
+    const auto first = std::find_if(
+        dispatches.begin(), dispatches.end(), [](const TickDispatch& value) {
+            return value.kind == TickDispatchKind::kProjectOrdered &&
+                   value.tick.common.native_sequence == 1U;
+        });
+    CHECK(first != dispatches.end());
+    CHECK(first->expected_sequence == 1U);
+    CHECK(first->admission_floor == 1U);
+    CHECK(first->generation == 0U);
+
+    const auto opened = std::find_if(
+        dispatches.begin(), dispatches.end(), [](const TickDispatch& value) {
+            return value.kind == TickDispatchKind::kGapOpen;
+        });
+    CHECK(opened != dispatches.end());
+    CHECK(opened->generation == 1U);
+    CHECK(opened->first_missing == 2U);
+    CHECK(opened->last_missing == 2U);
+
+    const auto third = std::find_if(
+        dispatches.begin(), dispatches.end(), [](const TickDispatch& value) {
+            return value.kind == TickDispatchKind::kProjectOrdered &&
+                   value.tick.common.native_sequence == 3U;
+        });
+    CHECK(third != dispatches.end());
+    CHECK(third->tick.price.p6 == 12'345'000);
+    CHECK(third->expected_sequence == 1U);
+    CHECK(third->admission_floor == 1U);
+    CHECK(third->generation == 1U);
+    CHECK(opened < third);
+    CHECK(engine->healthy());
+    engine->Stop();
+}
+
+void TestModuloCollisionKeepsCurrentOccurrenceAndArrivalToken() {
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.reorder_entries_per_channel = 4U;
+    config.maximum_reorder_span = 4U;
+    config.from_open_gap_wait_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    // 2 and 6 occupy the same modulo-4 slot. Sequence 6 arrives while E/A are
+    // still 1/1; forcing the older slot out must neither lose nor reclassify 6.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(6, "600000"), base_time + 1U);
+    for (std::uint64_t sequence = 3U; sequence <= 5U; ++sequence) {
+        Admit(engine.get(), {4U, 101U, 24U},
+              MakeShTick(static_cast<std::int64_t>(sequence), "600000"),
+              base_time + sequence);
+    }
+
+    CHECK(WaitFor([&] {
+        const EngineStats stats = engine->stats();
+        return stats.dispatched_ticks == 5U && stats.gaps_skipped == 1U;
+    }));
+
+    std::vector<TickDispatch> dispatches;
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(0U, &dispatch)) {
+        dispatches.push_back(dispatch);
+    }
+    std::size_t projected_six = 0U;
+    std::size_t rejected_six = 0U;
+    TickDispatch six{};
+    for (const TickDispatch& value : dispatches) {
+        if (value.tick.common.native_sequence != 6U) {
+            continue;
+        }
+        if (value.kind == TickDispatchKind::kProjectOrdered) {
+            ++projected_six;
+            six = value;
+        } else if (value.kind == TickDispatchKind::kRejectLateFact) {
+            ++rejected_six;
+        }
+    }
+    CHECK(projected_six == 1U);
+    CHECK(rejected_six == 0U);
+    CHECK(six.expected_sequence == 1U);
+    CHECK(six.admission_floor == 1U);
+    CHECK(six.generation == 1U);
+    CHECK(engine->stats().rejected_late_facts == 0U);
+    CHECK(engine->healthy());
+    engine->Stop();
+}
+
+void TestPartialDiscoveryModuloCollisionAdoptsLowerOrigin() {
+    EngineConfig config = MakeConfig(StartMode::kPartial);
+    config.reorder_entries_per_channel = 4U;
+    config.maximum_reorder_span = 4U;
+    config.partial_initial_hold_ns = UINT64_C(1'000'000'000);
+    config.partial_gap_wait_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    // 6 occupies the same modulo-4 slot as the subsequently observed 2.
+    // PARTIAL discovery must adopt 2 as the origin before classifying either
+    // occurrence; committing 6 first would incorrectly expire 2.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(6, "600000"), base_time);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time + 1U);
+    for (std::uint64_t sequence = 3U; sequence <= 5U; ++sequence) {
+        Admit(engine.get(), {4U, 101U, 24U},
+              MakeShTick(static_cast<std::int64_t>(sequence), "600000"),
+              base_time + sequence);
+    }
+
+    CHECK(WaitFor([&] {
+        return engine->stats().dispatched_ticks == 5U;
+    }));
+    std::vector<TickDispatch> dispatches;
+    TickDispatch dispatch{};
+    while (engine->TryPollTickDispatch(0U, &dispatch)) {
+        dispatches.push_back(dispatch);
+    }
+    CHECK(dispatches.size() == 5U);
+    for (std::size_t index = 0U; index < dispatches.size(); ++index) {
+        CHECK(dispatches[index].kind == TickDispatchKind::kProjectOrdered);
+        CHECK(dispatches[index].tick.common.native_sequence == index + 2U);
+        CHECK(dispatches[index].dispatch_fence == index + 1U);
+    }
+    CHECK(dispatches.back().expected_sequence == 2U);
+    CHECK(dispatches.back().admission_floor == 2U);
+    CHECK(engine->stats().rejected_late_facts == 0U);
+    CHECK(engine->stats().gaps_skipped == 0U);
+    CHECK(engine->healthy());
+    engine->Stop();
+}
+
+void TestStopFailsClosedWhenSequenceFlushCannotPublish() {
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.dispatch_queue_capacity = 2U;
+    config.from_open_gap_wait_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600000"), base_time);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time + 1U);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(4, "600000"), base_time + 2U);
+    CHECK(WaitFor([&] { return engine->stats().decoded_ticks == 3U; }));
+
+    // The owner FIFO already contains 1 and 2. Flushing the pending 4 cannot
+    // publish GapOpen; Stop must fail closed and return instead of spinning on
+    // the unchanged pending count.
+    engine->Stop();
+    CHECK(!engine->healthy());
+    CHECK(engine->fatal_error().find("queue overflow") != std::string::npos ||
+          engine->fatal_error().find("made no progress") !=
+              std::string::npos);
+}
+
+void TestDispatchOverflowDropsAlreadyQueuedTicksFailClosed() {
+    RecordingRawTap raw;
+    raw.block_tick_sequence_ = 3U;
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.dispatch_queue_capacity = 2U;
+    config.from_open_gap_wait_ns = UINT64_C(1'000'000'000);
+    config.raw_record_tap = &raw;
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600000"), base_time);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time + 1U);
+    CHECK(WaitFor([&] { return engine->stats().dispatched_ticks == 2U; }));
+
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(3, "600000"), base_time + 2U);
+    CHECK(WaitFor([&] {
+        return raw.tick_block_entered_.load(std::memory_order_acquire);
+    }));
+    for (std::uint64_t sequence = 4U; sequence <= 12U; ++sequence) {
+        Admit(engine.get(), {4U, 101U, 24U},
+              MakeShTick(static_cast<std::int64_t>(sequence), "600000"),
+              base_time + sequence);
+    }
+    std::vector<std::byte> conflicting_three = MakeShTick(3, "600000");
+    PutI32(conflicting_three, 44U, 12'346);
+    Admit(engine.get(), {4U, 101U, 24U}, conflicting_three,
+          base_time + 13U);
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(13, "600000"), base_time + 14U);
+
+    raw.release_tick_block_.store(true, std::memory_order_release);
+    CHECK(WaitFor([&] { return !engine->healthy(); }));
+
+    std::vector<TickDispatch> dispatches;
+    TickDispatch dispatch{};
+    CHECK(engine->TryPollTickDispatch(0U, &dispatch));
+    dispatches.push_back(dispatch);
+    engine->Stop();
+    while (engine->TryPollTickDispatch(0U, &dispatch)) {
+        dispatches.push_back(dispatch);
+    }
+
+    CHECK(dispatches.size() == 2U);
+    for (std::size_t index = 0U; index < dispatches.size(); ++index) {
+        CHECK(dispatches[index].kind == TickDispatchKind::kProjectOrdered);
+        CHECK(dispatches[index].tick.common.native_sequence == index + 1U);
+    }
+    CHECK(raw.ticks.size() == 3U);
+    CHECK(raw.ticks.back().common.native_sequence == 3U);
+    CHECK(engine->stats().decoded_ticks == 3U);
+    CHECK(engine->stats().dispatched_ticks == 2U);
+    CHECK(engine->stats().rejected_late_facts == 0U);
+    CHECK(engine->fatal_error().find("TickDispatch queue overflow") !=
+          std::string::npos);
 }
 
 void TestShenzhenOrderAndTransactionShareDomain() {
@@ -626,12 +1135,12 @@ void TestShenzhenOrderAndTransactionShareDomain() {
     Admit(engine.get(), {6U, 101U, 33U},
           MakeSzOrder(1, "000001"), base_time + 1U);
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 1U);
     CHECK(tick.common.kind == CanonicalKind::kShenzhenOrder);
     CHECK(tick.order_type == OrderType::kLimit);
     CHECK(tick.price.p6 == 12'340'000);
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 2U);
     CHECK(tick.common.kind == CanonicalKind::kShenzhenTransaction);
     CHECK(tick.action == TickAction::kTrade);
@@ -643,7 +1152,7 @@ void TestPartialSkipsGapWithoutFreezing() {
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(10, "600000"), 10U);
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 10U);
     CHECK((tick.validity & kTickChannelHistoryValid) == 0U);
     CHECK((tick.common.quality_flags &
@@ -658,7 +1167,7 @@ void TestPartialSkipsGapWithoutFreezing() {
     CHECK(gap.first_present_after_gap == 12U);
     CHECK(gap.gap_epoch == 1U);
     CHECK(gap.cumulative_missing_sequences == 1U);
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 12U);
     CHECK(tick.common.gap_before_first == 11U);
     CHECK(tick.common.gap_before_last == 11U);
@@ -666,20 +1175,21 @@ void TestPartialSkipsGapWithoutFreezing() {
 
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(11, "600000"), 13U);
-    LateRecoveryTick late{};
-    CHECK(WaitFor([&] { return engine->TryPollLateRecovery(&late); }));
-    CHECK(late.tick.common.native_sequence == 11U);
-    CHECK(late.committed_next_sequence == 13U);
-    CHECK(late.observed_gap_epoch == 1U);
-    CHECK(late.reason ==
-          LateRecoveryReason::kBehindCommittedFrontier);
-    CHECK(late.catalog_match);
-    CHECK((late.tick.validity & kTickChannelHistoryValid) == 0U);
-    CHECK((late.tick.common.quality_flags & kQualityLateRecovery) != 0U);
-    CHECK(!engine->TryPollTick(0U, &tick));
+    TickDispatch fill{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kProjectHoleFill, &fill);
+    }));
+    CHECK(fill.tick.common.native_sequence == 11U);
+    CHECK(fill.expected_sequence == 13U);
+    CHECK(fill.admission_floor == 10U);
+    CHECK(fill.generation == 1U);
+    CHECK(fill.catalog_match);
+    CHECK((fill.tick.validity & kTickChannelHistoryValid) == 0U);
+    CHECK((fill.tick.common.quality_flags & kQualityHoleFill) != 0U);
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &tick));
     CHECK(engine->healthy());
-    CHECK(engine->stats().duplicates_or_late >= 1U);
-    CHECK(engine->stats().late_recovery_dispatched == 1U);
+    CHECK(engine->stats().hole_fills_dispatched == 1U);
     engine->Stop();
 }
 
@@ -698,7 +1208,7 @@ void TestPartialReorderCapacityAdvancesWithoutLoss() {
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(3, "600000"), base_time);
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 3U);
 
     for (std::uint64_t sequence = 5U; sequence <= 9U; ++sequence) {
@@ -715,7 +1225,7 @@ void TestPartialReorderCapacityAdvancesWithoutLoss() {
     CHECK(gap.cumulative_missing_sequences == 1U);
 
     for (std::uint64_t expected = 5U; expected <= 9U; ++expected) {
-        CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+        CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
         CHECK(tick.common.native_sequence == expected);
         CHECK((tick.validity & kTickChannelHistoryValid) == 0U);
     }
@@ -744,6 +1254,9 @@ void TestPartialGapMailboxCoalescesWithoutOverflow() {
               MakeShTick(static_cast<std::int64_t>(sequence), "600001"),
               base_time + index);
         CHECK(WaitFor([&] {
+            TickDispatch ignored{};
+            while (engine->TryPollTickDispatch(0U, &ignored)) {
+            }
             const EngineStats stats = engine->stats();
             return stats.decoded_ticks == index + 1U &&
                    stats.gaps_skipped == index;
@@ -770,7 +1283,7 @@ void TestCatalogMissStillAdvancesNativeSequence() {
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(2, "600000"), 2U);
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 2U);
     CHECK(tick.common.instrument_id == 1U);
     CHECK(engine->stats().catalog_misses == 1U);
@@ -816,7 +1329,7 @@ void TestRawTapRetainsRetransmissionsBeforeRecoveryMutation() {
 
     std::vector<CanonicalTick> ordered;
     CanonicalTick tick{};
-    while (engine->TryPollTick(0U, &tick)) {
+    while (TryPollProjectedTick(engine.get(), 0U, &tick)) {
         ordered.push_back(tick);
     }
     CHECK(ordered.size() == 2U);
@@ -857,7 +1370,7 @@ void TestRawTapRetainsCatalogMissesBeforeOwnerSuppression() {
            kQualityInstrumentNotInCatalog) != 0U);
     CanonicalTick tick{};
     CanonicalSnapshot snapshot{};
-    CHECK(!engine->TryPollTick(0U, &tick));
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &tick));
     CHECK(!engine->TryPollSnapshot(0U, &snapshot));
     CHECK(engine->stats().catalog_misses == 2U);
 }
@@ -885,7 +1398,7 @@ void TestRawTapFailureClosesAdmission() {
     CHECK(engine->fatal_error().find("raw Tick batch queue") !=
           std::string::npos);
     CanonicalTick tick{};
-    CHECK(!engine->TryPollTick(0U, &tick));
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &tick));
 
     RecordingRawTap snapshot_raw;
     snapshot_raw.reject_snapshot_ = true;
@@ -957,8 +1470,63 @@ void TestDynamicRangesMayNotOverlap() {
     Admit(engine.get(), {4U, 101U, 24U}, body, 1U);
     CHECK(WaitFor([&] { return engine->stats().decode_errors == 1U; }));
     CanonicalTick tick{};
-    CHECK(!engine->TryPollTick(0U, &tick));
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &tick));
     engine->Stop();
+}
+
+void TestDecodeFreezeRejectsEveryRawAcceptedOccurrence() {
+    RecordingRawTap raw;
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.raw_record_tap = &raw;
+    config.from_open_gap_wait_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
+        config, MakeCatalog(), &error);
+    CHECK(engine != nullptr);
+    CHECK(engine->Start(&error));
+
+    const std::uint64_t base_time = MonotonicNowNs();
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(2, "600000"), base_time);
+    CHECK(WaitFor([&] { return engine->stats().decoded_ticks == 1U; }));
+
+    std::vector<std::byte> malformed = MakeShTick(1, "600000");
+    PutUnsigned<std::uint16_t>(malformed, 22U, 6U);
+    PutUnsigned<std::uint32_t>(malformed, 24U, 48U);
+    Admit(engine.get(), {4U, 101U, 24U}, malformed, base_time + 1U);
+    ChannelFault fault{};
+    CHECK(WaitFor([&] { return engine->TryPollChannelFault(&fault); }));
+    CHECK(fault.reason == ChannelFaultReason::kDecodeFailure);
+    CHECK(fault.expected_sequence == 1U);
+    CHECK(fault.observed_sequence == 1U);
+    CHECK(fault.feed_session_epoch == 1U);
+
+    // Once frozen, later successfully decoded/raw-tapped occurrences are also
+    // explicitly rejected instead of leaving an unmatched raw ACK.
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(3, "600000"), base_time + 2U);
+    CHECK(WaitFor([&] {
+        const EngineStats stats = engine->stats();
+        return stats.decoded_ticks == 2U &&
+               stats.decode_errors == 1U &&
+               stats.rejected_late_facts == 2U;
+    }));
+    engine->Stop();
+
+    TickDispatch rejected{};
+    CHECK(TryPollDispatchKind(
+        engine.get(), 0U, TickDispatchKind::kRejectLateFact, &rejected));
+    CHECK(rejected.tick.common.native_sequence == 2U);
+    CHECK(TryPollDispatchKind(
+        engine.get(), 0U, TickDispatchKind::kRejectLateFact, &rejected));
+    CHECK(rejected.tick.common.native_sequence == 3U);
+    CanonicalTick projected{};
+    CHECK(!TryPollProjectedTick(engine.get(), 0U, &projected));
+    CHECK(raw.ticks.size() == 2U);
+    CHECK(raw.ticks[0U].common.native_sequence == 2U);
+    CHECK(raw.ticks[1U].common.native_sequence == 3U);
+    CHECK(engine->stats().from_open_channels_frozen == 1U);
+    CHECK(engine->healthy());
 }
 
 void TestShanghaiDepthAndNestedQueue() {
@@ -995,7 +1563,7 @@ void TestShanghaiDepthAndNestedQueue() {
     engine->Stop();
 }
 
-void TestFromOpenConflictFreezesOnlyThatChannel() {
+void TestFromOpenPendingSameSequenceIsFirstWins() {
     std::unique_ptr<IngestEngine> engine =
         MakeEngine(StartMode::kFromOpen);
     std::vector<std::byte> first = MakeShTick(2, "600000");
@@ -1004,19 +1572,37 @@ void TestFromOpenConflictFreezesOnlyThatChannel() {
     const std::uint64_t base_time = MonotonicNowNs();
     Admit(engine.get(), {4U, 101U, 24U}, first, base_time);
     Admit(engine.get(), {4U, 101U, 24U}, conflicting, base_time + 1U);
+    TickDispatch rejected{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kRejectLateFact, &rejected);
+    }));
+    CHECK(rejected.tick.common.native_sequence == 2U);
+    CHECK(rejected.tick.price.p6 == 12'346'000);
+    CHECK(rejected.expected_sequence == 1U);
+    CHECK(rejected.admission_floor == 1U);
+
+    Admit(engine.get(), {4U, 101U, 24U},
+          MakeShTick(1, "600000"), base_time + 2U);
+    CanonicalTick tick{};
+    CHECK(WaitFor([&] {
+        return TryPollProjectedTick(engine.get(), 0U, &tick);
+    }));
+    CHECK(tick.common.native_sequence == 1U);
+    CHECK(WaitFor([&] {
+        return TryPollProjectedTick(engine.get(), 0U, &tick);
+    }));
+    CHECK(tick.common.native_sequence == 2U);
+    CHECK(tick.price.p6 == 12'345'000);
     ChannelFault fault{};
-    CHECK(WaitFor([&] { return engine->TryPollChannelFault(&fault); }));
-    CHECK(fault.market == Market::kShanghai);
-    CHECK(fault.channel == 1U);
-    CHECK(fault.reason == ChannelFaultReason::kCanonicalConflict);
-    CHECK(fault.expected_sequence == 1U);
-    CHECK(fault.observed_sequence == 2U);
-    CHECK(engine->stats().from_open_channels_frozen == 1U);
+    CHECK(!engine->TryPollChannelFault(&fault));
+    CHECK(engine->stats().from_open_channels_frozen == 0U);
+    CHECK(engine->stats().rejected_late_facts == 1U);
     CHECK(engine->healthy());
     engine->Stop();
 }
 
-void TestPartialConflictKeepsFirstWithoutFreezing() {
+void TestPartialPendingSameSequenceIsFirstWins() {
     EngineConfig config = MakeConfig(StartMode::kPartial);
     config.partial_gap_wait_ns = UINT64_C(1'000'000'000);
     std::string error;
@@ -1029,7 +1615,7 @@ void TestPartialConflictKeepsFirstWithoutFreezing() {
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(10, "600000"), base_time);
     CanonicalTick tick{};
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 10U);
 
     std::vector<std::byte> first = MakeShTick(12, "600000");
@@ -1037,17 +1623,18 @@ void TestPartialConflictKeepsFirstWithoutFreezing() {
     PutI32(conflicting, 44U, 12'346);
     Admit(engine.get(), {4U, 101U, 24U}, first, base_time + 1U);
     Admit(engine.get(), {4U, 101U, 24U}, conflicting, base_time + 2U);
-    LateRecoveryTick late{};
-    CHECK(WaitFor([&] { return engine->TryPollLateRecovery(&late); }));
-    CHECK(late.reason ==
-          LateRecoveryReason::kPendingCanonicalConflict);
-    CHECK(late.tick.price.p6 == 12'346'000);
+    TickDispatch rejected{};
+    CHECK(WaitFor([&] {
+        return TryPollDispatchKind(
+            engine.get(), 0U, TickDispatchKind::kRejectLateFact, &rejected);
+    }));
+    CHECK(rejected.tick.price.p6 == 12'346'000);
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(11, "600000"), base_time + 3U);
 
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 11U);
-    CHECK(WaitFor([&] { return engine->TryPollTick(0U, &tick); }));
+    CHECK(WaitFor([&] { return TryPollProjectedTick(engine.get(), 0U, &tick); }));
     CHECK(tick.common.native_sequence == 12U);
     CHECK(tick.price.p6 == 12'345'000);
     ChannelFault fault{};
@@ -1598,8 +2185,15 @@ int main() {
     TestStreamSelectionDisablesUnlistedTuple();
     TestFromOpenReordersShanghai();
     TestGapWaitDefaultsAreEqual();
-    TestFromOpenGapTimeoutAdvancesAndRoutesLateBackfill();
-    TestFromOpenCapacityAdvancesWithoutLossAndRoutesBackfill();
+    TestFromOpenGapTimeoutAcceptsOpenHoleFill();
+    TestFromOpenCapacityExpiresBackfillOutsideWindow();
+    TestFilledGapRestoresCompletePrefix();
+    TestExactHoleLedgerBoundaryAndArrivalToken();
+    TestPartialDiscoveryFixesOriginTokensAndCurrentGeneration();
+    TestModuloCollisionKeepsCurrentOccurrenceAndArrivalToken();
+    TestPartialDiscoveryModuloCollisionAdoptsLowerOrigin();
+    TestStopFailsClosedWhenSequenceFlushCannotPublish();
+    TestDispatchOverflowDropsAlreadyQueuedTicksFailClosed();
     TestShenzhenOrderAndTransactionShareDomain();
     TestPartialSkipsGapWithoutFreezing();
     TestPartialReorderCapacityAdvancesWithoutLoss();
@@ -1611,9 +2205,10 @@ int main() {
     TestBothSnapshotLayouts();
     TestMalformedSnapshotListFailsDecode();
     TestDynamicRangesMayNotOverlap();
+    TestDecodeFreezeRejectsEveryRawAcceptedOccurrence();
     TestShanghaiDepthAndNestedQueue();
-    TestFromOpenConflictFreezesOnlyThatChannel();
-    TestPartialConflictKeepsFirstWithoutFreezing();
+    TestFromOpenPendingSameSequenceIsFirstWins();
+    TestPartialPendingSameSequenceIsFirstWins();
     TestMdlConnectionBoundaryClassification();
     TestMdlConnectionBoundaryStopsAdmission();
     TestMdlReadinessRequiresLogonAndConfiguredStatuses();

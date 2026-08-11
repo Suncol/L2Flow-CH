@@ -210,7 +210,7 @@ void AppendPayload(RowBinaryWriter* writer,
     AppendAnchor(writer, value.first_trade);
     AppendAnchor(writer, value.last_trade);
     writer->Append(value.source_quality_flags);
-    writer->AppendBool(value.has_late_recovery);
+    writer->AppendBool(value.has_hole_fill);
     writer->AppendBool(value.provisional);
 }
 
@@ -268,7 +268,7 @@ struct RevisionChunkMetadata final {
            "high_price_p6 Int64, low_price_p6 Int64, close_price_p6 Int64, "
            "volume Int64, notional_p6 Int64, trade_count UInt64, "
            "first_trade " + AnchorType() + ", last_trade " + AnchorType() +
-           ", source_quality_flags UInt64, has_late_recovery Bool, "
+           ", source_quality_flags UInt64, has_hole_fill Bool, "
            "provisional Bool)";
 }
 
@@ -845,7 +845,8 @@ bool ValidateKLineClickHouseConfig(const KLineClickHouseConfig& config,
     }
     const bool valid_writer_lanes =
         config.writer_lanes == 1U || config.writer_lanes == 2U ||
-        config.writer_lanes == 4U || config.writer_lanes == 8U;
+        config.writer_lanes == 4U || config.writer_lanes == 8U ||
+        config.writer_lanes == 16U || config.writer_lanes == 32U;
     if (!valid_writer_lanes || config.insert_chunk_rows == 0U ||
         config.queue_revision_batches == 0U ||
         config.queue_revision_rows == 0U ||

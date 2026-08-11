@@ -73,9 +73,10 @@ enum TickField : int {
     kTickAggressor,
     kTickOrderType,
     kTickPhase,
-    kTickCommittedNextSequence,
-    kTickObservedGapEpoch,
-    kTickLateReason,
+    kTickExpectedSequence,
+    kTickAdmissionFloor,
+    kTickGeneration,
+    kTickEvictBefore,
     kTickCatalogMatch,
 };
 
@@ -220,9 +221,10 @@ void AppendCommonFields(arrow::FieldVector* fields) {
     fields.push_back(arrow::field("aggressor", arrow::uint8(), false));
     fields.push_back(arrow::field("order_type", arrow::uint8(), false));
     fields.push_back(arrow::field("phase", arrow::uint8(), false));
-    fields.push_back(arrow::field("committed_next_sequence", arrow::uint64()));
-    fields.push_back(arrow::field("observed_gap_epoch", arrow::uint64()));
-    fields.push_back(arrow::field("late_recovery_reason", arrow::uint8()));
+    fields.push_back(arrow::field("expected_sequence", arrow::uint64()));
+    fields.push_back(arrow::field("admission_floor", arrow::uint64()));
+    fields.push_back(arrow::field("generation", arrow::uint64()));
+    fields.push_back(arrow::field("evict_before", arrow::uint64()));
     fields.push_back(arrow::field("catalog_match", arrow::boolean()));
     return fields;
 }
@@ -554,8 +556,15 @@ void SetError(std::string* error, std::string value) noexcept {
 }
 
 [[nodiscard]] bool IsRingStreamKind(RingStreamKind kind) noexcept {
-    return kind >= RingStreamKind::kOrderedTick &&
-           kind <= RingStreamKind::kKline;
+    switch (kind) {
+        case RingStreamKind::kOrderedTick:
+        case RingStreamKind::kSnapshot:
+        case RingStreamKind::kControl:
+        case RingStreamKind::kEvent:
+        case RingStreamKind::kKline:
+            return true;
+    }
+    return false;
 }
 
 [[nodiscard]] bool IsKnownMarket(ingest::Market market) noexcept {
@@ -566,7 +575,6 @@ void SetError(std::string* error, std::string value) noexcept {
 [[nodiscard]] bool IsChannelFaultReason(
     ingest::ChannelFaultReason reason) noexcept {
     switch (reason) {
-        case ingest::ChannelFaultReason::kCanonicalConflict:
         case ingest::ChannelFaultReason::kDecodeFailure:
             return true;
     }
@@ -604,7 +612,7 @@ public:
 
     arrow::Status Append(const ingest::CanonicalTick& tick,
                          TickStreamRole role,
-                         const ingest::LateRecoveryTick* late) {
+                         const ingest::TickDispatch* hole_fill) {
         ARROW_RETURN_NOT_OK(
             AppendCommon(builder_.get(), tick.common, feed_session_epoch_));
         ARROW_RETURN_NOT_OK(builder_->GetFieldAs<arrow::UInt8Builder>(
@@ -652,23 +660,29 @@ public:
                 static_cast<std::uint8_t>(tick.order_type)));
         ARROW_RETURN_NOT_OK(builder_->GetFieldAs<arrow::UInt8Builder>(
             kTickPhase)->Append(static_cast<std::uint8_t>(tick.phase)));
-        const bool is_late = late != nullptr;
+        const bool is_hole_fill = hole_fill != nullptr;
         ARROW_RETURN_NOT_OK(AppendNullable(
             builder_->GetFieldAs<arrow::UInt64Builder>(
-                kTickCommittedNextSequence),
-            is_late, is_late ? late->committed_next_sequence : 0U));
+                kTickExpectedSequence),
+            is_hole_fill,
+            is_hole_fill ? hole_fill->expected_sequence : 0U));
         ARROW_RETURN_NOT_OK(AppendNullable(
             builder_->GetFieldAs<arrow::UInt64Builder>(
-                kTickObservedGapEpoch),
-            is_late, is_late ? late->observed_gap_epoch : 0U));
+                kTickAdmissionFloor),
+            is_hole_fill,
+            is_hole_fill ? hole_fill->admission_floor : 0U));
         ARROW_RETURN_NOT_OK(AppendNullable(
-            builder_->GetFieldAs<arrow::UInt8Builder>(kTickLateReason),
-            is_late,
-            is_late ? static_cast<std::uint8_t>(late->reason)
-                    : std::uint8_t{0U}));
+            builder_->GetFieldAs<arrow::UInt64Builder>(kTickGeneration),
+            is_hole_fill,
+            is_hole_fill ? hole_fill->generation : 0U));
+        ARROW_RETURN_NOT_OK(AppendNullable(
+            builder_->GetFieldAs<arrow::UInt64Builder>(kTickEvictBefore),
+            is_hole_fill,
+            is_hole_fill ? hole_fill->evict_before : 0U));
         ARROW_RETURN_NOT_OK(AppendNullable(
             builder_->GetFieldAs<arrow::BooleanBuilder>(kTickCatalogMatch),
-            is_late, is_late && late->catalog_match));
+            is_hole_fill,
+            is_hole_fill && hole_fill->catalog_match));
         UpdateBatchMetadata(tick.common, feed_session_epoch_, rows_,
                             &has_exchange_time_, &metadata_);
         ++rows_;
@@ -728,20 +742,25 @@ bool TickRecordBatchBuilder::AppendOrdered(
     }
 }
 
-bool TickRecordBatchBuilder::AppendLateRecovery(
-    const ingest::LateRecoveryTick& record,
+bool TickRecordBatchBuilder::AppendHoleFill(
+    const ingest::TickDispatch& dispatch,
     std::string* error) noexcept {
-    if (!ValidateCommon(record.tick.common, error) ||
-        record.reason > ingest::LateRecoveryReason::kPendingCanonicalConflict) {
-        if (record.reason >
-            ingest::LateRecoveryReason::kPendingCanonicalConflict) {
-            SetError(error, "invalid LateRecovery reason");
-        }
+    const std::uint64_t sequence = dispatch.tick.common.native_sequence;
+    if (!ValidateCommon(dispatch.tick.common, error)) {
+        return false;
+    }
+    if (dispatch.kind != ingest::TickDispatchKind::kProjectHoleFill ||
+        dispatch.feed_session_epoch != impl_->feed_session_epoch_ ||
+        dispatch.expected_sequence == 0U ||
+        dispatch.admission_floor > sequence ||
+        sequence >= dispatch.expected_sequence ||
+        dispatch.generation == 0U || dispatch.evict_before == 0U) {
+        SetError(error, "invalid hole-fill dispatch");
         return false;
     }
     try {
         const arrow::Status status = impl_->Append(
-            record.tick, TickStreamRole::kLateRecovery, &record);
+            dispatch.tick, TickStreamRole::kHoleFill, &dispatch);
         SetError(error, status.ok() ? std::string{} : status.ToString());
         return status.ok();
     } catch (const std::exception& exception) {

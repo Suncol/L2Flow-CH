@@ -26,6 +26,8 @@ using namespace l2flow::kline;
         }                                                                    \
     } while (false)
 
+constexpr std::uint64_t kFeedSessionEpoch = 17U;
+
 std::shared_ptr<l2flow::journal::CanonicalFactJournal> TestJournal() {
     static std::atomic<std::uint64_t> next_id{0U};
     const std::uint64_t id = next_id.fetch_add(1U, std::memory_order_relaxed);
@@ -122,12 +124,114 @@ KLineWorkerConfig Config(std::vector<std::uint32_t> intervals = {5U}) {
     config.owner = 0U;
     config.owner_count = 1U;
     config.revision_epoch = 11U;
+    config.feed_session_epoch = kFeedSessionEpoch;
     config.calculation_run_id.bytes[0U] = std::byte{1U};
     config.interval_seconds = std::move(intervals);
     config.fact_journal = TestJournal();
     config.maximum_bars = 1'024U;
     config.maximum_pending_commits = 64U;
     config.maximum_acknowledged_raw_dependencies = 1'024U;
+    return config;
+}
+
+KLineInput OrderedInput(const CanonicalTick& tick) {
+    KLineInput input{};
+    input.tick = tick;
+    input.admission.feed_session_epoch = kFeedSessionEpoch;
+    input.admission.expected_sequence = tick.common.native_sequence;
+    input.admission.admission_floor = 1U;
+    input.admission.retention_floor = tick.common.native_sequence + 1U;
+    input.admission.dispatch_fence = tick.common.ingress_sequence;
+    input.admission.sequence_class = KLineSequenceClass::kOrdered;
+    return input;
+}
+
+KLineInput HoleFillInput(const CanonicalTick& tick,
+                         std::uint64_t expected_sequence,
+                         std::uint64_t admission_floor,
+                         std::uint64_t generation) {
+    KLineInput input{};
+    input.tick = tick;
+    input.admission.feed_session_epoch = kFeedSessionEpoch;
+    input.admission.expected_sequence = expected_sequence;
+    input.admission.admission_floor = admission_floor;
+    input.admission.retention_floor = admission_floor;
+    input.admission.generation = generation;
+    input.admission.dispatch_fence = tick.common.ingress_sequence;
+    input.admission.sequence_class = KLineSequenceClass::kHoleFill;
+    return input;
+}
+
+TickDispatch OrderedDispatch(const CanonicalTick& tick) {
+    TickDispatch dispatch{};
+    dispatch.tick = tick;
+    dispatch.feed_session_epoch = kFeedSessionEpoch;
+    dispatch.expected_sequence = tick.common.native_sequence;
+    dispatch.admission_floor = 1U;
+    dispatch.evict_before = tick.common.native_sequence + 1U;
+    dispatch.dispatch_fence = tick.common.ingress_sequence;
+    dispatch.channel = tick.common.channel;
+    dispatch.owner = tick.common.instrument_ordinal;
+    dispatch.market = tick.common.identity.market;
+    dispatch.kind = TickDispatchKind::kProjectOrdered;
+    dispatch.catalog_match = true;
+    return dispatch;
+}
+
+TickDispatch HoleFillDispatch(const CanonicalTick& tick,
+                              std::uint64_t expected_sequence,
+                              std::uint64_t admission_floor,
+                              std::uint64_t generation) {
+    TickDispatch dispatch = OrderedDispatch(tick);
+    dispatch.expected_sequence = expected_sequence;
+    dispatch.admission_floor = admission_floor;
+    dispatch.evict_before = admission_floor;
+    dispatch.generation = generation;
+    dispatch.kind = TickDispatchKind::kProjectHoleFill;
+    return dispatch;
+}
+
+TickDispatch RejectDispatch(const CanonicalTick& tick) {
+    TickDispatch dispatch = OrderedDispatch(tick);
+    dispatch.kind = TickDispatchKind::kRejectLateFact;
+    return dispatch;
+}
+
+TickDispatch GapOpenDispatch(std::uint64_t fence) {
+    TickDispatch dispatch{};
+    dispatch.feed_session_epoch = kFeedSessionEpoch;
+    dispatch.generation = 1U;
+    dispatch.dispatch_fence = fence;
+    dispatch.first_missing = 10U;
+    dispatch.last_missing = 11U;
+    dispatch.channel = 7U;
+    dispatch.owner = 0U;
+    dispatch.market = Market::kShanghai;
+    dispatch.kind = TickDispatchKind::kGapOpen;
+    return dispatch;
+}
+
+TickDispatch ChannelSealDispatch(std::uint64_t fence) {
+    TickDispatch dispatch{};
+    dispatch.feed_session_epoch = kFeedSessionEpoch;
+    dispatch.generation = 1U;
+    dispatch.dispatch_fence = fence;
+    dispatch.evict_before = 12U;
+    dispatch.channel = 7U;
+    dispatch.owner = 0U;
+    dispatch.market = Market::kShanghai;
+    dispatch.kind = TickDispatchKind::kChannelSeal;
+    return dispatch;
+}
+
+KLineRuntimeConfig RuntimeConfig() {
+    KLineRuntimeConfig config{};
+    config.worker = Config({1U});
+    config.feed_session_epoch = kFeedSessionEpoch;
+    config.micro_batch_rows = 1U;
+    config.maximum_raw_ack_backlog_per_owner = 8U;
+    config.maximum_occurrence_join_entries_per_owner = 8U;
+    config.worker.maximum_acknowledged_raw_dependencies = 8U;
     return config;
 }
 
@@ -159,7 +263,7 @@ void TestSdkExchangeTimeDefinesWindowAndOhlc() {
         100U, 2U, base + UINT64_C(1'000'000'000), 9'000U,
         10'000'000, 10);
     const std::array<KLineInput, 2U> inputs{
-        KLineInput{later_exchange}, KLineInput{earlier_exchange}};
+        OrderedInput(later_exchange), OrderedInput(earlier_exchange)};
     const KLineApplyResult result = worker->ApplyBatch(inputs);
     CHECK(result.code == KLineApplyCode::kApplied);
     CHECK(sink.batches.empty());
@@ -191,7 +295,7 @@ void TestLateBackfillRevisesHistoricalSecondWindow() {
 
     const CanonicalTick live = Trade(
         102U, 10U, base + 800'000'000U, 100U, 11'000'000, 5);
-    const KLineInput live_input{live};
+    const KLineInput live_input = OrderedInput(live);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&live_input, 1U)).code ==
           KLineApplyCode::kApplied);
@@ -200,7 +304,7 @@ void TestLateBackfillRevisesHistoricalSecondWindow() {
     const CanonicalTick next_window = Trade(
         103U, 11U, base + UINT64_C(1'100'000'000), 101U,
         13'000'000, 7);
-    const KLineInput next_input{next_window};
+    const KLineInput next_input = OrderedInput(next_window);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&next_input, 1U)).code ==
           KLineApplyCode::kApplied);
@@ -208,9 +312,8 @@ void TestLateBackfillRevisesHistoricalSecondWindow() {
 
     const CanonicalTick recovered = Trade(
         101U, 12U, base + 100'000'000U, 9'999U, 9'000'000, 3);
-    KLineInput recovered_input{recovered};
-    recovered_input.late_recovery = true;
-    recovered_input.committed_next_sequence = 104U;
+    const KLineInput recovered_input =
+        HoleFillInput(recovered, 104U, 100U, 1U);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&recovered_input, 1U)).code ==
           KLineApplyCode::kApplied);
@@ -219,7 +322,7 @@ void TestLateBackfillRevisesHistoricalSecondWindow() {
     CHECK(sink.batches.size() == 3U);
     const KLineRevision& repair = sink.batches.back()->revisions.front();
     CHECK(repair.operation == RevisionOperation::kUpdate);
-    CHECK(repair.reason == RevisionReason::kLateRecovery);
+    CHECK(repair.reason == RevisionReason::kHoleFill);
     CHECK(repair.supersedes_revision_id_valid);
     KLinePayload bar{};
     CHECK(worker->CopyBar(
@@ -227,7 +330,7 @@ void TestLateBackfillRevisesHistoricalSecondWindow() {
     CHECK(bar.open_price_p6 == 9'000'000);
     CHECK(bar.close_price_p6 == 11'000'000);
     CHECK(bar.volume == 8);
-    CHECK(bar.has_late_recovery);
+    CHECK(bar.has_hole_fill);
 }
 
 void TestInvalidExchangeTimeNeverFallsBackToLocalClock() {
@@ -251,8 +354,8 @@ void TestInvalidExchangeTimeNeverFallsBackToLocalClock() {
         3U, 22U, kNanosecondsPerDay,
         UINT64_C(34'200'700'000'000), 10'000'000, 10);
     const std::array<KLineInput, 3U> inputs{
-        KLineInput{invalid}, KLineInput{missing_validity},
-        KLineInput{out_of_day}};
+        OrderedInput(invalid), OrderedInput(missing_validity),
+        OrderedInput(out_of_day)};
     const KLineApplyResult result = worker->ApplyBatch(inputs);
     CHECK(result.code == KLineApplyCode::kInvalidInput);
     CHECK(result.trades_inserted == 0U);
@@ -284,8 +387,8 @@ void TestHalfOpenWindowAndEqualTimestampTieBreak() {
     const CanonicalTick boundary = Trade(
         2U, 25U, base + 5'000'000'000U, 30U, 15'000'000, 4, 7U);
     const std::array<KLineInput, 3U> inputs{
-        KLineInput{channel_nine}, KLineInput{channel_two},
-        KLineInput{boundary}};
+        OrderedInput(channel_nine), OrderedInput(channel_two),
+        OrderedInput(boundary)};
     const KLineApplyResult result = worker->ApplyBatch(inputs);
     CHECK(result.code == KLineApplyCode::kApplied);
     CHECK(result.changed_bars == 2U);
@@ -320,7 +423,7 @@ void TestDuplicateConflictAndMultipleIntervals() {
     constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
     const CanonicalTick trade = Trade(
         1U, 30U, base + 100'000'000U, 1U, 10'000'000, 10, 0U);
-    const KLineInput first{trade};
+    const KLineInput first = OrderedInput(trade);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&first, 1U)).revisions_created == 2U);
     Ack(worker.get(), std::span<const CanonicalTick>(&trade, 1U));
@@ -328,7 +431,7 @@ void TestDuplicateConflictAndMultipleIntervals() {
     CanonicalTick duplicate = trade;
     duplicate.common.ingress_sequence = 31U;
     duplicate.common.receive_monotonic_ns = 2U;
-    const KLineInput duplicate_input{duplicate};
+    const KLineInput duplicate_input = OrderedInput(duplicate);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&duplicate_input, 1U)).code ==
           KLineApplyCode::kDuplicateOnly);
@@ -339,7 +442,7 @@ void TestDuplicateConflictAndMultipleIntervals() {
     conflict.common.ingress_sequence = 32U;
     conflict.price.raw = 110'000;
     conflict.price.p6 = 11'000'000;
-    const KLineInput conflict_input{conflict};
+    const KLineInput conflict_input = OrderedInput(conflict);
     CHECK(worker->ApplyBatch(
               std::span<const KLineInput>(&conflict_input, 1U)).code ==
           KLineApplyCode::kSourceConflict);
@@ -347,26 +450,278 @@ void TestDuplicateConflictAndMultipleIntervals() {
     CHECK(sink.batches.size() == 1U);
 }
 
-void TestRawAckBeforeFactAndRuntimeRouting() {
+void TestRuntimeProjectJoinBothArrivalOrders() {
     RecordingSink sink;
-    KLineRuntimeConfig config{};
-    config.worker = Config({1U});
-    config.micro_batch_rows = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 64U;
-    config.worker.maximum_acknowledged_raw_dependencies = 64U;
     std::string error;
     std::unique_ptr<KLineRuntime> runtime =
-        KLineRuntime::Create(config, &sink, &error);
+        KLineRuntime::Create(RuntimeConfig(), &sink, &error);
     CHECK(runtime != nullptr);
     constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
-    const CanonicalTick trade = Trade(
+
+    const CanonicalTick ack_first = Trade(
         1U, 40U, base + 1U, 100U, 10'000'000, 1);
     CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&trade, 1U)));
-    CHECK(runtime->AppendTick(0U, trade));
+        std::span<const CanonicalTick>(&ack_first, 1U)));
+    CHECK(runtime->AppendDispatch(0U, OrderedDispatch(ack_first)));
     CHECK(runtime->FlushAll());
     CHECK(sink.batches.size() == 1U);
-    CHECK(runtime->stats().raw_tick_acks_received == 1U);
+
+    const CanonicalTick disposition_first = Trade(
+        2U, 41U, base + 2U, 101U, 11'000'000, 2);
+    CHECK(runtime->AppendDispatch(
+        0U, HoleFillDispatch(disposition_first, 3U, 2U, 1U)));
+    CHECK(sink.batches.size() == 1U);
+    CHECK(runtime->stats().occurrence_join_entries == 1U);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&disposition_first, 1U)));
+    CHECK(runtime->FlushAll());
+    CHECK(sink.batches.size() == 2U);
+
+    const KLineRuntimeStats stats = runtime->stats();
+    CHECK(stats.raw_tick_acks_received == 2U);
+    CHECK(stats.ordered_dispositions_received == 1U);
+    CHECK(stats.hole_fill_dispositions_received == 1U);
+    CHECK(stats.occurrence_ack_first == 1U);
+    CHECK(stats.occurrence_disposition_first == 1U);
+    CHECK(stats.occurrence_projects_resolved == 2U);
+    CHECK(stats.occurrence_rejections_resolved == 0U);
+    CHECK(stats.occurrence_join_entries == 0U);
+    CHECK(runtime->DrainAll());
+}
+
+void TestRuntimeRejectJoinBothArrivalOrders() {
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<KLineRuntime> runtime =
+        KLineRuntime::Create(RuntimeConfig(), &sink, &error);
+    CHECK(runtime != nullptr);
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+
+    const CanonicalTick disposition_first = Trade(
+        10U, 50U, base + 1U, 100U, 10'000'000, 1);
+    CHECK(runtime->AppendDispatch(0U, RejectDispatch(disposition_first)));
+    CHECK(runtime->stats().occurrence_join_entries == 1U);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&disposition_first, 1U)));
+    CHECK(runtime->Flush(0U));
+
+    const CanonicalTick ack_first = Trade(
+        11U, 51U, base + 2U, 101U, 10'000'000, 1);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&ack_first, 1U)));
+    CHECK(runtime->AppendDispatch(0U, RejectDispatch(ack_first)));
+
+    const KLineRuntimeStats stats = runtime->stats();
+    CHECK(stats.rejected_dispositions_received == 2U);
+    CHECK(stats.occurrence_ack_first == 1U);
+    CHECK(stats.occurrence_disposition_first == 1U);
+    CHECK(stats.occurrence_projects_resolved == 0U);
+    CHECK(stats.occurrence_rejections_resolved == 2U);
+    CHECK(stats.occurrence_join_entries == 0U);
+    CHECK(stats.workers.facts_journaled == 0U);
+    CHECK(sink.batches.empty());
+    CHECK(runtime->DrainAll());
+}
+
+void TestRuntimeDuplicateSidesFailClosedWhilePairActive() {
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+    std::string error;
+
+    RecordingSink disposition_sink;
+    std::unique_ptr<KLineRuntime> duplicate_disposition =
+        KLineRuntime::Create(RuntimeConfig(), &disposition_sink, &error);
+    CHECK(duplicate_disposition != nullptr);
+    const CanonicalTick disposition = Trade(
+        20U, 60U, base + 1U, 100U, 10'000'000, 1);
+    const TickDispatch rejected = RejectDispatch(disposition);
+    CHECK(duplicate_disposition->AppendDispatch(0U, rejected));
+    CHECK(!duplicate_disposition->AppendDispatch(0U, rejected));
+    CHECK(!duplicate_disposition->healthy());
+    CHECK(duplicate_disposition->stats().occurrence_duplicate_sides == 1U);
+    CHECK(duplicate_disposition->fatal_error().find("duplicate side") !=
+          std::string::npos);
+
+    RecordingSink ack_sink;
+    std::unique_ptr<KLineRuntime> duplicate_ack =
+        KLineRuntime::Create(RuntimeConfig(), &ack_sink, &error);
+    CHECK(duplicate_ack != nullptr);
+    const CanonicalTick acknowledged = Trade(
+        21U, 61U, base + 2U, 101U, 10'000'000, 1);
+    CHECK(duplicate_ack->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&acknowledged, 1U)));
+    CHECK(duplicate_ack->Flush(0U));
+    CHECK(duplicate_ack->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&acknowledged, 1U)));
+    CHECK(!duplicate_ack->Flush(0U));
+    CHECK(!duplicate_ack->healthy());
+    CHECK(duplicate_ack->stats().occurrence_duplicate_sides == 1U);
+}
+
+void TestRuntimeDrainFailsClosedWithUnresolvedJoin() {
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<KLineRuntime> runtime =
+        KLineRuntime::Create(RuntimeConfig(), &sink, &error);
+    CHECK(runtime != nullptr);
+
+    const CanonicalTick rejected = Trade(
+        22U, 62U, base + 3U, 102U, 10'000'000, 1);
+    CHECK(runtime->AppendDispatch(0U, RejectDispatch(rejected)));
+    CHECK(!runtime->DrainAll());
+    CHECK(!runtime->healthy());
+    CHECK(runtime->fatal_error().find(
+              "unresolved raw ACK/disposition dependencies") !=
+          std::string::npos);
+    CHECK(runtime->stats().occurrence_join_entries == 1U);
+}
+
+void TestRuntimeJoinAndAckInboxCapacityFailClosed() {
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+    std::string error;
+
+    RecordingSink join_sink;
+    KLineRuntimeConfig join_config = RuntimeConfig();
+    join_config.maximum_occurrence_join_entries_per_owner = 1U;
+    std::unique_ptr<KLineRuntime> join = KLineRuntime::Create(
+        std::move(join_config), &join_sink, &error);
+    CHECK(join != nullptr);
+    const CanonicalTick first = Trade(
+        30U, 70U, base + 1U, 100U, 10'000'000, 1);
+    const CanonicalTick second = Trade(
+        31U, 71U, base + 2U, 101U, 10'000'000, 1);
+    CHECK(join->AppendDispatch(0U, RejectDispatch(first)));
+    CHECK(!join->AppendDispatch(0U, RejectDispatch(second)));
+    CHECK(!join->healthy());
+    CHECK(join->stats().occurrence_join_entries == 1U);
+    CHECK(join->fatal_error().find("join capacity") != std::string::npos);
+
+    RecordingSink inbox_sink;
+    KLineRuntimeConfig inbox_config = RuntimeConfig();
+    inbox_config.maximum_raw_ack_backlog_per_owner = 1U;
+    std::unique_ptr<KLineRuntime> inbox = KLineRuntime::Create(
+        std::move(inbox_config), &inbox_sink, &error);
+    CHECK(inbox != nullptr);
+    const std::array<CanonicalTick, 2U> acknowledgements{first, second};
+    CHECK(!inbox->OnRawTickBatchAcknowledged(acknowledgements));
+    CHECK(!inbox->healthy());
+    CHECK(inbox->stats().raw_tick_acks_received == 1U);
+    CHECK(inbox->stats().raw_ack_inbox_backlog == 1U);
+    CHECK(inbox->fatal_error().find("ACK inbox capacity") !=
+          std::string::npos);
+}
+
+void TestRuntimeAckCapacityRelationshipValidation() {
+    RecordingSink sink;
+    std::string error;
+
+    KLineRuntimeConfig config = RuntimeConfig();
+    config.micro_batch_rows = 7U;
+    config.maximum_raw_ack_backlog_per_owner = 5U;
+    config.maximum_occurrence_join_entries_per_owner = 6U;
+    config.worker.maximum_acknowledged_raw_dependencies = 6U;
+    CHECK(ValidateKLineRuntimeConfig(config, &error));
+    CHECK(KLineRuntime::Create(config, &sink, &error) != nullptr);
+
+    config.worker.maximum_acknowledged_raw_dependencies = 5U;
+    CHECK(!ValidateKLineRuntimeConfig(config, &error));
+    CHECK(error.find("ACK forwarding cut") != std::string::npos);
+
+    config = RuntimeConfig();
+    config.micro_batch_rows = 1U;
+    config.maximum_raw_ack_backlog_per_owner = 2U;
+    config.maximum_occurrence_join_entries_per_owner = 2U;
+    config.worker.maximum_acknowledged_raw_dependencies = 1U;
+    CHECK(KLineRuntime::Create(config, &sink, &error) == nullptr);
+    CHECK(error.find("ACK forwarding cut") != std::string::npos);
+}
+
+void TestRuntimeRejectsInvalidEpochOwnerAndFence() {
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+    const CanonicalTick trade = Trade(
+        40U, 80U, base + 1U, 100U, 10'000'000, 1);
+    std::string error;
+
+    RecordingSink epoch_sink;
+    std::unique_ptr<KLineRuntime> epoch =
+        KLineRuntime::Create(RuntimeConfig(), &epoch_sink, &error);
+    CHECK(epoch != nullptr);
+    TickDispatch wrong_epoch = OrderedDispatch(trade);
+    wrong_epoch.feed_session_epoch = kFeedSessionEpoch + 1U;
+    CHECK(!epoch->AppendDispatch(0U, wrong_epoch));
+    CHECK(!epoch->healthy());
+
+    RecordingSink owner_sink;
+    std::unique_ptr<KLineRuntime> owner =
+        KLineRuntime::Create(RuntimeConfig(), &owner_sink, &error);
+    CHECK(owner != nullptr);
+    TickDispatch wrong_owner = OrderedDispatch(trade);
+    wrong_owner.owner = 1U;
+    CHECK(!owner->AppendDispatch(0U, wrong_owner));
+    CHECK(!owner->healthy());
+
+    RecordingSink fence_sink;
+    std::unique_ptr<KLineRuntime> fence =
+        KLineRuntime::Create(RuntimeConfig(), &fence_sink, &error);
+    CHECK(fence != nullptr);
+    TickDispatch missing_fence = OrderedDispatch(trade);
+    missing_fence.dispatch_fence = 0U;
+    CHECK(!fence->AppendDispatch(0U, missing_fence));
+    CHECK(!fence->healthy());
+}
+
+void TestRuntimeGapAndSealControlsAreNoOps() {
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<KLineRuntime> runtime =
+        KLineRuntime::Create(RuntimeConfig(), &sink, &error);
+    CHECK(runtime != nullptr);
+
+    CHECK(runtime->AppendDispatch(0U, GapOpenDispatch(1U)));
+    CHECK(runtime->AppendDispatch(0U, ChannelSealDispatch(2U)));
+    CHECK(runtime->FlushAll());
+    CHECK(runtime->DrainAll());
+
+    const KLineRuntimeStats stats = runtime->stats();
+    CHECK(stats.gap_open_controls_received == 1U);
+    CHECK(stats.channel_seal_controls_received == 1U);
+    CHECK(stats.occurrence_join_entries == 0U);
+    CHECK(stats.raw_tick_acks_received == 0U);
+    CHECK(stats.micro_batches_applied == 0U);
+    CHECK(stats.workers.facts_journaled == 0U);
+    CHECK(sink.batches.empty());
+}
+
+void TestAdmissionTokenHalfOpenBoundary() {
+    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
+
+    RecordingSink accepted_sink;
+    std::string error;
+    std::unique_ptr<KLineWorker> accepted = KLineWorker::Create(
+        Config({1U}), &accepted_sink, &error);
+    CHECK(accepted != nullptr);
+    const CanonicalTick at_floor = Trade(
+        100U, 41U, base + 1U, 100U, 10'000'000, 1);
+    const KLineInput accepted_input =
+        HoleFillInput(at_floor, 101U, 100U, 1U);
+    CHECK(accepted->ApplyBatch(
+              std::span<const KLineInput>(&accepted_input, 1U)).code ==
+          KLineApplyCode::kApplied);
+
+    RecordingSink expired_sink;
+    std::unique_ptr<KLineWorker> expired = KLineWorker::Create(
+        Config({1U}), &expired_sink, &error);
+    CHECK(expired != nullptr);
+    const CanonicalTick below_floor = Trade(
+        99U, 42U, base + 2U, 101U, 10'000'000, 1);
+    const KLineInput expired_input =
+        HoleFillInput(below_floor, 101U, 100U, 1U);
+    CHECK(expired->ApplyBatch(
+              std::span<const KLineInput>(&expired_input, 1U)).code ==
+          KLineApplyCode::kFailed);
+    CHECK(!expired->healthy());
+    CHECK(expired->fatal_error().find("admission token") !=
+          std::string::npos);
 }
 
 void TestChannelGlobalFirstWinnerAcrossInstrumentOwners() {
@@ -392,7 +747,7 @@ void TestChannelGlobalFirstWinnerAcrossInstrumentOwners() {
     CanonicalTick winner = Trade(
         77U, 50U, base + 1U, 100U, 10'000'000, 1);
     winner.common.instrument_ordinal = 0U;
-    const KLineInput winner_input{winner};
+    const KLineInput winner_input = OrderedInput(winner);
     CHECK(owner_zero->ApplyBatch(
               std::span<const KLineInput>(&winner_input, 1U)).code ==
           KLineApplyCode::kApplied);
@@ -402,7 +757,7 @@ void TestChannelGlobalFirstWinnerAcrossInstrumentOwners() {
     conflicting_identity.common.instrument_id = 2U;
     conflicting_identity.common.instrument_ordinal = 1U;
     conflicting_identity.common.identity.security_id[5U] = std::byte{'2'};
-    const KLineInput conflict_input{conflicting_identity};
+    const KLineInput conflict_input = OrderedInput(conflicting_identity);
     CHECK(owner_one->ApplyBatch(
               std::span<const KLineInput>(&conflict_input, 1U)).code ==
           KLineApplyCode::kSourceConflict);
@@ -435,7 +790,15 @@ int main() {
     TestInvalidExchangeTimeNeverFallsBackToLocalClock();
     TestHalfOpenWindowAndEqualTimestampTieBreak();
     TestDuplicateConflictAndMultipleIntervals();
-    TestRawAckBeforeFactAndRuntimeRouting();
+    TestRuntimeProjectJoinBothArrivalOrders();
+    TestRuntimeRejectJoinBothArrivalOrders();
+    TestRuntimeDuplicateSidesFailClosedWhilePairActive();
+    TestRuntimeDrainFailsClosedWithUnresolvedJoin();
+    TestRuntimeJoinAndAckInboxCapacityFailClosed();
+    TestRuntimeAckCapacityRelationshipValidation();
+    TestRuntimeRejectsInvalidEpochOwnerAndFence();
+    TestRuntimeGapAndSealControlsAreNoOps();
+    TestAdmissionTokenHalfOpenBoundary();
     TestChannelGlobalFirstWinnerAcrossInstrumentOwners();
     TestWorkerRejectsUnhealthyFactJournal();
     std::cout << "all KLine worker tests passed\n";

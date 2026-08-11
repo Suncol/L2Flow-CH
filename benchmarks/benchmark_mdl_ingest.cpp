@@ -333,13 +333,23 @@ void PrintUsage() {
         << "  --clickhouse-shutdown-timeout-ms N default 30000\n"
         << "  --clickhouse-no-auto-create use pre-created tables\n"
         << "  --event-enable            enable Event worker + Event ClickHouse\n"
-        << "  --event-micro-batch-rows N default 256\n"
-        << "  --event-micro-batch-max-delay-ns N default 1000000\n"
-        << "  --event-insert-chunk-rows N default 16384\n"
+        << "  --event-micro-batch-rows N default 512\n"
+        << "  --event-micro-batch-max-delay-ns N default 50000000\n"
+        << "  --event-persistence-group-max-batches N default 1024\n"
+        << "  --event-persistence-group-max-rows N default 16384\n"
+        << "  --event-persistence-group-max-bytes N default 16777216\n"
+        << "  --event-persistence-group-max-delay-ns N default 1000000000\n"
+        << "  --event-insert-request-max-rows N default 1024\n"
+        << "  --event-insert-request-max-bytes N default 1048576\n"
+        << "  --event-physical-group-max-batches N default 256\n"
+        << "  --event-physical-group-max-delay-ns N default 1000000\n"
         << "  --event-writer-lanes N (1,2,4,8) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
         << "  --event-maximum-raw-ack-backlog N default 65536\n"
+        << "  --event-maximum-pending-channel-seals N default 4096\n"
+        << "  --event-raw-ack-drain-max-entries N default 1024\n"
+        << "  --event-raw-ack-drain-max-cpu-ns N default 150000\n"
         << "  --event-journal-dir DIR  unique file directory; default system temp\n"
         << "  --event-construction-smoke validate Event construction without network I/O\n";
 #endif
@@ -554,10 +564,71 @@ void PrintUsage() {
                 return false;
             }
             parsed.event_configuration_set = true;
-        } else if (argument == "--event-insert-chunk-rows") {
+        } else if (argument ==
+                   "--event-persistence-group-max-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.persistence_group_max_batches)) {
+                *error =
+                    "invalid --event-persistence-group-max-batches";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-persistence-group-max-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.persistence_group_max_rows)) {
+                *error = "invalid --event-persistence-group-max-rows";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-persistence-group-max-bytes") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.persistence_group_max_bytes)) {
+                *error = "invalid --event-persistence-group-max-bytes";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument ==
+                   "--event-persistence-group-max-delay-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.worker.persistence_group_max_delay_ns)) {
+                *error =
+                    "invalid --event-persistence-group-max-delay-ns";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-insert-request-max-rows") {
             if (!ParseInteger(next(argument),
-                              &parsed.clickhouse_event.insert_chunk_rows)) {
-                *error = "invalid --event-insert-chunk-rows";
+                              &parsed.clickhouse_event
+                                   .insert_request_max_rows)) {
+                *error = "invalid --event-insert-request-max-rows";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-insert-request-max-bytes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event
+                                   .insert_request_max_bytes)) {
+                *error = "invalid --event-insert-request-max-bytes";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-physical-group-max-batches") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event
+                                   .physical_group_max_batches)) {
+                *error = "invalid --event-physical-group-max-batches";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-physical-group-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_event
+                                   .physical_group_max_delay_ns)) {
+                *error = "invalid --event-physical-group-max-delay-ns";
                 return false;
             }
             parsed.event_configuration_set = true;
@@ -589,6 +660,35 @@ void PrintUsage() {
                     next(argument),
                     &parsed.event.maximum_raw_ack_backlog_per_owner)) {
                 *error = "invalid --event-maximum-raw-ack-backlog";
+                return false;
+            }
+            parsed.event.worker.maximum_acknowledged_raw_dependencies =
+                parsed.event.maximum_raw_ack_backlog_per_owner;
+            parsed.event_configuration_set = true;
+        } else if (argument ==
+                   "--event-maximum-pending-channel-seals") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event
+                         .maximum_pending_channel_seals_per_owner)) {
+                *error =
+                    "invalid --event-maximum-pending-channel-seals";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-raw-ack-drain-max-entries") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.raw_ack_drain_max_entries)) {
+                *error = "invalid --event-raw-ack-drain-max-entries";
+                return false;
+            }
+            parsed.event_configuration_set = true;
+        } else if (argument == "--event-raw-ack-drain-max-cpu-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.event.raw_ack_drain_max_cpu_ns)) {
+                *error = "invalid --event-raw-ack-drain-max-cpu-ns";
                 return false;
             }
             parsed.event_configuration_set = true;
@@ -1195,6 +1295,15 @@ int main(int argc, char** argv) {
     }
     EngineConfig config{};
     config.trade_date = 20260806U;
+    config.feed_session_epoch =
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        options.clickhouse_enabled ? options.clickhouse.feed_session_epoch :
+#endif
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        !options.arrow_ring_directory.empty()
+            ? options.arrow_feed_session_epoch :
+#endif
+        1U;
     config.start_mode = StartMode::kFromOpen;
     config.tick_decoder_lanes = options.tick_lanes;
     config.snapshot_decoder_lanes = 1U;
@@ -1205,7 +1314,6 @@ int main(int argc, char** argv) {
     config.maximum_snapshot_body_bytes = 1'024U;
     config.dispatch_queue_capacity = options.dispatch_queue_capacity;
     config.diagnostic_queue_capacity = 256U;
-    config.late_recovery_queue_capacity = 256U;
     config.maximum_channels_per_tick_lane =
         std::max<std::size_t>(
             8U, (options.channels + options.tick_lanes - 1U) /
@@ -1283,6 +1391,9 @@ int main(int argc, char** argv) {
                 std::move(created_journal));
 
         options.event.worker.trade_date = config.trade_date;
+        options.event.feed_session_epoch = config.feed_session_epoch;
+        options.event.worker.feed_session_epoch =
+            config.feed_session_epoch;
         options.event.worker.owner_count =
             static_cast<std::uint32_t>(options.instrument_owners);
         options.event.worker.revision_epoch = 1U;
@@ -1473,8 +1584,24 @@ int main(int argc, char** argv) {
             << " micro_batch_rows=" << options.event.micro_batch_rows
             << " micro_batch_max_delay_ns="
             << options.event.micro_batch_max_delay_ns
-            << " insert_chunk_rows="
-            << options.clickhouse_event.insert_chunk_rows
+            << " maximum_pending_channel_seals="
+            << options.event.maximum_pending_channel_seals_per_owner
+            << " persistence_group_max_batches="
+            << options.event.worker.persistence_group_max_batches
+            << " persistence_group_max_rows="
+            << options.event.worker.persistence_group_max_rows
+            << " persistence_group_max_bytes="
+            << options.event.worker.persistence_group_max_bytes
+            << " persistence_group_max_delay_ns="
+            << options.event.worker.persistence_group_max_delay_ns
+            << " insert_request_max_rows="
+            << options.clickhouse_event.insert_request_max_rows
+            << " insert_request_max_bytes="
+            << options.clickhouse_event.insert_request_max_bytes
+            << " physical_group_max_batches="
+            << options.clickhouse_event.physical_group_max_batches
+            << " physical_group_max_delay_ns="
+            << options.clickhouse_event.physical_group_max_delay_ns
             << " writer_lanes=" << options.clickhouse_event.writer_lanes
             << '\n';
     }
@@ -1718,7 +1845,7 @@ int main(int argc, char** argv) {
             }
             state.observed_cpu = CurrentCpu();
             ready.fetch_add(1U, std::memory_order_release);
-            CanonicalTick tick{};
+            TickDispatch dispatch{};
             std::uint64_t local_consumed = 0U;
             std::uint64_t expected_sequence = 1U;
             std::uint64_t measured_index = 0U;
@@ -1729,7 +1856,7 @@ int main(int argc, char** argv) {
 #endif
             while (local_consumed < total_per_channel &&
                    !abort.load(std::memory_order_acquire)) {
-                if (!engine->TryPollTick(owner, &tick)) {
+                if (!engine->TryPollTickDispatch(owner, &dispatch)) {
                     ++idle_spins;
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
                     if (arrow_egress != nullptr) {
@@ -1767,6 +1894,13 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 idle_spins = 0U;
+                if (dispatch.kind != TickDispatchKind::kProjectOrdered) {
+                    state.error =
+                        "unexpected non-ordered benchmark dispatch";
+                    abort.store(true, std::memory_order_release);
+                    break;
+                }
+                const CanonicalTick& tick = dispatch.tick;
                 if (tick.common.instrument_ordinal != owner ||
                     tick.common.native_sequence != expected_sequence) {
                     ++state.ordering_errors;
@@ -1776,7 +1910,7 @@ int main(int argc, char** argv) {
                     const std::uint64_t operation_start_ns =
                         MonotonicNowNs();
                     const bool appended =
-                        arrow_egress->AppendTick(owner, tick);
+                        arrow_egress->AppendTickDispatch(owner, dispatch);
                     const std::uint64_t operation_finish_ns =
                         MonotonicNowNs();
                     RecordMaximumElapsed(
@@ -1806,7 +1940,7 @@ int main(int argc, char** argv) {
                 if (event_runtime != nullptr) {
                     const std::uint64_t operation_start_ns =
                         MonotonicNowNs();
-                    if (!event_runtime->AppendTick(owner, tick)) {
+                    if (!event_runtime->AppendDispatch(owner, dispatch)) {
                         state.error =
                             "Event worker append failed: " +
                             event_runtime->fatal_error();
@@ -2009,7 +2143,8 @@ int main(int argc, char** argv) {
             const EngineStats progress_stats = engine->stats();
             if (abort.load(std::memory_order_acquire) ||
                 !engine->healthy() || progress_stats.gaps_skipped != 0U ||
-                progress_stats.late_recovery_dispatched != 0U ||
+                progress_stats.hole_fills_dispatched != 0U ||
+                progress_stats.rejected_late_facts != 0U ||
                 progress_stats.from_open_channels_frozen != 0U ||
                 MonotonicNowNs() >= completion_deadline) {
                 completion_failed = true;
@@ -2186,16 +2321,11 @@ int main(int argc, char** argv) {
 #endif
 
     std::uint64_t gap_controls = 0U;
-    std::uint64_t late_controls = 0U;
     std::uint64_t fault_controls = 0U;
     ChannelGap gap{};
-    LateRecoveryTick late{};
     ChannelFault fault{};
     while (engine->TryPollGap(&gap)) {
         ++gap_controls;
-    }
-    while (engine->TryPollLateRecovery(&late)) {
-        ++late_controls;
     }
     while (engine->TryPollChannelFault(&fault)) {
         ++fault_controls;
@@ -2357,7 +2487,11 @@ int main(int argc, char** argv) {
             event_journal_stats.waiting_admissions == 0U &&
             event_journal_stats.errors == 0U &&
             event_journal_stats.flush_calls >= 1U &&
-            event_final_runtime_stats.normal_ticks_received == total_count &&
+            event_final_runtime_stats.ordered_dispositions_received ==
+                total_count &&
+            event_final_runtime_stats.hole_fill_dispositions_received == 0U &&
+            event_final_runtime_stats.rejected_dispositions_received == 0U &&
+            event_final_runtime_stats.occurrence_join_entries == 0U &&
             event_final_runtime_stats.workers.facts_journaled == total_count &&
             event_final_runtime_stats.raw_tick_acks_received == total_count &&
             event_final_runtime_stats.invalid_inputs == 0U &&
@@ -2391,12 +2525,11 @@ int main(int argc, char** argv) {
         const std::uint64_t expected_published_rows =
             arrow_stats.tick_rows_received +
             arrow_stats.snapshot_rows_received +
-            arrow_stats.late_recovery_rows_received +
             arrow_stats.control_rows_received;
         arrow_valid =
             arrow_stats.tick_rows_received == total_count &&
             arrow_stats.snapshot_rows_received == 0U &&
-            arrow_stats.late_recovery_rows_received == 0U &&
+            arrow_stats.hole_fill_rows_received == 0U &&
             arrow_stats.published_rows == expected_published_rows &&
             arrow_stats.no_segment_dropped_rows == 0U &&
             arrow_stats.oversized_dropped_rows == 0U &&
@@ -2421,9 +2554,10 @@ int main(int argc, char** argv) {
         ordering_errors == 0U && clock_errors == 0U &&
         stats.lane_full == 0U && stats.decode_errors == 0U &&
         stats.dispatch_overflows == 0U && stats.gaps_skipped == 0U &&
-        stats.late_recovery_dispatched == 0U &&
+        stats.hole_fills_dispatched == 0U &&
+        stats.rejected_late_facts == 0U &&
         stats.from_open_channels_frozen == 0U && gap_controls == 0U &&
-        late_controls == 0U && fault_controls == 0U &&
+        fault_controls == 0U &&
         engine->healthy() && !handler.failed() && cpu_binding_valid &&
         producer_rate >= minimum_pass_rate &&
         dispatch_rate >= minimum_pass_rate;
@@ -2496,7 +2630,8 @@ int main(int argc, char** argv) {
               << " decode_errors=" << stats.decode_errors
               << " dispatch_overflows=" << stats.dispatch_overflows
               << " gaps=" << stats.gaps_skipped
-              << " late_recovery=" << stats.late_recovery_dispatched
+              << " hole_fills=" << stats.hole_fills_dispatched
+              << " rejected_late_facts=" << stats.rejected_late_facts
               << " channel_faults=" << stats.from_open_channels_frozen
               << " healthy=" << (engine->healthy() ? "true" : "false")
               << '\n';
@@ -2618,8 +2753,14 @@ int main(int argc, char** argv) {
             << options.event.micro_batch_rows
             << " micro_batch_max_delay_ns="
             << options.event.micro_batch_max_delay_ns
-            << " insert_chunk_rows="
-            << options.clickhouse_event.insert_chunk_rows
+            << " insert_request_max_rows="
+            << options.clickhouse_event.insert_request_max_rows
+            << " insert_request_max_bytes="
+            << options.clickhouse_event.insert_request_max_bytes
+            << " physical_group_max_batches="
+            << options.clickhouse_event.physical_group_max_batches
+            << " physical_group_max_delay_ns="
+            << options.clickhouse_event.physical_group_max_delay_ns
             << " writer_lanes="
             << options.clickhouse_event.writer_lanes
             << " calculation_run_id="
@@ -2641,8 +2782,10 @@ int main(int argc, char** argv) {
                           static_cast<double>(
                               event_final_runtime_stats.workers.facts_journaled))
             << '\n'
-            << "event_final normal_ticks="
-            << event_final_runtime_stats.normal_ticks_received
+            << "event_final ordered_dispositions="
+            << event_final_runtime_stats.ordered_dispositions_received
+            << " occurrence_join_entries="
+            << event_final_runtime_stats.occurrence_join_entries
             << " raw_tick_acks="
             << event_final_runtime_stats.raw_tick_acks_received
             << " facts_journaled="
@@ -2651,6 +2794,42 @@ int main(int argc, char** argv) {
             << event_final_runtime_stats.workers.revisions_created
             << " micro_batches="
             << event_final_runtime_stats.micro_batches_applied
+            << " facts_in_micro_batches="
+            << event_final_runtime_stats.facts_in_micro_batches
+            << " facts_per_micro_batch="
+            << (event_final_runtime_stats.micro_batches_applied == 0U
+                    ? 0.0
+                    : static_cast<double>(
+                          event_final_runtime_stats.facts_in_micro_batches) /
+                          static_cast<double>(
+                              event_final_runtime_stats
+                                  .micro_batches_applied))
+            << " micro_batch_rows_max="
+            << event_final_runtime_stats.micro_batch_rows_max
+            << " row_limit_flushes="
+            << event_final_runtime_stats.row_limit_flushes
+            << " timer_flushes="
+            << event_final_runtime_stats.timer_flushes
+            << " forced_active_flushes="
+            << event_final_runtime_stats.forced_active_flushes
+            << " empty_control_flushes="
+            << event_final_runtime_stats.empty_control_flushes
+            << " channel_seals_applied="
+            << event_final_runtime_stats.channel_seals_applied
+            << " channel_seals_coalesced="
+            << event_final_runtime_stats.channel_seals_coalesced
+            << " pending_channel_seals="
+            << event_final_runtime_stats.pending_channel_seals
+            << " pending_channel_seals_hwm="
+            << event_final_runtime_stats.pending_channel_seals_high_water
+            << " persistence_groups="
+            << event_final_runtime_stats.workers
+                   .persistence_groups_submitted
+            << " persistence_group_batches_max="
+            << event_final_runtime_stats.workers
+                   .persistence_group_batches_max
+            << " persistence_group_rows_max="
+            << event_final_runtime_stats.workers.persistence_group_rows_max
             << " pending_raw_commits="
             << event_final_runtime_stats.workers.pending_raw_commits
             << " invalid_inputs="
@@ -2676,12 +2855,48 @@ int main(int argc, char** argv) {
             << event_final_stats.revision_batches_acked
             << " revision_batches_released="
             << event_final_stats.revision_batches_released
-            << " chunks_acked=" << event_final_stats.revision_chunks_acked
+            << " submission_groups_queued="
+            << event_final_stats.submission_groups_queued
+            << " submission_groups_released="
+            << event_final_stats.submission_groups_released
+            << " sink_batches_per_second="
+            << (event_processing_seconds == 0.0
+                    ? 0.0
+                    : static_cast<double>(
+                          event_final_stats.submission_groups_queued) /
+                          event_processing_seconds)
+            << " revisions_per_sink_batch="
+            << (event_final_stats.submission_groups_queued == 0U
+                    ? 0.0
+                    : static_cast<double>(
+                          event_final_stats.revision_rows_queued) /
+                          static_cast<double>(
+                              event_final_stats.submission_groups_queued))
+            << " revisions_per_insert="
+            << (event_final_stats.revision_insert_requests_acked == 0U
+                    ? 0.0
+                    : static_cast<double>(
+                          event_final_stats.revision_rows_acked) /
+                          static_cast<double>(
+                              event_final_stats
+                                  .revision_insert_requests_acked))
+            << " physical_groups="
+            << event_final_stats.physical_groups_committed
+            << " revision_insert_requests="
+            << event_final_stats.revision_insert_requests_acked
+            << " marker_insert_requests="
+            << event_final_stats.marker_insert_requests_acked
             << " recovery_runs_committed="
             << event_final_stats.recovery_runs_committed
             << " retries=" << event_final_stats.retry_attempts
             << " unknown_outcomes=" << event_final_stats.unknown_outcomes
             << " queued_rows_at_measurement_end=" << event_revision_lag_rows
+            << " queued_submission_groups_hwm="
+            << event_final_stats.queued_submission_groups_high_water
+            << " queued_logical_batches_hwm="
+            << event_final_stats.queued_revision_batches_high_water
+            << " queued_rows_hwm="
+            << event_final_stats.queued_revision_rows_high_water
             << " bytes_sent=" << event_final_stats.bytes_sent
             << " stop_drain_ms="
             << to_us(event_stop_finish_ns >= event_stop_start_ns
