@@ -41,6 +41,8 @@ using kline::Identifier128;
 using kline::TradeAnchor;
 
 constexpr std::size_t kMaximumHttpResponseBytes = 64U * 1'024U;
+constexpr std::size_t kRevisionRowBinaryBytes = 313U;
+constexpr std::size_t kRecoveryMarkerRowBinaryBytes = 120U;
 
 [[nodiscard]] bool IsZero(Identifier128 identifier) noexcept {
     return std::all_of(identifier.bytes.begin(), identifier.bytes.end(),
@@ -126,6 +128,31 @@ constexpr std::size_t kMaximumHttpResponseBytes = 64U * 1'024U;
     return Blake3Hash128(input);
 }
 
+[[nodiscard]] Identifier128 PhysicalRequestIdentifier(
+    Identifier128 writer,
+    std::uint64_t group_sequence,
+    std::uint32_t lane,
+    std::uint32_t request,
+    std::uint32_t schema_version,
+    std::uint8_t table_tag) noexcept {
+    std::array<std::byte, 37U> input{};
+    std::copy(writer.bytes.begin(), writer.bytes.end(), input.begin());
+    std::size_t offset = writer.bytes.size();
+    const auto append = [&input, &offset](auto value) {
+        using Value = decltype(value);
+        for (std::size_t index = 0U; index < sizeof(Value); ++index) {
+            input[offset++] = static_cast<std::byte>(
+                static_cast<std::uint64_t>(value) >> (index * 8U));
+        }
+    };
+    append(group_sequence);
+    append(lane);
+    append(request);
+    append(schema_version);
+    input[offset] = static_cast<std::byte>(table_tag);
+    return Blake3Hash128(input);
+}
+
 [[nodiscard]] bool TradeDateToDays(std::uint32_t value,
                                    std::uint16_t* output) noexcept {
     if (output == nullptr) {
@@ -182,6 +209,14 @@ public:
         bytes_.insert(bytes_.end(), value.bytes.begin(), value.bytes.end());
     }
 
+    [[nodiscard]] std::size_t size() const noexcept { return bytes_.size(); }
+
+    void Truncate(std::size_t size) noexcept {
+        if (size <= bytes_.size()) {
+            bytes_.resize(size);
+        }
+    }
+
     [[nodiscard]] std::span<const std::byte> bytes() const noexcept {
         return bytes_;
     }
@@ -218,7 +253,6 @@ struct RevisionChunkMetadata final {
     std::uint64_t sink_batch_sequence = 0U;
     std::uint32_t chunk_index = 0U;
     Identifier128 batch_id{};
-    std::uint32_t trade_date = 0U;
 };
 
 [[nodiscard]] bool AppendRevisionRow(
@@ -257,6 +291,46 @@ struct RevisionChunkMetadata final {
     writer->Append(kline::kKLineSchemaVersion);
     return true;
 }
+
+[[nodiscard]] bool AppendRecoveryMarkerRow(
+    RowBinaryWriter* writer,
+    const KLineRevisionBatch& batch,
+    Identifier128 writer_instance_id,
+    std::uint32_t chunk_count,
+    std::uint64_t committed_utc_ns) {
+    if (batch.revisions.empty() || chunk_count == 0U) {
+        return false;
+    }
+    std::uint16_t days = 0U;
+    if (!TradeDateToDays(batch.revisions.front().key.trade_date, &days)) {
+        return false;
+    }
+    const Identifier128 commit_id = ChunkIdentifier(
+        writer_instance_id, batch.recovery_run_id, 0U,
+        kline::kKLineSchemaVersion, 2U);
+    writer->Append(days);
+    writer->AppendIdentifier(batch.calculation_run_id);
+    writer->AppendIdentifier(batch.recovery_run_id);
+    writer->Append(batch.owner);
+    writer->Append(batch.batch_sequence);
+    writer->AppendEnum(batch.reason);
+    writer->Append(batch.revisions.front().version);
+    writer->Append(batch.revisions.back().version);
+    writer->Append(static_cast<std::uint64_t>(batch.revisions.size()));
+    writer->Append(chunk_count);
+    writer->AppendBool(true);
+    writer->Append(committed_utc_ns);
+    writer->AppendIdentifier(writer_instance_id);
+    writer->AppendIdentifier(commit_id);
+    writer->Append(kline::kKLineSchemaVersion);
+    return true;
+}
+
+constexpr std::string_view kRecoveryMarkerColumns =
+    "trade_date,calculation_run_id,recovery_run_id,owner,"
+    "calculation_batch_sequence,revision_reason,minimum_version,"
+    "maximum_version,revision_count,chunk_count,committed,"
+    "committed_utc_ns,writer_instance_id,commit_id,schema_version";
 
 [[nodiscard]] std::string AnchorType() {
     return "Tuple(exchange_time_ns_from_midnight UInt64, channel UInt32, "
@@ -692,12 +766,37 @@ struct AtomicStats final {
     std::atomic<std::uint64_t> revision_batches_released{0U};
     std::atomic<std::uint64_t> revision_rows_queued{0U};
     std::atomic<std::uint64_t> revision_rows_acked{0U};
-    std::atomic<std::uint64_t> revision_chunks_acked{0U};
+    std::atomic<std::uint64_t> physical_groups_committed{0U};
+    std::atomic<std::uint64_t> revision_insert_requests_acked{0U};
+    std::atomic<std::uint64_t> marker_insert_requests_acked{0U};
+    std::atomic<std::uint64_t> revision_insert_rows_acked{0U};
+    std::atomic<std::uint64_t> revision_insert_bytes_acked{0U};
+    std::atomic<std::uint64_t> marker_insert_rows_acked{0U};
+    std::atomic<std::uint64_t> marker_insert_bytes_acked{0U};
     std::atomic<std::uint64_t> recovery_runs_committed{0U};
     std::atomic<std::uint64_t> retry_attempts{0U};
     std::atomic<std::uint64_t> unknown_outcomes{0U};
     std::atomic<std::uint64_t> bytes_sent{0U};
+    std::atomic<std::uint64_t> physical_group_batches_max{0U};
+    std::atomic<std::uint64_t> physical_group_rows_max{0U};
+    std::atomic<std::uint64_t> revision_request_rows_max{0U};
+    std::atomic<std::uint64_t> revision_request_bytes_max{0U};
+    std::atomic<std::uint64_t> marker_request_rows_max{0U};
+    std::atomic<std::uint64_t> marker_request_bytes_max{0U};
+    std::atomic<std::uint64_t> revision_insert_latency_ns_total{0U};
+    std::atomic<std::uint64_t> revision_insert_latency_ns_max{0U};
+    std::atomic<std::uint64_t> marker_insert_latency_ns_total{0U};
+    std::atomic<std::uint64_t> marker_insert_latency_ns_max{0U};
 };
+
+void PublishMaximum(std::atomic<std::uint64_t>* target,
+                    std::uint64_t value) noexcept {
+    std::uint64_t current = target->load(std::memory_order_relaxed);
+    while (current < value &&
+           !target->compare_exchange_weak(
+               current, value, std::memory_order_relaxed)) {
+    }
+}
 
 [[nodiscard]] bool ValidRevisionReason(
     kline::RevisionReason value) noexcept {
@@ -847,10 +946,16 @@ bool ValidateKLineClickHouseConfig(const KLineClickHouseConfig& config,
         config.writer_lanes == 1U || config.writer_lanes == 2U ||
         config.writer_lanes == 4U || config.writer_lanes == 8U ||
         config.writer_lanes == 16U || config.writer_lanes == 32U;
-    if (!valid_writer_lanes || config.insert_chunk_rows == 0U ||
+    if (!valid_writer_lanes ||
+        config.writer_lanes > kMaximumKLineWriterLanes ||
+        config.insert_request_max_rows == 0U ||
+        config.insert_request_max_bytes < kRevisionRowBinaryBytes ||
+        config.physical_group_max_batches == 0U ||
+        config.physical_group_max_delay_ns == 0U ||
+        config.physical_group_max_delay_ns > UINT64_C(1'000'000'000) ||
         config.queue_revision_batches == 0U ||
         config.queue_revision_rows == 0U ||
-        config.insert_chunk_rows > config.queue_revision_rows ||
+        config.insert_request_max_rows > config.queue_revision_rows ||
         config.queue_revision_rows >=
             static_cast<std::size_t>(
                 std::numeric_limits<std::uint32_t>::max()) ||
@@ -870,10 +975,45 @@ bool ValidateKLineClickHouseConfig(const KLineClickHouseConfig& config,
 
 class KLineClickHouseSink::Impl final {
 public:
+    struct QueuedBatch final {
+        std::shared_ptr<const KLineRevisionBatch> batch;
+        std::uint64_t enqueued_monotonic_ns = 0U;
+    };
+
+    struct PreparedBatch final {
+        std::shared_ptr<const KLineRevisionBatch> batch;
+        std::uint64_t sink_batch_sequence = 0U;
+        std::uint32_t chunk_count = 0U;
+    };
+
+    struct InsertRequest final {
+        explicit InsertRequest(std::size_t reserve_bytes)
+            : payload(reserve_bytes) {}
+
+        RowBinaryWriter payload;
+        std::string query_id;
+        std::string dedup_token;
+        std::size_t rows = 0U;
+    };
+
+    struct PhysicalInsertGroup final {
+        explicit PhysicalInsertGroup(std::uint64_t sequence,
+                                     std::size_t marker_reserve)
+            : group_sequence(sequence), marker_payload(marker_reserve) {}
+
+        std::uint64_t group_sequence = 0U;
+        std::vector<PreparedBatch> batches;
+        std::vector<InsertRequest> revision_requests;
+        RowBinaryWriter marker_payload;
+        std::string marker_query_id;
+        std::string marker_dedup_token;
+        std::size_t revision_rows = 0U;
+    };
+
     struct Lane final {
         mutable std::mutex mutex;
         std::condition_variable wake;
-        std::deque<std::shared_ptr<const KLineRevisionBatch>> queue;
+        std::deque<QueuedBatch> queue;
         std::thread thread;
     };
 
@@ -1010,6 +1150,15 @@ public:
             std::lock_guard<std::mutex> budget_lock(queue_budget_mutex_);
             if (queued_batches_ != 0U || queued_rows_ != 0U) {
                 SetFatal("ClickHouse KLine sink queue budget not empty");
+            } else {
+                for (std::size_t lane = 0U; lane < lanes_.size(); ++lane) {
+                    if (lane_queued_batches_[lane] != 0U ||
+                        lane_queued_rows_[lane] != 0U) {
+                        SetFatal(
+                            "ClickHouse KLine per-lane queue budget not empty");
+                        break;
+                    }
+                }
             }
         }
         if (error != nullptr) {
@@ -1041,12 +1190,25 @@ public:
                 }
                 ++queued_batches_;
                 queued_rows_ += rows;
+                ++lane_queued_batches_[lane_index];
+                lane_queued_rows_[lane_index] += rows;
+                queued_batches_high_water_ = std::max(
+                    queued_batches_high_water_, queued_batches_);
+                queued_rows_high_water_ = std::max(
+                    queued_rows_high_water_, queued_rows_);
+                lane_queued_batches_high_water_[lane_index] = std::max(
+                    lane_queued_batches_high_water_[lane_index],
+                    lane_queued_batches_[lane_index]);
+                lane_queued_rows_high_water_[lane_index] = std::max(
+                    lane_queued_rows_high_water_[lane_index],
+                    lane_queued_rows_[lane_index]);
             }
             try {
                 Lane& lane = *lanes_[lane_index];
                 {
                     std::lock_guard<std::mutex> lane_lock(lane.mutex);
-                    lane.queue.push_back(std::move(batch));
+                    lane.queue.push_back(QueuedBatch{
+                        std::move(batch), ingest::MonotonicNowNs()});
                 }
                 stats_.revision_batches_queued.fetch_add(
                     1U, std::memory_order_relaxed);
@@ -1059,6 +1221,8 @@ public:
                 std::lock_guard<std::mutex> budget_lock(queue_budget_mutex_);
                 --queued_batches_;
                 queued_rows_ -= rows;
+                --lane_queued_batches_[lane_index];
+                lane_queued_rows_[lane_index] -= rows;
                 throw;
             }
         } catch (...) {
@@ -1088,8 +1252,22 @@ public:
             stats_.revision_rows_queued.load(std::memory_order_relaxed);
         result.revision_rows_acked =
             stats_.revision_rows_acked.load(std::memory_order_relaxed);
-        result.revision_chunks_acked =
-            stats_.revision_chunks_acked.load(std::memory_order_relaxed);
+        result.physical_groups_committed =
+            stats_.physical_groups_committed.load(std::memory_order_relaxed);
+        result.revision_insert_requests_acked =
+            stats_.revision_insert_requests_acked.load(
+                std::memory_order_relaxed);
+        result.marker_insert_requests_acked =
+            stats_.marker_insert_requests_acked.load(
+                std::memory_order_relaxed);
+        result.revision_insert_rows_acked =
+            stats_.revision_insert_rows_acked.load(std::memory_order_relaxed);
+        result.revision_insert_bytes_acked =
+            stats_.revision_insert_bytes_acked.load(std::memory_order_relaxed);
+        result.marker_insert_rows_acked =
+            stats_.marker_insert_rows_acked.load(std::memory_order_relaxed);
+        result.marker_insert_bytes_acked =
+            stats_.marker_insert_bytes_acked.load(std::memory_order_relaxed);
         result.recovery_runs_committed =
             stats_.recovery_runs_committed.load(std::memory_order_relaxed);
         result.retry_attempts =
@@ -1098,8 +1276,47 @@ public:
             stats_.unknown_outcomes.load(std::memory_order_relaxed);
         result.bytes_sent =
             stats_.bytes_sent.load(std::memory_order_relaxed);
+        result.physical_group_batches_max =
+            stats_.physical_group_batches_max.load(std::memory_order_relaxed);
+        result.physical_group_rows_max =
+            stats_.physical_group_rows_max.load(std::memory_order_relaxed);
+        result.revision_request_rows_max =
+            stats_.revision_request_rows_max.load(std::memory_order_relaxed);
+        result.revision_request_bytes_max =
+            stats_.revision_request_bytes_max.load(std::memory_order_relaxed);
+        result.marker_request_rows_max =
+            stats_.marker_request_rows_max.load(std::memory_order_relaxed);
+        result.marker_request_bytes_max =
+            stats_.marker_request_bytes_max.load(std::memory_order_relaxed);
+        result.revision_insert_latency_ns_total =
+            stats_.revision_insert_latency_ns_total.load(
+                std::memory_order_relaxed);
+        result.revision_insert_latency_ns_max =
+            stats_.revision_insert_latency_ns_max.load(
+                std::memory_order_relaxed);
+        result.marker_insert_latency_ns_total =
+            stats_.marker_insert_latency_ns_total.load(
+                std::memory_order_relaxed);
+        result.marker_insert_latency_ns_max =
+            stats_.marker_insert_latency_ns_max.load(
+                std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(queue_budget_mutex_);
+        result.queued_revision_batches = queued_batches_;
         result.queued_revision_rows = queued_rows_;
+        result.queued_revision_batches_high_water =
+            queued_batches_high_water_;
+        result.queued_revision_rows_high_water = queued_rows_high_water_;
+        result.writer_lanes = lanes_.size();
+        for (std::size_t lane = 0U; lane < lanes_.size(); ++lane) {
+            result.lanes[lane].queued_revision_batches =
+                lane_queued_batches_[lane];
+            result.lanes[lane].queued_revision_rows =
+                lane_queued_rows_[lane];
+            result.lanes[lane].queued_revision_batches_high_water =
+                lane_queued_batches_high_water_[lane];
+            result.lanes[lane].queued_revision_rows_high_water =
+                lane_queued_rows_high_water_[lane];
+        }
         return result;
     }
 
@@ -1112,13 +1329,21 @@ public:
     }
 
 private:
+    enum class InsertKind : std::uint8_t {
+        kRevision,
+        kMarker,
+    };
+
     [[nodiscard]] bool ExactInsert(
         HttpClient* client,
+        InsertKind kind,
+        std::size_t rows,
         std::string_view table,
         std::string_view columns,
         const std::string& query_id,
         const std::string& token,
         std::span<const std::byte> payload) {
+        const std::uint64_t request_started_ns = ingest::MonotonicNowNs();
         std::uint64_t retry_started_ns = 0U;
         std::uint32_t backoff = config_.retry_initial_backoff_ms;
         for (;;) {
@@ -1128,6 +1353,50 @@ private:
                 static_cast<std::uint64_t>(payload.size()),
                 std::memory_order_relaxed);
             if (HttpSucceeded(result)) {
+                const std::uint64_t completed_ns = ingest::MonotonicNowNs();
+                const std::uint64_t elapsed =
+                    completed_ns >= request_started_ns
+                    ? completed_ns - request_started_ns
+                    : 0U;
+                if (kind == InsertKind::kRevision) {
+                    stats_.revision_insert_requests_acked.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    stats_.revision_insert_rows_acked.fetch_add(
+                        static_cast<std::uint64_t>(rows),
+                        std::memory_order_relaxed);
+                    stats_.revision_insert_bytes_acked.fetch_add(
+                        static_cast<std::uint64_t>(payload.size()),
+                        std::memory_order_relaxed);
+                    stats_.revision_insert_latency_ns_total.fetch_add(
+                        elapsed, std::memory_order_relaxed);
+                    PublishMaximum(
+                        &stats_.revision_insert_latency_ns_max, elapsed);
+                    PublishMaximum(
+                        &stats_.revision_request_rows_max,
+                        static_cast<std::uint64_t>(rows));
+                    PublishMaximum(
+                        &stats_.revision_request_bytes_max,
+                        static_cast<std::uint64_t>(payload.size()));
+                } else {
+                    stats_.marker_insert_requests_acked.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    stats_.marker_insert_rows_acked.fetch_add(
+                        static_cast<std::uint64_t>(rows),
+                        std::memory_order_relaxed);
+                    stats_.marker_insert_bytes_acked.fetch_add(
+                        static_cast<std::uint64_t>(payload.size()),
+                        std::memory_order_relaxed);
+                    stats_.marker_insert_latency_ns_total.fetch_add(
+                        elapsed, std::memory_order_relaxed);
+                    PublishMaximum(
+                        &stats_.marker_insert_latency_ns_max, elapsed);
+                    PublishMaximum(
+                        &stats_.marker_request_rows_max,
+                        static_cast<std::uint64_t>(rows));
+                    PublishMaximum(
+                        &stats_.marker_request_bytes_max,
+                        static_cast<std::uint64_t>(payload.size()));
+                }
                 return true;
             }
             if (!IsRetryable(result)) {
@@ -1166,105 +1435,351 @@ private:
         }
     }
 
-    [[nodiscard]] bool ProcessBatch(const KLineRevisionBatch& batch,
-                                    HttpClient* client,
-                                    std::size_t lane_index) {
-        const std::uint64_t sink_sequence =
-            next_sink_batch_sequence_.fetch_add(1U, std::memory_order_relaxed);
-        if (sink_sequence == 0U) {
-            SetFatal("ClickHouse KLine sink batch sequence exhausted");
+    struct PrefixSelection final {
+        std::size_t batches = 0U;
+        std::size_t rows = 0U;
+        bool closed = false;
+    };
+
+    [[nodiscard]] PrefixSelection SelectPrefix(const Lane& lane) const noexcept {
+        PrefixSelection result{};
+        std::size_t revision_bytes = 0U;
+        const std::size_t marker_byte_rows =
+            config_.insert_request_max_bytes /
+            kRecoveryMarkerRowBinaryBytes;
+        for (const QueuedBatch& queued : lane.queue) {
+            const std::size_t rows = queued.batch->revisions.size();
+            const bool first = result.batches == 0U;
+            const bool oversized =
+                rows > config_.insert_request_max_rows ||
+                rows > config_.insert_request_max_bytes /
+                           kRevisionRowBinaryBytes;
+            if (first && oversized) {
+                result.batches = 1U;
+                result.rows = rows;
+                result.closed = true;
+                return result;
+            }
+            const bool batch_limit =
+                result.batches >= config_.physical_group_max_batches;
+            const bool marker_row_limit =
+                result.batches >= config_.insert_request_max_rows;
+            const bool marker_byte_limit =
+                result.batches >= marker_byte_rows;
+            const bool row_limit = oversized ||
+                rows > config_.insert_request_max_rows - result.rows;
+            const bool byte_limit = oversized ||
+                rows > (config_.insert_request_max_bytes - revision_bytes) /
+                           kRevisionRowBinaryBytes;
+            if (batch_limit || marker_row_limit || marker_byte_limit ||
+                row_limit || byte_limit) {
+                result.closed = true;
+                break;
+            }
+            ++result.batches;
+            result.rows += rows;
+            revision_bytes += rows * kRevisionRowBinaryBytes;
+        }
+        if (result.batches == config_.physical_group_max_batches ||
+            result.batches == config_.insert_request_max_rows ||
+            result.batches == marker_byte_rows ||
+            result.rows == config_.insert_request_max_rows ||
+            result.rows == config_.insert_request_max_bytes /
+                               kRevisionRowBinaryBytes) {
+            result.closed = true;
+        }
+        return result;
+    }
+
+    [[nodiscard]] bool CollectGroupPrefix(
+        Lane* lane,
+        std::vector<std::shared_ptr<const KLineRevisionBatch>>* batches) {
+        batches->clear();
+        std::unique_lock<std::mutex> lock(lane->mutex);
+        for (;;) {
+            lane->wake.wait(lock, [this, lane] {
+                return !lane->queue.empty() ||
+                    stopping_.load(std::memory_order_acquire) || !healthy();
+            });
+            if (lane->queue.empty() || !healthy()) {
+                return false;
+            }
+            const PrefixSelection selection = SelectPrefix(*lane);
+            if (selection.batches == 0U) {
+                SetFatal("ClickHouse KLine group selection made no progress");
+                return false;
+            }
+            if (!stopping_.load(std::memory_order_acquire) &&
+                !selection.closed) {
+                const std::uint64_t now = ingest::MonotonicNowNs();
+                const std::uint64_t enqueued =
+                    lane->queue.front().enqueued_monotonic_ns;
+                const std::uint64_t elapsed = now >= enqueued
+                    ? now - enqueued
+                    : 0U;
+                if (elapsed < config_.physical_group_max_delay_ns) {
+                    lane->wake.wait_for(
+                        lock,
+                        std::chrono::nanoseconds(
+                            config_.physical_group_max_delay_ns - elapsed));
+                    continue;
+                }
+            }
+            batches->reserve(selection.batches);
+            for (std::size_t index = 0U; index < selection.batches; ++index) {
+                batches->push_back(lane->queue[index].batch);
+            }
+            return true;
+        }
+    }
+
+    [[nodiscard]] bool FinalizeRevisionRequest(
+        std::size_t lane_index,
+        PhysicalInsertGroup* group,
+        InsertRequest* current) {
+        if (current->rows == 0U || current->payload.size() == 0U) {
+            SetFatal("ClickHouse KLine revision request is empty");
             return false;
         }
+        if (current->rows > config_.insert_request_max_rows ||
+            current->payload.size() > config_.insert_request_max_bytes ||
+            group->revision_requests.size() >=
+                std::numeric_limits<std::uint32_t>::max()) {
+            SetFatal("ClickHouse KLine revision request bound was exceeded");
+            return false;
+        }
+        const std::uint32_t request_index = static_cast<std::uint32_t>(
+            group->revision_requests.size());
+        const Identifier128 request_id = PhysicalRequestIdentifier(
+            writer_instance_id_, group->group_sequence,
+            static_cast<std::uint32_t>(lane_index), request_index,
+            kline::kKLineSchemaVersion, 1U);
         const std::string writer = IdentifierString(writer_instance_id_);
-        const std::string lane_text = std::to_string(lane_index);
-        std::uint32_t chunk_index = 0U;
-        for (std::size_t begin = 0U; begin < batch.revisions.size();
-             begin += config_.insert_chunk_rows, ++chunk_index) {
-            const std::size_t end = std::min(
-                batch.revisions.size(), begin + config_.insert_chunk_rows);
-            RevisionChunkMetadata metadata{};
-            metadata.sink_batch_sequence = sink_sequence;
-            metadata.chunk_index = chunk_index;
-            metadata.trade_date = batch.revisions[begin].key.trade_date;
-            metadata.batch_id = ChunkIdentifier(
-                writer_instance_id_, batch.recovery_run_id, chunk_index,
-                kline::kKLineSchemaVersion, 1U);
-            RowBinaryWriter payload((end - begin) * 512U);
-            for (std::size_t row = begin; row < end; ++row) {
+        current->query_id =
+            "l2flow/kline_revision_log/" + writer + "/" +
+            std::to_string(lane_index) + "/" +
+            std::to_string(group->group_sequence) + "/" +
+            std::to_string(request_index);
+        current->dedup_token =
+            "l2flow/kline_revision_log/" + IdentifierString(request_id) +
+            "/" + std::to_string(kline::kKLineSchemaVersion);
+        group->revision_requests.push_back(std::move(*current));
+        return true;
+    }
+
+    [[nodiscard]] bool PrepareGroup(
+        std::span<const std::shared_ptr<const KLineRevisionBatch>> batches,
+        std::size_t lane_index,
+        PhysicalInsertGroup* group) {
+        if (batches.empty()) {
+            SetFatal("ClickHouse KLine physical group is empty");
+            return false;
+        }
+        group->batches.reserve(batches.size());
+        for (const auto& batch : batches) {
+            const std::uint64_t sink_sequence =
+                next_sink_batch_sequence_.fetch_add(
+                    1U, std::memory_order_relaxed);
+            if (sink_sequence == 0U) {
+                SetFatal("ClickHouse KLine sink batch sequence exhausted");
+                return false;
+            }
+            group->revision_rows += batch->revisions.size();
+            group->batches.push_back(
+                PreparedBatch{batch, sink_sequence, 0U});
+        }
+
+        const std::size_t bounded_rows = std::min(
+            {group->revision_rows, config_.insert_request_max_rows,
+             config_.insert_request_max_bytes /
+                 kRevisionRowBinaryBytes});
+        const std::size_t initial_reserve = std::max(
+            kRevisionRowBinaryBytes,
+            bounded_rows * kRevisionRowBinaryBytes);
+        InsertRequest current(initial_reserve);
+        for (PreparedBatch& prepared : group->batches) {
+            const KLineRevisionBatch& batch = *prepared.batch;
+            std::uint32_t chunk_index = 0U;
+            bool logical_chunk_has_rows = false;
+            for (std::size_t row = 0U; row < batch.revisions.size(); ++row) {
+                if (current.rows == config_.insert_request_max_rows) {
+                    if (!FinalizeRevisionRequest(
+                            lane_index, group, &current)) {
+                        return false;
+                    }
+                    current = InsertRequest(initial_reserve);
+                    if (logical_chunk_has_rows) {
+                        ++chunk_index;
+                        logical_chunk_has_rows = false;
+                    }
+                }
+
+                RevisionChunkMetadata metadata{};
+                metadata.sink_batch_sequence = prepared.sink_batch_sequence;
+                metadata.chunk_index = chunk_index;
+                metadata.batch_id = ChunkIdentifier(
+                    writer_instance_id_, batch.recovery_run_id, chunk_index,
+                    kline::kKLineSchemaVersion, 1U);
+                const std::size_t checkpoint = current.payload.size();
                 if (!AppendRevisionRow(
-                        &payload, batch.revisions[row], writer_instance_id_,
-                        metadata, static_cast<std::uint32_t>(row))) {
-                    SetFatal("ClickHouse KLine revision serialization failed");
+                        &current.payload, batch.revisions[row],
+                        writer_instance_id_, metadata,
+                        static_cast<std::uint32_t>(row)) ||
+                    current.payload.size() - checkpoint !=
+                        kRevisionRowBinaryBytes) {
+                    SetFatal(
+                        "ClickHouse KLine revision serialization size changed");
+                    return false;
+                }
+                if (current.payload.size() >
+                    config_.insert_request_max_bytes) {
+                    current.payload.Truncate(checkpoint);
+                    if (current.rows == 0U ||
+                        !FinalizeRevisionRequest(
+                            lane_index, group, &current)) {
+                        SetFatal(
+                            "ClickHouse KLine revision row exceeds byte bound");
+                        return false;
+                    }
+                    current = InsertRequest(initial_reserve);
+                    if (logical_chunk_has_rows) {
+                        ++chunk_index;
+                        logical_chunk_has_rows = false;
+                    }
+                    metadata.chunk_index = chunk_index;
+                    metadata.batch_id = ChunkIdentifier(
+                        writer_instance_id_, batch.recovery_run_id,
+                        chunk_index, kline::kKLineSchemaVersion, 1U);
+                    const std::size_t empty_checkpoint =
+                        current.payload.size();
+                    if (!AppendRevisionRow(
+                            &current.payload, batch.revisions[row],
+                            writer_instance_id_, metadata,
+                            static_cast<std::uint32_t>(row)) ||
+                        current.payload.size() - empty_checkpoint !=
+                            kRevisionRowBinaryBytes ||
+                        current.payload.size() >
+                            config_.insert_request_max_bytes) {
+                        SetFatal(
+                            "ClickHouse KLine revision row exceeds byte bound");
+                        return false;
+                    }
+                }
+                ++current.rows;
+                logical_chunk_has_rows = true;
+            }
+            prepared.chunk_count = chunk_index + 1U;
+        }
+        if (current.rows != 0U &&
+            !FinalizeRevisionRequest(lane_index, group, &current)) {
+            return false;
+        }
+        if (group->revision_requests.empty()) {
+            SetFatal("ClickHouse KLine group has no revision requests");
+            return false;
+        }
+
+        const std::uint64_t committed_utc_ns = SystemUtcNowNs();
+        for (const PreparedBatch& prepared : group->batches) {
+            const std::size_t checkpoint = group->marker_payload.size();
+            if (!AppendRecoveryMarkerRow(
+                    &group->marker_payload, *prepared.batch,
+                    writer_instance_id_, prepared.chunk_count,
+                    committed_utc_ns) ||
+                group->marker_payload.size() - checkpoint !=
+                    kRecoveryMarkerRowBinaryBytes) {
+                SetFatal(
+                    "ClickHouse KLine recovery marker serialization changed");
+                return false;
+            }
+        }
+        if (group->batches.size() > config_.insert_request_max_rows ||
+            group->marker_payload.size() >
+                config_.insert_request_max_bytes) {
+            SetFatal("ClickHouse KLine marker request bound was exceeded");
+            return false;
+        }
+        const Identifier128 marker_id = PhysicalRequestIdentifier(
+            writer_instance_id_, group->group_sequence,
+            static_cast<std::uint32_t>(lane_index), 0U,
+            kline::kKLineSchemaVersion, 2U);
+        const std::string writer = IdentifierString(writer_instance_id_);
+        group->marker_query_id =
+            "l2flow/kline_recovery_run/" + writer + "/" +
+            std::to_string(lane_index) + "/" +
+            std::to_string(group->group_sequence);
+        group->marker_dedup_token =
+            "l2flow/kline_recovery_run/" + IdentifierString(marker_id) +
+            "/" + std::to_string(kline::kKLineSchemaVersion);
+        return true;
+    }
+
+    [[nodiscard]] bool ProcessGroup(PhysicalInsertGroup* group,
+                                    HttpClient* client) {
+        for (InsertRequest& request : group->revision_requests) {
+            if (!ExactInsert(client, InsertKind::kRevision, request.rows,
+                             "kline_revision_log", RevisionColumnNames(),
+                             request.query_id, request.dedup_token,
+                             request.payload.bytes())) {
+                return false;
+            }
+        }
+        if (!ExactInsert(client, InsertKind::kMarker, group->batches.size(),
+                         "kline_recovery_run", kRecoveryMarkerColumns,
+                         group->marker_query_id, group->marker_dedup_token,
+                         group->marker_payload.bytes())) {
+            return false;
+        }
+        const std::uint64_t batch_count =
+            static_cast<std::uint64_t>(group->batches.size());
+        const std::uint64_t row_count =
+            static_cast<std::uint64_t>(group->revision_rows);
+        stats_.physical_groups_committed.fetch_add(
+            1U, std::memory_order_relaxed);
+        stats_.recovery_runs_committed.fetch_add(
+            batch_count, std::memory_order_relaxed);
+        stats_.revision_rows_acked.fetch_add(
+            row_count, std::memory_order_relaxed);
+        stats_.revision_batches_acked.fetch_add(
+            batch_count, std::memory_order_release);
+        PublishMaximum(&stats_.physical_group_batches_max, batch_count);
+        PublishMaximum(&stats_.physical_group_rows_max, row_count);
+        return true;
+    }
+
+    [[nodiscard]] bool ReleaseGroup(
+        Lane* lane,
+        std::size_t lane_index,
+        const PhysicalInsertGroup& group) noexcept {
+        {
+            std::scoped_lock lock(lane->mutex, queue_budget_mutex_);
+            const std::size_t batch_count = group.batches.size();
+            if (lane->queue.size() < batch_count ||
+                queued_batches_ < batch_count ||
+                queued_rows_ < group.revision_rows ||
+                lane_queued_batches_[lane_index] < batch_count ||
+                lane_queued_rows_[lane_index] < group.revision_rows) {
+                SetFatal("ClickHouse KLine queue budget invariant failed");
+                return false;
+            }
+            for (std::size_t index = 0U; index < batch_count; ++index) {
+                if (lane->queue[index].batch != group.batches[index].batch) {
+                    SetFatal("ClickHouse KLine queue prefix changed");
                     return false;
                 }
             }
-            const std::string query_id =
-                "l2flow/kline_revision_log/" + writer + "/" +
-                lane_text + "/" +
-                std::to_string(sink_sequence) + "/" +
-                std::to_string(chunk_index);
-            const std::string token =
-                "l2flow/kline_revision_log/" +
-                IdentifierString(metadata.batch_id) + "/" +
-                std::to_string(kline::kKLineSchemaVersion);
-            if (!ExactInsert(client, "kline_revision_log",
-                             RevisionColumnNames(), query_id, token,
-                             payload.bytes())) {
-                return false;
+            for (std::size_t index = 0U; index < batch_count; ++index) {
+                lane->queue.pop_front();
             }
-            stats_.revision_chunks_acked.fetch_add(
-                1U, std::memory_order_relaxed);
+            queued_batches_ -= batch_count;
+            queued_rows_ -= group.revision_rows;
+            lane_queued_batches_[lane_index] -= batch_count;
+            lane_queued_rows_[lane_index] -= group.revision_rows;
         }
-
-        const KLineRevision& first = batch.revisions.front();
-        const KLineRevision& last = batch.revisions.back();
-        std::uint16_t days = 0U;
-        if (!TradeDateToDays(first.key.trade_date, &days)) {
-            SetFatal("ClickHouse KLine recovery marker date is invalid");
-            return false;
-        }
-        const Identifier128 commit_id = ChunkIdentifier(
-            writer_instance_id_, batch.recovery_run_id, 0U,
-            kline::kKLineSchemaVersion, 2U);
-        RowBinaryWriter marker(160U);
-        marker.Append(days);
-        marker.AppendIdentifier(batch.calculation_run_id);
-        marker.AppendIdentifier(batch.recovery_run_id);
-        marker.Append(batch.owner);
-        marker.Append(batch.batch_sequence);
-        marker.AppendEnum(batch.reason);
-        marker.Append(first.version);
-        marker.Append(last.version);
-        marker.Append(static_cast<std::uint64_t>(batch.revisions.size()));
-        marker.Append(chunk_index);
-        marker.AppendBool(true);
-        marker.Append(SystemUtcNowNs());
-        marker.AppendIdentifier(writer_instance_id_);
-        marker.AppendIdentifier(commit_id);
-        marker.Append(kline::kKLineSchemaVersion);
-        constexpr std::string_view marker_columns =
-            "trade_date,calculation_run_id,recovery_run_id,owner,"
-            "calculation_batch_sequence,revision_reason,minimum_version,"
-            "maximum_version,revision_count,chunk_count,committed,"
-            "committed_utc_ns,writer_instance_id,commit_id,schema_version";
-        const std::string marker_query_id =
-            "l2flow/kline_recovery_run/" + writer + "/" +
-            lane_text + "/" +
-            IdentifierString(batch.recovery_run_id);
-        const std::string marker_token =
-            "l2flow/kline_recovery_run/" + IdentifierString(commit_id) +
-            "/" + std::to_string(kline::kKLineSchemaVersion);
-        if (!ExactInsert(client, "kline_recovery_run", marker_columns,
-                         marker_query_id, marker_token, marker.bytes())) {
-            return false;
-        }
-        stats_.recovery_runs_committed.fetch_add(
-            1U, std::memory_order_relaxed);
-        stats_.revision_rows_acked.fetch_add(
-            static_cast<std::uint64_t>(batch.revisions.size()),
-            std::memory_order_relaxed);
-        stats_.revision_batches_acked.fetch_add(
-            1U, std::memory_order_release);
+        stats_.revision_batches_released.fetch_add(
+            static_cast<std::uint64_t>(group.batches.size()),
+            std::memory_order_release);
+        lane->wake.notify_all();
         return true;
     }
 
@@ -1272,51 +1787,35 @@ private:
         try {
             HttpClient client(config_);
             Lane& lane = *lanes_[lane_index];
+            std::vector<std::shared_ptr<const KLineRevisionBatch>> batches;
+            const std::size_t maximum_selected_batches = std::min(
+                {config_.physical_group_max_batches,
+                 config_.insert_request_max_rows,
+                 config_.insert_request_max_bytes /
+                     kRecoveryMarkerRowBinaryBytes,
+                 config_.queue_revision_batches,
+                 config_.queue_revision_rows});
+            batches.reserve(maximum_selected_batches);
             for (;;) {
-                std::shared_ptr<const KLineRevisionBatch> batch;
-                {
-                    std::unique_lock<std::mutex> lock(lane.mutex);
-                    lane.wake.wait_for(
-                        lock, std::chrono::milliseconds(1), [this, &lane] {
-                            return !lane.queue.empty() ||
-                                stopping_.load(std::memory_order_acquire) ||
-                                !healthy();
-                        });
-                    if (lane.queue.empty()) {
-                        if (stopping_.load(std::memory_order_acquire) ||
-                            !healthy()) {
-                            return;
-                        }
-                        continue;
-                    }
-                    batch = lane.queue.front();
-                }
-                if (!healthy() ||
-                    !ProcessBatch(*batch, &client, lane_index)) {
+                if (!CollectGroupPrefix(&lane, &batches)) {
                     return;
                 }
-                {
-                    std::lock_guard<std::mutex> lock(lane.mutex);
-                    if (lane.queue.empty() || lane.queue.front() != batch) {
-                        SetFatal("ClickHouse KLine queue invariant failed");
-                        return;
-                    }
-                    lane.queue.pop_front();
+                const std::uint64_t group_sequence =
+                    next_physical_group_sequence_.fetch_add(
+                        1U, std::memory_order_relaxed);
+                if (group_sequence == 0U) {
+                    SetFatal(
+                        "ClickHouse KLine physical group sequence exhausted");
+                    return;
                 }
-                {
-                    std::lock_guard<std::mutex> budget_lock(
-                        queue_budget_mutex_);
-                    if (queued_batches_ == 0U ||
-                        queued_rows_ < batch->revisions.size()) {
-                        SetFatal("ClickHouse KLine queue budget invariant failed");
-                        return;
-                    }
-                    --queued_batches_;
-                    queued_rows_ -= batch->revisions.size();
+                PhysicalInsertGroup group(
+                    group_sequence,
+                    batches.size() * kRecoveryMarkerRowBinaryBytes);
+                if (!PrepareGroup(batches, lane_index, &group) ||
+                    !ProcessGroup(&group, &client) ||
+                    !ReleaseGroup(&lane, lane_index, group)) {
+                    return;
                 }
-                stats_.revision_batches_released.fetch_add(
-                    1U, std::memory_order_release);
-                lane.wake.notify_all();
             }
         } catch (const std::exception& exception) {
             SetFatal(std::string("ClickHouse KLine writer failed: ") +
@@ -1352,7 +1851,18 @@ private:
     mutable std::shared_mutex lifecycle_mutex_;
     std::size_t queued_batches_ = 0U;
     std::size_t queued_rows_ = 0U;
+    std::size_t queued_batches_high_water_ = 0U;
+    std::size_t queued_rows_high_water_ = 0U;
+    std::array<std::size_t, kMaximumKLineWriterLanes>
+        lane_queued_batches_{};
+    std::array<std::size_t, kMaximumKLineWriterLanes>
+        lane_queued_rows_{};
+    std::array<std::size_t, kMaximumKLineWriterLanes>
+        lane_queued_batches_high_water_{};
+    std::array<std::size_t, kMaximumKLineWriterLanes>
+        lane_queued_rows_high_water_{};
     std::atomic<std::uint64_t> next_sink_batch_sequence_{1U};
+    std::atomic<std::uint64_t> next_physical_group_sequence_{1U};
     std::atomic<std::uint64_t> shutdown_deadline_ns_{
         std::numeric_limits<std::uint64_t>::max()};
     std::atomic<bool> started_{false};

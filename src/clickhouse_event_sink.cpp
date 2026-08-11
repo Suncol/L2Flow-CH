@@ -1026,8 +1026,11 @@ bool ValidateEventClickHouseConfig(const EventClickHouseConfig& config,
     }
     const bool valid_writer_lanes =
         config.writer_lanes == 1U || config.writer_lanes == 2U ||
-        config.writer_lanes == 4U || config.writer_lanes == 8U;
-    if (!valid_writer_lanes || config.insert_request_max_rows == 0U ||
+        config.writer_lanes == 4U || config.writer_lanes == 8U ||
+        config.writer_lanes == 16U || config.writer_lanes == 32U;
+    if (!valid_writer_lanes ||
+        config.writer_lanes > kMaximumEventWriterLanes ||
+        config.insert_request_max_rows == 0U ||
         config.insert_request_max_bytes < kRevisionRowBinaryBytes ||
         config.physical_group_max_batches == 0U ||
         config.physical_group_max_delay_ns == 0U ||

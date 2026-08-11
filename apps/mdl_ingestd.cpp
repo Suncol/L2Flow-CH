@@ -330,7 +330,7 @@ void PrintUsage() {
         << "  --event-insert-request-max-bytes N default 1048576\n"
         << "  --event-physical-group-max-batches N default 256\n"
         << "  --event-physical-group-max-delay-ns N default 1000000\n"
-        << "  --event-writer-lanes N (1,2,4,8) default 1\n"
+        << "  --event-writer-lanes N (1,2,4,8,16,32) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
         << "  --event-maximum-carry-orders N default 2097152 per owner\n"
@@ -367,7 +367,10 @@ void PrintUsage() {
         << "  --kline-logic-version N    default 1\n"
         << "  --kline-micro-batch-rows N default 256\n"
         << "  --kline-micro-batch-max-delay-ns N default 1000000\n"
-        << "  --kline-insert-chunk-rows N default 16384\n"
+        << "  --kline-insert-request-max-rows N default 1024\n"
+        << "  --kline-insert-request-max-bytes N default 1048576\n"
+        << "  --kline-physical-group-max-batches N default 256\n"
+        << "  --kline-physical-group-max-delay-ns N default 1000000\n"
         << "  --kline-writer-lanes N (1,2,4,8,16,32) default 1\n"
         << "  --kline-queue-revision-batches N default 1024\n"
         << "  --kline-queue-revision-rows N default 1048576\n"
@@ -1565,11 +1568,35 @@ struct CpuSelection final {
                 return false;
             }
             kline_option_seen = true;
-        } else if (argument == "--kline-insert-chunk-rows") {
+        } else if (argument == "--kline-insert-request-max-rows") {
             if (!ParseInteger(
                     next(argument),
-                    &parsed.clickhouse_kline.insert_chunk_rows)) {
-                *error = "invalid --kline-insert-chunk-rows";
+                    &parsed.clickhouse_kline.insert_request_max_rows)) {
+                *error = "invalid --kline-insert-request-max-rows";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-insert-request-max-bytes") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.insert_request_max_bytes)) {
+                *error = "invalid --kline-insert-request-max-bytes";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-physical-group-max-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.physical_group_max_batches)) {
+                *error = "invalid --kline-physical-group-max-batches";
+                return false;
+            }
+            kline_option_seen = true;
+        } else if (argument == "--kline-physical-group-max-delay-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.physical_group_max_delay_ns)) {
+                *error = "invalid --kline-physical-group-max-delay-ns";
                 return false;
             }
             kline_option_seen = true;
@@ -2224,6 +2251,15 @@ void PrintKLineStats(
               << " kline_rejections_resolved="
               << runtime.occurrence_rejections_resolved
               << " kline_micro_batches=" << runtime.micro_batches_applied
+              << " kline_facts_in_micro_batches="
+              << runtime.facts_in_micro_batches
+              << " kline_micro_batch_rows_max="
+              << runtime.micro_batch_rows_max
+              << " kline_micro_batch_source_age_ns_max="
+              << runtime.micro_batch_source_age_ns_max
+              << " kline_row_limit_flushes=" << runtime.row_limit_flushes
+              << " kline_timer_flushes=" << runtime.timer_flushes
+              << " kline_explicit_flushes=" << runtime.explicit_flushes
               << " kline_facts=" << runtime.workers.facts_journaled
               << " kline_trades=" << runtime.workers.trades_projected
               << " kline_invalid_exchange_time="
@@ -2233,19 +2269,85 @@ void PrintKLineStats(
               << " kline_revisions=" << runtime.workers.revisions_created
               << " kline_pending_raw="
               << runtime.workers.pending_raw_commits
+              << " kline_pending_revision_rows="
+              << runtime.workers.pending_revision_rows
+              << " kline_pending_revision_rows_owner_hwm_max="
+              << runtime.workers.pending_revision_rows_high_watermark
+              << " kline_pending_revision_bytes="
+              << runtime.workers.pending_revision_bytes
+              << " kline_pending_revision_bytes_owner_hwm_max="
+              << runtime.workers.pending_revision_bytes_high_watermark
               << " kline_ack_index="
               << runtime.workers.acknowledged_raw_dependencies
               << " kline_sink_batches_queued="
               << sink.revision_batches_queued
               << " kline_sink_batches_acked="
               << sink.revision_batches_acked
+              << " kline_sink_batches_released="
+              << sink.revision_batches_released
+              << " kline_sink_rows_queued_total="
+              << sink.revision_rows_queued
               << " kline_sink_rows_acked=" << sink.revision_rows_acked
+              << " kline_sink_physical_groups="
+              << sink.physical_groups_committed
+              << " kline_sink_revision_insert_requests="
+              << sink.revision_insert_requests_acked
+              << " kline_sink_marker_insert_requests="
+              << sink.marker_insert_requests_acked
+              << " kline_sink_revision_insert_rows="
+              << sink.revision_insert_rows_acked
+              << " kline_sink_revision_insert_bytes="
+              << sink.revision_insert_bytes_acked
+              << " kline_sink_marker_insert_rows="
+              << sink.marker_insert_rows_acked
+              << " kline_sink_marker_insert_bytes="
+              << sink.marker_insert_bytes_acked
               << " kline_recovery_runs_committed="
               << sink.recovery_runs_committed
+              << " kline_sink_physical_group_batches_max="
+              << sink.physical_group_batches_max
+              << " kline_sink_physical_group_rows_max="
+              << sink.physical_group_rows_max
+              << " kline_sink_revision_request_rows_max="
+              << sink.revision_request_rows_max
+              << " kline_sink_revision_request_bytes_max="
+              << sink.revision_request_bytes_max
+              << " kline_sink_marker_request_rows_max="
+              << sink.marker_request_rows_max
+              << " kline_sink_marker_request_bytes_max="
+              << sink.marker_request_bytes_max
+              << " kline_sink_revision_latency_ns_total="
+              << sink.revision_insert_latency_ns_total
+              << " kline_sink_revision_latency_ns_max="
+              << sink.revision_insert_latency_ns_max
+              << " kline_sink_marker_latency_ns_total="
+              << sink.marker_insert_latency_ns_total
+              << " kline_sink_marker_latency_ns_max="
+              << sink.marker_insert_latency_ns_max
               << " kline_sink_retry_attempts=" << sink.retry_attempts
               << " kline_sink_unknown_outcomes=" << sink.unknown_outcomes
+              << " kline_sink_bytes_sent=" << sink.bytes_sent
+              << " kline_sink_queued_batches="
+              << sink.queued_revision_batches
               << " kline_sink_queued_rows=" << sink.queued_revision_rows
+              << " kline_sink_queued_batches_hwm="
+              << sink.queued_revision_batches_high_water
+              << " kline_sink_queued_rows_hwm="
+              << sink.queued_revision_rows_high_water
               << '\n';
+    for (std::size_t lane = 0U; lane < sink.writer_lanes; ++lane) {
+        const auto& lane_stats = sink.lanes[lane];
+        std::cout << "kline_sink_lane=" << lane
+                  << " kline_sink_lane_queued_batches="
+                  << lane_stats.queued_revision_batches
+                  << " kline_sink_lane_queued_rows="
+                  << lane_stats.queued_revision_rows
+                  << " kline_sink_lane_queued_batches_hwm="
+                  << lane_stats.queued_revision_batches_high_water
+                  << " kline_sink_lane_queued_rows_hwm="
+                  << lane_stats.queued_revision_rows_high_water
+                  << '\n';
+    }
 }
 #endif
 

@@ -10,6 +10,8 @@
 
 namespace l2flow::clickhouse {
 
+inline constexpr std::size_t kMaximumEventWriterLanes = 32U;
+
 struct EventClickHouseConfig final {
     std::string endpoint = "http://127.0.0.1:8123";
     std::string database = "l2flow";
@@ -27,7 +29,7 @@ struct EventClickHouseConfig final {
     std::size_t physical_group_max_batches = 256U;
     std::uint64_t physical_group_max_delay_ns = 1'000'000U;
     // Number of independent, ordered Event INSERT lanes.  The supported
-    // production values are 1, 2, 4, and 8.  A batch is routed by its
+    // production values are 1, 2, 4, 8, 16, and 32.  A batch is routed by its
     // logical Event owner, so all revisions for one owner stay FIFO on one
     // lane while different owners may be written concurrently.
     std::size_t writer_lanes = 1U;

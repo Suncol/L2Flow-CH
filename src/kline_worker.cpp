@@ -325,6 +325,48 @@ void AppendAnchor(HashInput* hash, const TradeAnchor& anchor) {
     return day <= maximum;
 }
 
+[[nodiscard]] constexpr std::size_t SaturatingAdd(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return right > std::numeric_limits<std::size_t>::max() - left
+        ? std::numeric_limits<std::size_t>::max()
+        : left + right;
+}
+
+[[nodiscard]] constexpr std::size_t SaturatingMultiply(
+    std::size_t left,
+    std::size_t right) noexcept {
+    return left != 0U &&
+                   right > std::numeric_limits<std::size_t>::max() / left
+        ? std::numeric_limits<std::size_t>::max()
+        : left * right;
+}
+
+template <typename Value>
+[[nodiscard]] constexpr std::size_t TreeNodeOwnedBytes() noexcept {
+    // Three links, allocator bookkeeping, and alignment form a conservative
+    // logical-owned estimate. This is intentionally not an RSS measurement.
+    return sizeof(Value) + 5U * sizeof(void*);
+}
+
+[[nodiscard]] std::size_t PendingCommitOwnedBytes(
+    const std::shared_ptr<const KLineRevisionBatch>& batch,
+    std::size_t dependency_count) noexcept {
+    std::size_t bytes = 0U;
+    if (batch != nullptr) {
+        bytes = sizeof(KLineRevisionBatch) + 4U * sizeof(void*);
+        bytes = SaturatingAdd(
+            bytes,
+            SaturatingMultiply(batch->revisions.capacity(),
+                               sizeof(KLineRevision)));
+    }
+    return SaturatingAdd(
+        bytes,
+        SaturatingMultiply(
+            dependency_count,
+            TreeNodeOwnedBytes<RawTickDependency>()));
+}
+
 struct AtomicStats final {
     std::atomic<std::uint64_t> facts_journaled{0U};
     std::atomic<std::uint64_t> trades_projected{0U};
@@ -336,9 +378,22 @@ struct AtomicStats final {
     std::atomic<std::uint64_t> bars_updated{0U};
     std::atomic<std::uint64_t> revisions_created{0U};
     std::atomic<std::uint64_t> pending_raw_commits{0U};
+    std::atomic<std::uint64_t> pending_revision_rows{0U};
+    std::atomic<std::uint64_t> pending_revision_rows_high_watermark{0U};
+    std::atomic<std::uint64_t> pending_revision_bytes{0U};
+    std::atomic<std::uint64_t> pending_revision_bytes_high_watermark{0U};
     std::atomic<std::uint64_t> acknowledged_raw_dependencies{0U};
     std::atomic<std::uint64_t> revision_batches_submitted{0U};
 };
+
+void PublishMaximum(std::atomic<std::uint64_t>* target,
+                    std::uint64_t value) noexcept {
+    std::uint64_t current = target->load(std::memory_order_relaxed);
+    while (current < value &&
+           !target->compare_exchange_weak(
+               current, value, std::memory_order_relaxed)) {
+    }
+}
 
 }  // namespace
 
@@ -366,6 +421,8 @@ public:
     struct PendingCommit final {
         std::shared_ptr<const KLineRevisionBatch> batch;
         std::set<RawTickDependency> raw_dependencies;
+        std::size_t revision_rows = 0U;
+        std::size_t owned_bytes = 0U;
     };
 
     Impl(KLineWorkerConfig config, KLineRevisionSink* sink)
@@ -613,10 +670,18 @@ public:
                 ? 0U
                 : revision_batch->revisions.size();
             if (revision_count != 0U || !dependencies.empty()) {
+                const std::size_t owned_bytes = PendingCommitOwnedBytes(
+                    revision_batch, dependencies.size());
                 pending_commits_.push_back(PendingCommit{
-                    std::move(revision_batch), std::move(dependencies)});
+                    std::move(revision_batch), std::move(dependencies),
+                    revision_count, owned_bytes});
+                pending_revision_rows_ = SaturatingAdd(
+                    pending_revision_rows_, revision_count);
+                pending_revision_bytes_ = SaturatingAdd(
+                    pending_revision_bytes_, owned_bytes);
                 stats_.pending_raw_commits.store(
                     pending_commits_.size(), std::memory_order_relaxed);
+                PublishPendingRevisionStats();
             }
             stats_.revisions_created.fetch_add(
                 static_cast<std::uint64_t>(revision_count),
@@ -697,9 +762,19 @@ public:
                  pending.raw_dependencies) {
                 acknowledged_raw_.erase(dependency);
             }
+            const std::size_t released_rows = pending.revision_rows;
+            const std::size_t released_bytes = pending.owned_bytes;
+            if (released_rows > pending_revision_rows_ ||
+                released_bytes > pending_revision_bytes_) {
+                SetFatal("KLine pending revision accounting diverged");
+                return false;
+            }
             pending_commits_.pop_front();
+            pending_revision_rows_ -= released_rows;
+            pending_revision_bytes_ -= released_bytes;
             stats_.pending_raw_commits.store(
                 pending_commits_.size(), std::memory_order_relaxed);
+            PublishPendingRevisionStats();
             stats_.acknowledged_raw_dependencies.store(
                 acknowledged_raw_.size(), std::memory_order_relaxed);
         }
@@ -751,6 +826,16 @@ public:
             std::memory_order_relaxed);
         result.pending_raw_commits = stats_.pending_raw_commits.load(
             std::memory_order_relaxed);
+        result.pending_revision_rows = stats_.pending_revision_rows.load(
+            std::memory_order_relaxed);
+        result.pending_revision_rows_high_watermark =
+            stats_.pending_revision_rows_high_watermark.load(
+                std::memory_order_relaxed);
+        result.pending_revision_bytes = stats_.pending_revision_bytes.load(
+            std::memory_order_relaxed);
+        result.pending_revision_bytes_high_watermark =
+            stats_.pending_revision_bytes_high_watermark.load(
+                std::memory_order_relaxed);
         result.acknowledged_raw_dependencies =
             stats_.acknowledged_raw_dependencies.load(
                 std::memory_order_relaxed);
@@ -765,6 +850,19 @@ public:
     }
 
 private:
+    void PublishPendingRevisionStats() noexcept {
+        stats_.pending_revision_rows.store(
+            pending_revision_rows_, std::memory_order_relaxed);
+        stats_.pending_revision_bytes.store(
+            pending_revision_bytes_, std::memory_order_relaxed);
+        PublishMaximum(
+            &stats_.pending_revision_rows_high_watermark,
+            static_cast<std::uint64_t>(pending_revision_rows_));
+        PublishMaximum(
+            &stats_.pending_revision_bytes_high_watermark,
+            static_cast<std::uint64_t>(pending_revision_bytes_));
+    }
+
     [[nodiscard]] bool AddTrade(const KLineKey& key,
                                 const FactRecord& record,
                                 BarState* state) noexcept {
@@ -873,6 +971,8 @@ private:
     std::unordered_map<KLineKey, BarState, KLineKeyHash> bars_;
     std::unordered_map<KLineKey, BarHead, KLineKeyHash> heads_;
     std::deque<PendingCommit> pending_commits_;
+    std::size_t pending_revision_rows_ = 0U;
+    std::size_t pending_revision_bytes_ = 0U;
     std::unordered_set<RawTickDependency, RawTickDependencyHash>
         acknowledged_raw_;
     std::uint32_t next_revision_counter_ = 1U;

@@ -187,11 +187,46 @@ on its own.
 
 ## 6. ClickHouse contract
 
-The sink writes revision chunks to `kline_revision_log` using immutable
-RowBinary bodies, stable query IDs, and stable insert-deduplication tokens. An
-unknown HTTP outcome retries the exact same chunk. Only after every revision
-chunk is acknowledged does it write the corresponding
-`kline_recovery_run` commit marker.
+`AppendRevisionBatch` remains the logical recovery boundary. A writer lane
+selects only a consecutive FIFO prefix of those immutable batches. The prefix
+stays in the lane queue while HTTP is in flight, so producers may append at the
+tail but no selected batch can be reordered or released early.
+
+Within that prefix, revision rows from several logical batches are serialized
+into the same `kline_revision_log` RowBinary request. A logical batch larger
+than a revision-request row or byte bound is split into multiple immutable
+requests. Every row retains its own `recovery_run_id`, sink
+`batch_sequence`, logical `chunk_index`, row index, and chunk `batch_id`;
+physical grouping does not replace those provenance fields. Physical query IDs
+and insert-deduplication tokens are derived from writer instance, lane,
+physical-group sequence, request index, schema version, and table tag, rather
+than from any one logical batch.
+
+The current RowBinary serializer has two checked schema invariants:
+
+```text
+kline_revision_log row = 313 bytes
+kline_recovery_run row  = 120 bytes
+```
+
+The sink checks the actual byte growth after every serialized row. A schema or
+serializer change that violates either width fails closed instead of silently
+invalidating byte grouping.
+
+After all revision requests succeed, the sink serializes one independent
+120-byte recovery marker row per logical batch and sends all marker rows in one
+`kline_recovery_run` INSERT. Only success of that combined marker request
+advances logical batch/row ACK counters and permits the complete physical
+prefix to be released. Revision-request ACK counters may therefore advance
+while logical ACK counters remain unchanged; that state identifies marker-side
+blocking rather than a completed logical commit.
+
+An unknown HTTP outcome retries the exact same immutable body, query ID, and
+deduplication token. A marker retry does not replay acknowledged revision
+requests. A permanent marker failure or exhausted retry budget retains the
+entire logical prefix and makes the sink unhealthy. Shutdown bypasses physical
+linger and attempts the final partial group; queue capacity exhaustion remains
+fail closed.
 
 `kline` is a `ReplacingMergeTree(version)` current table populated by a
 materialized view. Its sort key excludes `version` and exactly matches the
@@ -204,11 +239,12 @@ FROM l2flow.kline FINAL
 WHERE is_deleted = false;
 ```
 
-The sink supports one, two, four, or eight writer lanes. A batch is routed by
-`owner % writer_lanes`, preserving FIFO for one owner while permitting
-unrelated owners to write concurrently. Queue batch and row capacities are
-global bounds across the lanes. Exhaustion, permanent INSERT failure, retry
-budget expiry, schema mismatch, or marker failure makes the sink unhealthy.
+The sink supports one, two, four, eight, sixteen, or thirty-two writer lanes. A
+batch is routed by `owner % writer_lanes`, preserving FIFO for one owner while
+permitting unrelated owners to write concurrently. Queue batch and row
+capacities are global hard bounds across the lanes. Exhaustion, permanent
+INSERT failure, retry-budget expiry, schema mismatch, or marker failure makes
+the sink unhealthy.
 
 The single-node and Keeper-backed schemas are in
 `clickhouse/schema/kline_tables.sql` and
@@ -230,7 +266,69 @@ Enable the path on top of durable raw ClickHouse output:
 
 Intervals are repeatable, sorted, deduplicated at startup, and restricted to
 `[1, 86400]`. They are immutable for a runtime. Capacity, micro-batch, sink
-chunk, queue, and writer-lane flags are listed by `mdl_ingestd --help`.
+request, physical-group, queue, and writer-lane flags are listed by
+`mdl_ingestd --help`. The current production profile deliberately retains the
+conservative KLine sink settings:
+
+```text
+--kline-insert-request-max-rows 1024
+--kline-insert-request-max-bytes 1048576
+--kline-physical-group-max-batches 256
+--kline-physical-group-max-delay-ns 1000000
+--kline-writer-lanes 4
+--kline-queue-revision-batches 1024
+--kline-queue-revision-rows 1048576
+```
+
+The P1 `2048 rows / 1 MiB / 256 batches / 1 ms` and P2
+`4096 rows / 2 MiB / 256 batches / 1-2 ms` shapes are benchmark candidates,
+not production defaults. The component benchmark and its ClickHouse-storage
+limitations are documented in
+[kline-sink-physical-grouping-benchmark-report.md](kline-sink-physical-grouping-benchmark-report.md).
+
+### 7.1 Batch observability
+
+KLine metrics are updated at micro-batch, pending-commit, request, group, or
+queue transitions; no new atomic operation is performed for each serialized
+revision row. `mdl_ingestd` exports raw cumulative counters so a monitoring
+system can compute rates and averages from interval deltas:
+
+- runtime micro-batch facts, maximum rows, maximum source age, and row-limit,
+  timer, and explicit flush counts;
+- worker pending revision rows and conservative logical-owned bytes, with
+  per-owner high-water marks aggregated as the maximum owner HWM;
+- cumulative logical rows/batches queued, ACKed, and released;
+- successful revision and marker request counts, rows, bytes, latency totals,
+  and lifetime maxima;
+- physical groups, retry attempts, unknown outcomes, and bytes sent including
+  retries;
+- global and per-lane queued batch/row current values and lifetime high-water
+  marks.
+
+Row-limit and timer flush counters advance only when a nonempty micro-batch is
+applied. The explicit counter follows the runtime's drain contract and also
+counts an explicit flush call whose active batch is empty and which only
+services pending worker state; it therefore need not equal the number of
+explicitly applied micro-batches.
+
+Pending owned bytes include the immutable batch object/control estimate,
+revision vector capacity, and raw-dependency tree nodes. They exclude deque
+implementation storage and are not allocator RSS. They return to zero when the
+worker pending FIFO drains; the sink queue has separate current row/batch
+gauges.
+
+For a window `[t0,t1]`, request density is
+`delta(revision_insert_rows) / delta(revision_insert_requests)` and mean client
+latency is `delta(revision_latency_ns_total) /
+delta(revision_insert_requests)`. Lifetime maxima and HWM values are not
+percentiles. Client latency measures one immutable physical request from its
+first attempt until successful ACK, including retry and backoff time; a request
+that never succeeds is not added to the successful-request latency total.
+Request p50/p95/p99 and lane-level server duration should come from ClickHouse
+`system.query_log`, grouped by the lane encoded in `query_id`. Queue
+current-value slopes must be evaluated together with generated revision rate,
+logical ACK rate, raw pending/ACK backlog, and ClickHouse part/merge pressure;
+cumulative revisions minus ACKs at one instant is not a capacity test.
 
 KLine does not retain a full in-memory Tick history after each batch, but its
 bar/head maps are bounded independently by `maximum_bars` and are not reclaimed

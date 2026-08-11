@@ -37,6 +37,12 @@ struct KLineRuntimeStats final {
     std::uint64_t occurrence_rejections_resolved = 0U;
     std::uint64_t occurrence_duplicate_sides = 0U;
     std::uint64_t micro_batches_applied = 0U;
+    std::uint64_t facts_in_micro_batches = 0U;
+    std::uint64_t micro_batch_rows_max = 0U;
+    std::uint64_t micro_batch_source_age_ns_max = 0U;
+    std::uint64_t row_limit_flushes = 0U;
+    std::uint64_t timer_flushes = 0U;
+    std::uint64_t explicit_flushes = 0U;
     std::uint64_t source_conflicts = 0U;
     std::uint64_t invalid_inputs = 0U;
     KLineWorkerStats workers{};

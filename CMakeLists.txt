@@ -345,6 +345,14 @@ if(L2FLOW_CH_BUILD_TESTS)
             mdl_ingest_kline_requires_revision_epoch
             PROPERTIES WILL_FAIL TRUE)
         add_test(
+            NAME mdl_ingest_rejects_removed_kline_insert_chunk_rows
+            COMMAND ${CMAKE_COMMAND}
+                -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
+                -DARGUMENT=--kline-insert-chunk-rows
+                -DVALUE=16384
+                "-DEXPECTED=unknown option: --kline-insert-chunk-rows"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
+        add_test(
             NAME mdl_ingest_rejects_removed_kline_fact_capacity
             COMMAND ${CMAKE_COMMAND}
                 -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
@@ -594,7 +602,7 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
                     --producer-cpu 0 --first-consumer-cpu 1
                     --first-decoder-cpu 2
                     --clickhouse-url http://127.0.0.1:8123
-                    --clickhouse-feed-epoch 1 --event-enable
+                    --clickhouse-feed-epoch 1 --event-enable --kline-enable
                     --event-journal-dir /tmp
                     --event-construction-smoke)
         endif()
@@ -614,12 +622,27 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
         l2flow_ch_configure(benchmark_event_sink)
         target_link_libraries(benchmark_event_sink PRIVATE
             L2FlowCH::clickhouse)
+
+        add_executable(benchmark_kline_sink
+            benchmarks/benchmark_kline_sink.cpp)
+        l2flow_ch_configure(benchmark_kline_sink)
+        target_link_libraries(benchmark_kline_sink PRIVATE
+            L2FlowCH::clickhouse)
         if(L2FLOW_CH_BUILD_TESTS)
             add_test(
                 NAME event_state_benchmark_smoke
                 COMMAND benchmark_event_state
                     --rate 1000 --seconds 1 --actors 1
                     --micro-batch-rows 32)
+            add_test(
+                NAME kline_sink_benchmark_smoke
+                COMMAND benchmark_kline_sink
+                    --rate 10000 --seconds 1 --owners 4 --writer-lanes 2
+                    --logical-batch-rows 32 --producer-burst-batches 8
+                    --insert-request-rows 256
+                    --insert-request-bytes 1048576
+                    --physical-group-batches 256
+                    --physical-group-delay-ns 1000000)
         endif()
     endif()
 endif()

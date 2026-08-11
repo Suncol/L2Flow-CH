@@ -1,4 +1,5 @@
 #include "l2flow/kline/runtime.h"
+#include "l2flow/ingest/engine.h"
 
 #include <algorithm>
 #include <array>
@@ -782,6 +783,97 @@ void TestWorkerRejectsUnhealthyFactJournal() {
     CHECK(error.find("FactJournal is unhealthy") != std::string::npos);
 }
 
+void TestPendingRevisionRowsAndOwnedBytesAccounting() {
+    RecordingSink sink;
+    std::string error;
+    std::unique_ptr<KLineWorker> worker = KLineWorker::Create(
+        Config({1U, 5U}), &sink, &error);
+    CHECK(worker != nullptr);
+    constexpr std::uint64_t exchange = UINT64_C(34'200'000'000'000);
+    const CanonicalTick trade = Trade(
+        500U, 500U, exchange + 1U, MonotonicNowNs(),
+        10'000'000, 1);
+    const KLineInput input = OrderedInput(trade);
+    const KLineApplyResult applied = worker->ApplyBatch(
+        std::span<const KLineInput>(&input, 1U));
+    CHECK(applied.code == KLineApplyCode::kApplied);
+    CHECK(applied.revisions_created == 2U);
+
+    KLineWorkerStats stats = worker->stats();
+    CHECK(stats.pending_raw_commits == 1U);
+    CHECK(stats.pending_revision_rows == 2U);
+    CHECK(stats.pending_revision_rows_high_watermark == 2U);
+    CHECK(stats.pending_revision_bytes >= 2U * sizeof(KLineRevision));
+    CHECK(stats.pending_revision_bytes_high_watermark ==
+          stats.pending_revision_bytes);
+    CHECK(sink.batches.empty());
+
+    Ack(worker.get(), std::span<const CanonicalTick>(&trade, 1U));
+    stats = worker->stats();
+    CHECK(stats.pending_raw_commits == 0U);
+    CHECK(stats.pending_revision_rows == 0U);
+    CHECK(stats.pending_revision_bytes == 0U);
+    CHECK(stats.pending_revision_rows_high_watermark == 2U);
+    CHECK(stats.pending_revision_bytes_high_watermark > 0U);
+    CHECK(sink.batches.size() == 1U);
+}
+
+void TestRuntimeMicroBatchFlushMetrics() {
+    RecordingSink sink;
+    KLineRuntimeConfig config = RuntimeConfig();
+    config.micro_batch_rows = 2U;
+    config.micro_batch_max_delay_ns = UINT64_C(1'000'000);
+    std::string error;
+    std::unique_ptr<KLineRuntime> runtime =
+        KLineRuntime::Create(config, &sink, &error);
+    CHECK(runtime != nullptr);
+    constexpr std::uint64_t exchange = UINT64_C(34'200'000'000'000);
+
+    const std::uint64_t row_now = MonotonicNowNs();
+    const CanonicalTick row0 = Trade(
+        600U, 600U, exchange + 1U, row_now - 10'000U,
+        10'000'000, 1);
+    const CanonicalTick row1 = Trade(
+        601U, 601U, exchange + 2U, row_now - 5'000U,
+        11'000'000, 1);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&row0, 1U)));
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&row1, 1U)));
+    CHECK(runtime->AppendDispatch(0U, OrderedDispatch(row0)));
+    CHECK(runtime->AppendDispatch(0U, OrderedDispatch(row1)));
+
+    const std::uint64_t timer_now = MonotonicNowNs();
+    const CanonicalTick timer = Trade(
+        602U, 602U, exchange + 3U,
+        timer_now - config.micro_batch_max_delay_ns, 12'000'000, 1);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&timer, 1U)));
+    CHECK(runtime->AppendDispatch(0U, OrderedDispatch(timer)));
+    CHECK(runtime->FlushDue(0U, timer_now));
+
+    const CanonicalTick explicit_tick = Trade(
+        603U, 603U, exchange + 4U, MonotonicNowNs(), 13'000'000, 1);
+    CHECK(runtime->OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick>(&explicit_tick, 1U)));
+    CHECK(runtime->AppendDispatch(0U, OrderedDispatch(explicit_tick)));
+    CHECK(runtime->Flush(0U));
+    CHECK(runtime->Flush(0U));
+
+    const KLineRuntimeStats stats = runtime->stats();
+    CHECK(stats.micro_batches_applied == 3U);
+    CHECK(stats.facts_in_micro_batches == 4U);
+    CHECK(stats.micro_batch_rows_max == 2U);
+    CHECK(stats.micro_batch_source_age_ns_max > 0U);
+    CHECK(stats.row_limit_flushes == 1U);
+    CHECK(stats.timer_flushes == 1U);
+    CHECK(stats.explicit_flushes == 2U);
+    CHECK(stats.workers.pending_raw_commits == 0U);
+    CHECK(stats.workers.pending_revision_rows == 0U);
+    CHECK(stats.workers.pending_revision_bytes == 0U);
+    CHECK(runtime->DrainAll());
+}
+
 }  // namespace
 
 int main() {
@@ -801,6 +893,8 @@ int main() {
     TestAdmissionTokenHalfOpenBoundary();
     TestChannelGlobalFirstWinnerAcrossInstrumentOwners();
     TestWorkerRejectsUnhealthyFactJournal();
+    TestPendingRevisionRowsAndOwnedBytesAccounting();
+    TestRuntimeMicroBatchFlushMetrics();
     std::cout << "all KLine worker tests passed\n";
     return 0;
 }

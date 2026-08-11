@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -115,9 +116,18 @@ void TestConfigValidation() {
     config.endpoint = "http://127.0.0.1:8123/?bad=1";
     CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
     config.endpoint = "http://127.0.0.1:8123";
-    config.insert_chunk_rows = 0U;
+    config.insert_request_max_rows = 0U;
     CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
-    config.insert_chunk_rows = 16'384U;
+    config.insert_request_max_rows = 1'024U;
+    config.insert_request_max_bytes = 312U;
+    CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
+    config.insert_request_max_bytes = 1U * 1'024U * 1'024U;
+    config.physical_group_max_batches = 0U;
+    CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
+    config.physical_group_max_batches = 256U;
+    config.physical_group_max_delay_ns = 0U;
+    CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
+    config.physical_group_max_delay_ns = 1'000'000U;
     config.writer_lanes = 3U;
     CHECK(!l2flow::clickhouse::ValidateKLineClickHouseConfig(config, &error));
     config.writer_lanes = 8U;
@@ -134,14 +144,23 @@ struct CapturedRequest final {
     std::string body;
 };
 
+enum class ResponseAction : std::uint8_t {
+    kSuccess = 0U,
+    kDropConnection,
+    kRetryable,
+    kPermanent,
+};
+
 class RetryHttpServer final {
 public:
     explicit RetryHttpServer(
         std::chrono::milliseconds first_insert_delay =
             std::chrono::milliseconds{5},
-        bool drop_first_insert = true)
+        bool drop_first_insert = true,
+        std::vector<ResponseAction> response_script = {})
         : first_insert_delay_(first_insert_delay),
-          drop_first_insert_(drop_first_insert) {
+          drop_first_insert_(drop_first_insert),
+          response_script_(std::move(response_script)) {
         listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         if (listener_ < 0) {
             return;
@@ -277,9 +296,19 @@ private:
         return true;
     }
 
-    static void SendSuccess(int connection) noexcept {
-        constexpr std::string_view response =
+    static void SendResponse(int connection,
+                             ResponseAction action) noexcept {
+        constexpr std::string_view success =
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        constexpr std::string_view retryable =
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n"
+            "Connection: close\r\n\r\nretry";
+        constexpr std::string_view permanent =
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 9\r\n"
+            "Connection: close\r\n\r\npermanent";
+        const std::string_view response = action == ResponseAction::kRetryable
+            ? retryable
+            : action == ResponseAction::kPermanent ? permanent : success;
         std::size_t sent = 0U;
         while (sent < response.size()) {
             const ssize_t count = ::send(
@@ -319,8 +348,15 @@ private:
             if (insert && insert_requests == 1U) {
                 std::this_thread::sleep_for(first_insert_delay_);
             }
-            if (!insert || insert_requests != 1U || !drop_first_insert_) {
-                SendSuccess(connection);
+            ResponseAction action = ResponseAction::kSuccess;
+            if (insert && insert_requests <= response_script_.size()) {
+                action = response_script_[insert_requests - 1U];
+            } else if (insert && insert_requests == 1U &&
+                       drop_first_insert_) {
+                action = ResponseAction::kDropConnection;
+            }
+            if (action != ResponseAction::kDropConnection) {
+                SendResponse(connection, action);
             }
             static_cast<void>(::shutdown(connection, SHUT_RDWR));
             static_cast<void>(::close(connection));
@@ -329,6 +365,7 @@ private:
 
     std::chrono::milliseconds first_insert_delay_{};
     bool drop_first_insert_ = true;
+    std::vector<ResponseAction> response_script_;
     int listener_ = -1;
     std::uint16_t port_ = 0U;
     bool valid_ = false;
@@ -342,9 +379,9 @@ KLineClickHouseConfig HttpConfig(const RetryHttpServer& server) {
     KLineClickHouseConfig config{};
     config.endpoint = server.endpoint();
     config.database = "kline_retry_contract";
-    config.insert_chunk_rows = 1U;
-    config.queue_revision_batches = 2U;
-    config.queue_revision_rows = 8U;
+    config.insert_request_max_rows = 1U;
+    config.queue_revision_batches = 8U;
+    config.queue_revision_rows = 64U;
     config.connect_timeout_ms = 500U;
     config.request_timeout_ms = 1'000U;
     config.retry_initial_backoff_ms = 1U;
@@ -353,6 +390,43 @@ KLineClickHouseConfig HttpConfig(const RetryHttpServer& server) {
     config.shutdown_timeout_ms = 3'000U;
     config.ensure_local_tables = false;
     return config;
+}
+
+std::vector<CapturedRequest> InsertRequests(const RetryHttpServer& server) {
+    std::vector<CapturedRequest> inserts;
+    for (const CapturedRequest& request : server.requests()) {
+        if (request.target.find("INSERT") != std::string::npos) {
+            inserts.push_back(request);
+        }
+    }
+    return inserts;
+}
+
+std::uint32_t ReadUInt32(const std::string& body,
+                         std::size_t offset) {
+    CHECK(offset <= body.size());
+    CHECK(sizeof(std::uint32_t) <= body.size() - offset);
+    std::uint32_t value = 0U;
+    std::memcpy(&value, body.data() + offset, sizeof(value));
+    return value;
+}
+
+std::uint64_t ReadUInt64(const std::string& body,
+                         std::size_t offset) {
+    CHECK(offset <= body.size());
+    CHECK(sizeof(std::uint64_t) <= body.size() - offset);
+    std::uint64_t value = 0U;
+    std::memcpy(&value, body.data() + offset, sizeof(value));
+    return value;
+}
+
+void CheckIdentifier(const std::string& body,
+                     std::size_t offset,
+                     Identifier128 expected) {
+    CHECK(offset <= body.size());
+    CHECK(expected.bytes.size() <= body.size() - offset);
+    CHECK(std::memcmp(body.data() + offset, expected.bytes.data(),
+                      expected.bytes.size()) == 0);
 }
 
 void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
@@ -392,19 +466,318 @@ void TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit() {
     CHECK(!inserts[0U].body.empty());
     CHECK(inserts[0U].target.find("kline_revision_log") !=
           std::string::npos);
+    CHECK(inserts[0U].body.size() == 313U);
     CHECK(inserts[2U].target.find("kline_revision_log") !=
           std::string::npos);
+    CHECK(inserts[2U].body.size() == 313U);
     CHECK(inserts[3U].target.find("kline_recovery_run") !=
           std::string::npos);
+    CHECK(inserts[3U].body.size() == 120U);
     const auto stats = sink->stats();
     CHECK(stats.revision_batches_queued == 1U);
     CHECK(stats.revision_batches_acked == 1U);
     CHECK(stats.revision_batches_released == 1U);
     CHECK(stats.revision_rows_acked == 2U);
-    CHECK(stats.revision_chunks_acked == 2U);
+    CHECK(stats.physical_groups_committed == 1U);
+    CHECK(stats.revision_insert_requests_acked == 2U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.revision_insert_rows_acked == 2U);
+    CHECK(stats.revision_insert_bytes_acked == 626U);
+    CHECK(stats.marker_insert_rows_acked == 1U);
+    CHECK(stats.marker_insert_bytes_acked == 120U);
+    CHECK(stats.revision_request_rows_max == 1U);
+    CHECK(stats.revision_request_bytes_max == 313U);
     CHECK(stats.recovery_runs_committed == 1U);
     CHECK(stats.retry_attempts == 1U);
     CHECK(stats.unknown_outcomes == 1U);
+}
+
+void TestPhysicalGroupingPreservesLogicalRowsAndMarkers() {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "KLine grouped-marker fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.physical_group_max_delay_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+
+    const Identifier128 recovery0 = Identifier(20U);
+    const Identifier128 recovery1 = Identifier(21U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery0,
+        {Revision(401U, 401U, RevisionOperation::kInsert, 1, recovery0)})));
+    CHECK(sink->AppendRevisionBatch(Batch(
+        2U, recovery1,
+        {Revision(402U, 402U, RevisionOperation::kInsert, 2, recovery1)})));
+    const auto stop_started = std::chrono::steady_clock::now();
+    CHECK(sink->Stop(&error));
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
+    server.Stop();
+    CHECK(stop_elapsed < std::chrono::milliseconds{500});
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 2U);
+    CHECK(inserts[0U].target.find("kline_revision_log") !=
+          std::string::npos);
+    CHECK(inserts[0U].body.size() == 2U * 313U);
+    CheckIdentifier(inserts[0U].body, 60U, recovery0);
+    CheckIdentifier(inserts[0U].body, 313U + 60U, recovery1);
+    CHECK(ReadUInt64(inserts[0U].body, 293U) != 0U);
+    CHECK(ReadUInt64(inserts[0U].body, 313U + 293U) != 0U);
+    CHECK(ReadUInt64(inserts[0U].body, 293U) !=
+          ReadUInt64(inserts[0U].body, 313U + 293U));
+    CHECK(inserts[1U].target.find("kline_recovery_run") !=
+          std::string::npos);
+    CHECK(inserts[1U].body.size() == 2U * 120U);
+    CheckIdentifier(inserts[1U].body, 18U, recovery0);
+    CheckIdentifier(inserts[1U].body, 120U + 18U, recovery1);
+    CHECK(ReadUInt32(inserts[1U].body, 71U) == 1U);
+    CHECK(ReadUInt32(inserts[1U].body, 120U + 71U) == 1U);
+
+    const auto stats = sink->stats();
+    CHECK(stats.revision_batches_queued == 2U);
+    CHECK(stats.revision_batches_acked == 2U);
+    CHECK(stats.revision_batches_released == 2U);
+    CHECK(stats.revision_rows_queued == 2U);
+    CHECK(stats.revision_rows_acked == 2U);
+    CHECK(stats.physical_groups_committed == 1U);
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.recovery_runs_committed == 2U);
+    CHECK(stats.physical_group_batches_max == 2U);
+    CHECK(stats.physical_group_rows_max == 2U);
+    CHECK(stats.revision_request_rows_max == 2U);
+    CHECK(stats.revision_request_bytes_max == 626U);
+    CHECK(stats.marker_request_rows_max == 2U);
+    CHECK(stats.marker_request_bytes_max == 240U);
+    CHECK(stats.queued_revision_batches == 0U);
+    CHECK(stats.queued_revision_rows == 0U);
+    CHECK(stats.queued_revision_batches_high_water == 2U);
+    CHECK(stats.queued_revision_rows_high_water == 2U);
+    CHECK(stats.writer_lanes == 1U);
+    CHECK(stats.lanes[0U].queued_revision_batches == 0U);
+    CHECK(stats.lanes[0U].queued_revision_rows == 0U);
+    CHECK(stats.lanes[0U].queued_revision_batches_high_water == 2U);
+    CHECK(stats.lanes[0U].queued_revision_rows_high_water == 2U);
+}
+
+void TestUnknownMarkerOutcomeRetriesOnlyMarker() {
+    RetryHttpServer server(
+        std::chrono::milliseconds{0}, false,
+        {ResponseAction::kSuccess, ResponseAction::kDropConnection,
+         ResponseAction::kSuccess});
+    if (!server.valid()) {
+        std::cout << "KLine marker-retry fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(30U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery,
+        {Revision(501U, 501U, RevisionOperation::kInsert, 1, recovery)})));
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 3U);
+    CHECK(inserts[0U].target.find("kline_revision_log") !=
+          std::string::npos);
+    CHECK(inserts[1U].target.find("kline_recovery_run") !=
+          std::string::npos);
+    CHECK(inserts[1U].target == inserts[2U].target);
+    CHECK(inserts[1U].body == inserts[2U].body);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.retry_attempts == 1U);
+    CHECK(stats.unknown_outcomes == 1U);
+    CHECK(stats.revision_batches_acked == 1U);
+    CHECK(stats.revision_batches_released == 1U);
+}
+
+void TestPermanentMarkerFailureRetainsLogicalQueue() {
+    RetryHttpServer server(
+        std::chrono::milliseconds{0}, false,
+        {ResponseAction::kSuccess, ResponseAction::kPermanent});
+    if (!server.valid()) {
+        std::cout << "KLine permanent-marker fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(31U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery,
+        {Revision(601U, 601U, RevisionOperation::kInsert, 1, recovery)})));
+    CHECK(!sink->Stop(&error));
+    server.Stop();
+
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 1U);
+    CHECK(stats.marker_insert_requests_acked == 0U);
+    CHECK(stats.physical_groups_committed == 0U);
+    CHECK(stats.recovery_runs_committed == 0U);
+    CHECK(stats.revision_batches_acked == 0U);
+    CHECK(stats.revision_batches_released == 0U);
+    CHECK(stats.queued_revision_batches == 1U);
+    CHECK(stats.queued_revision_rows == 1U);
+    CHECK(stats.lanes[0U].queued_revision_batches == 1U);
+    CHECK(stats.lanes[0U].queued_revision_rows == 1U);
+    CHECK(error.find("failed permanently") != std::string::npos);
+}
+
+void TestByteBoundSplitsOneLogicalBatch() {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "KLine byte-bound fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 64U;
+    config.insert_request_max_bytes = 313U;
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery = Identifier(32U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery,
+        {Revision(701U, 701U, RevisionOperation::kInsert, 1, recovery),
+         Revision(702U, 702U, RevisionOperation::kInsert, 2, recovery)})));
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 3U);
+    CHECK(inserts[0U].body.size() == 313U);
+    CHECK(inserts[1U].body.size() == 313U);
+    CHECK(inserts[2U].body.size() == 120U);
+    CHECK(ReadUInt32(inserts[2U].body, 71U) == 2U);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_insert_requests_acked == 2U);
+    CHECK(stats.marker_insert_requests_acked == 1U);
+    CHECK(stats.revision_request_rows_max == 1U);
+    CHECK(stats.revision_request_bytes_max == 313U);
+}
+
+void RunThreeBatchBoundary(std::size_t maximum_rows,
+                           std::size_t maximum_bytes,
+                           std::size_t maximum_batches) {
+    RetryHttpServer server(std::chrono::milliseconds{0}, false);
+    if (!server.valid()) {
+        std::cout << "KLine group-boundary fixture skipped; loopback sockets "
+                     "are unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = maximum_rows;
+    config.insert_request_max_bytes = maximum_bytes;
+    config.physical_group_max_batches = maximum_batches;
+    config.physical_group_max_delay_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    for (std::uint64_t index = 0U; index < 3U; ++index) {
+        const Identifier128 recovery = Identifier(
+            static_cast<std::uint8_t>(40U + index));
+        CHECK(sink->AppendRevisionBatch(Batch(
+            index + 1U, recovery,
+            {Revision(801U + index, 801U + index,
+                      RevisionOperation::kInsert,
+                      static_cast<std::int64_t>(index + 1U), recovery)})));
+    }
+    CHECK(sink->Stop(&error));
+    server.Stop();
+
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    CHECK(inserts.size() == 4U);
+    CHECK(inserts[0U].target.find("kline_revision_log") !=
+          std::string::npos);
+    CHECK(inserts[0U].body.size() == 2U * 313U);
+    CHECK(inserts[1U].target.find("kline_recovery_run") !=
+          std::string::npos);
+    CHECK(inserts[1U].body.size() == 2U * 120U);
+    CHECK(inserts[2U].target.find("kline_revision_log") !=
+          std::string::npos);
+    CHECK(inserts[2U].body.size() == 313U);
+    CHECK(inserts[3U].target.find("kline_recovery_run") !=
+          std::string::npos);
+    CHECK(inserts[3U].body.size() == 120U);
+    const auto stats = sink->stats();
+    CHECK(stats.physical_groups_committed == 2U);
+    CHECK(stats.revision_insert_requests_acked == 2U);
+    CHECK(stats.marker_insert_requests_acked == 2U);
+    CHECK(stats.revision_batches_acked == 3U);
+    CHECK(stats.revision_batches_released == 3U);
+    CHECK(stats.revision_rows_acked == 3U);
+    CHECK(stats.physical_group_batches_max == 2U);
+    CHECK(stats.revision_request_rows_max == 2U);
+    CHECK(stats.revision_request_bytes_max == 626U);
+}
+
+void TestPhysicalGroupRowByteAndBatchBounds() {
+    RunThreeBatchBoundary(2U, 1U * 1'024U * 1'024U, 64U);
+    RunThreeBatchBoundary(64U, 626U, 64U);
+    RunThreeBatchBoundary(64U, 1U * 1'024U * 1'024U, 2U);
+}
+
+void TestQueueCapacityExhaustionFailsClosed() {
+    RetryHttpServer server(std::chrono::milliseconds{100}, false);
+    if (!server.valid()) {
+        std::cout << "KLine capacity fixture skipped; loopback sockets are "
+                     "unavailable\n";
+        return;
+    }
+    KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 8U;
+    config.queue_revision_batches = 1U;
+    config.queue_revision_rows = 8U;
+    config.physical_group_max_delay_ns = 1U;
+    std::string error;
+    std::unique_ptr<KLineClickHouseSink> sink =
+        KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr);
+    CHECK(sink->Start(&error));
+    const Identifier128 recovery0 = Identifier(50U);
+    const Identifier128 recovery1 = Identifier(51U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery0,
+        {Revision(901U, 901U, RevisionOperation::kInsert, 1, recovery0)})));
+    CHECK(!sink->AppendRevisionBatch(Batch(
+        2U, recovery1,
+        {Revision(902U, 902U, RevisionOperation::kInsert, 2, recovery1)})));
+    CHECK(!sink->healthy());
+    CHECK(!sink->Stop(&error));
+    server.Stop();
+    CHECK(error.find("capacity exhausted") != std::string::npos);
+    const auto stats = sink->stats();
+    CHECK(stats.revision_batches_queued == 1U);
+    CHECK(stats.queued_revision_batches_high_water == 1U);
+    CHECK(stats.queued_revision_rows_high_water == 1U);
 }
 
 void TestOrderedWriterLanesKeepOwnerAffinity() {
@@ -415,6 +788,8 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
         return;
     }
     KLineClickHouseConfig config = HttpConfig(server);
+    config.insert_request_max_rows = 8U;
+    config.physical_group_max_delay_ns = UINT64_C(1'000'000'000);
     config.writer_lanes = 2U;
     config.queue_revision_batches = 8U;
     config.queue_revision_rows = 32U;
@@ -426,15 +801,16 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
 
     const Identifier128 recovery0 = Identifier(10U);
     const Identifier128 recovery1 = Identifier(11U);
+    const Identifier128 recovery2 = Identifier(12U);
     CHECK(sink->AppendRevisionBatch(Batch(
         1U, recovery0,
         {Revision(201U, 201U, RevisionOperation::kInsert, 1,
                   recovery0)},
         0U)));
     CHECK(sink->AppendRevisionBatch(Batch(
-        2U, recovery0,
+        2U, recovery2,
         {Revision(202U, 202U, RevisionOperation::kInsert, 2,
-                  recovery0)},
+                  recovery2)},
         0U)));
     CHECK(sink->AppendRevisionBatch(Batch(
         1U, recovery1,
@@ -444,14 +820,9 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
     CHECK(sink->Stop(&error));
     server.Stop();
 
-    std::vector<CapturedRequest> inserts;
-    for (const CapturedRequest& request : server.requests()) {
-        if (request.target.find("INSERT") != std::string::npos) {
-            inserts.push_back(request);
-        }
-    }
-    // Every one-row batch has one revision INSERT followed by its marker.
-    CHECK(inserts.size() == 6U);
+    const std::vector<CapturedRequest> inserts = InsertRequests(server);
+    // Lane 0 combines two logical batches; lane 1 commits independently.
+    CHECK(inserts.size() == 4U);
     bool saw_lane0 = false;
     bool saw_lane1 = false;
     for (const CapturedRequest& request : inserts) {
@@ -468,7 +839,18 @@ void TestOrderedWriterLanesKeepOwnerAffinity() {
     CHECK(stats.revision_batches_released == 3U);
     CHECK(stats.revision_rows_acked == 3U);
     CHECK(stats.recovery_runs_committed == 3U);
+    CHECK(stats.physical_groups_committed == 2U);
+    CHECK(stats.revision_insert_requests_acked == 2U);
+    CHECK(stats.marker_insert_requests_acked == 2U);
+    CHECK(stats.writer_lanes == 2U);
     CHECK(stats.queued_revision_rows == 0U);
+    CHECK(stats.queued_revision_batches == 0U);
+    CHECK(stats.lanes[0U].queued_revision_batches == 0U);
+    CHECK(stats.lanes[1U].queued_revision_batches == 0U);
+    CHECK(stats.lanes[0U].queued_revision_batches_high_water == 2U);
+    CHECK(stats.lanes[0U].queued_revision_rows_high_water == 2U);
+    CHECK(stats.lanes[1U].queued_revision_batches_high_water == 1U);
+    CHECK(stats.lanes[1U].queued_revision_rows_high_water == 1U);
 }
 #endif
 
@@ -540,7 +922,7 @@ void TestClickHouseIntegration(std::string endpoint) {
     KLineClickHouseConfig config{};
     config.endpoint = std::move(endpoint);
     config.database = database;
-    config.insert_chunk_rows = 2U;
+    config.insert_request_max_rows = 2U;
     config.queue_revision_batches = 8U;
     config.queue_revision_rows = 32U;
     config.maximum_retry_elapsed_ms = 2'000U;
@@ -657,6 +1039,12 @@ int main() {
     TestConfigValidation();
 #if defined(__linux__)
     TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit();
+    TestPhysicalGroupingPreservesLogicalRowsAndMarkers();
+    TestUnknownMarkerOutcomeRetriesOnlyMarker();
+    TestPermanentMarkerFailureRetainsLogicalQueue();
+    TestByteBoundSplitsOneLogicalBatch();
+    TestPhysicalGroupRowByteAndBatchBounds();
+    TestQueueCapacityExhaustionFailsClosed();
     TestOrderedWriterLanesKeepOwnerAffinity();
 #endif
     const char* const endpoint = std::getenv("L2FLOW_CH_TEST_URL");

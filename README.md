@@ -358,7 +358,7 @@ Enable the Event projection on top of that durable raw path with:
 --event-insert-request-max-bytes <RowBinary bytes per physical HTTP request>
 --event-physical-group-max-batches <logical commits per physical group>
 --event-physical-group-max-delay-ns <oldest lane entry wait>
---event-writer-lanes <1|2|4|8>
+--event-writer-lanes <1|2|4|8|16|32>
 --event-queue-revision-batches <global logical-batch queue cap>
 --event-queue-revision-rows <global revision-row queue cap>
 --event-maximum-carry-orders <per-owner hard cap>
@@ -391,7 +391,11 @@ Enable one or more integer-second KLine intervals on the same durable raw path:
 --kline-revision-epoch <durably allocated nonzero monotone epoch>
 --kline-calculation-run-id <unique 32-hex calculation run ID>
 --kline-logic-version 1
---kline-writer-lanes <1|2|4|8>
+--kline-insert-request-max-rows 1024
+--kline-insert-request-max-bytes 1048576
+--kline-physical-group-max-batches 256
+--kline-physical-group-max-delay-ns 1000000
+--kline-writer-lanes <1|2|4|8|16|32>
 ```
 
 Intervals are repeatable and restricted to 1 through 86,400 seconds. Window
@@ -401,6 +405,9 @@ header `LocalTime` never substitute for it. An accepted hole fill emits a
 higher-version update to the same logical bar. The exact eligibility,
 ordering, provisional, raw-ACK, and restart contracts are documented in
 [docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
+The KLine sink transport benchmark and the limits of its 800k-1M revision/s
+loopback result are recorded in
+[docs/kline-sink-physical-grouping-benchmark-report.md](docs/kline-sink-physical-grouping-benchmark-report.md).
 
 For replicated production tables, provision the external DDL, add
 `--clickhouse-no-auto-create`, and set the required quorum, normally

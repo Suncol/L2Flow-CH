@@ -4,9 +4,11 @@
 
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
 #include "l2flow/clickhouse/event_sink.h"
+#include "l2flow/clickhouse/kline_sink.h"
 #include "l2flow/clickhouse/raw_sink.h"
 #include "l2flow/event/runtime.h"
 #include "l2flow/journal/fact_journal.h"
+#include "l2flow/kline/runtime.h"
 #endif
 
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -78,13 +80,18 @@ struct Options final {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     l2flow::clickhouse::RawClickHouseConfig clickhouse{};
     l2flow::clickhouse::EventClickHouseConfig clickhouse_event{};
+    l2flow::clickhouse::KLineClickHouseConfig clickhouse_kline{};
     l2flow::event::EventRuntimeConfig event{};
-    std::filesystem::path event_journal_directory;
+    l2flow::kline::KLineRuntimeConfig kline{};
+    std::filesystem::path fact_journal_directory;
     bool clickhouse_enabled = false;
     bool clickhouse_configuration_set = false;
     bool event_enabled = false;
     bool event_configuration_set = false;
     bool event_construction_smoke = false;
+    bool kline_enabled = false;
+    bool kline_configuration_set = false;
+    bool kline_interval_set = false;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::filesystem::path arrow_ring_directory;
@@ -98,6 +105,34 @@ struct Options final {
     bool arrow_configuration_set = false;
 #endif
 };
+
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+class RawTickBatchAckFanout final
+    : public l2flow::ingest::RawTickBatchAckListener {
+public:
+    void Configure(l2flow::ingest::RawTickBatchAckListener* first,
+                   l2flow::ingest::RawTickBatchAckListener* second) noexcept {
+        first_ = first;
+        second_ = second;
+    }
+
+    [[nodiscard]] bool OnRawTickBatchAcknowledged(
+        std::span<const CanonicalTick> ticks) noexcept override {
+        bool result = true;
+        if (first_ != nullptr) {
+            result = first_->OnRawTickBatchAcknowledged(ticks) && result;
+        }
+        if (second_ != nullptr) {
+            result = second_->OnRawTickBatchAcknowledged(ticks) && result;
+        }
+        return result;
+    }
+
+private:
+    l2flow::ingest::RawTickBatchAckListener* first_ = nullptr;
+    l2flow::ingest::RawTickBatchAckListener* second_ = nullptr;
+};
+#endif
 
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
 [[nodiscard]] l2flow::arrow_hot::ArrowHotEgressConfig MakeArrowConfig(
@@ -343,15 +378,30 @@ void PrintUsage() {
         << "  --event-insert-request-max-bytes N default 1048576\n"
         << "  --event-physical-group-max-batches N default 256\n"
         << "  --event-physical-group-max-delay-ns N default 1000000\n"
-        << "  --event-writer-lanes N (1,2,4,8) default 1\n"
+        << "  --event-writer-lanes N (1,2,4,8,16,32) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
         << "  --event-maximum-raw-ack-backlog N default 65536\n"
         << "  --event-maximum-pending-channel-seals N default 4096\n"
         << "  --event-raw-ack-drain-max-entries N default 1024\n"
         << "  --event-raw-ack-drain-max-cpu-ns N default 150000\n"
-        << "  --event-journal-dir DIR  unique file directory; default system temp\n"
+        << "  --fact-journal-dir DIR   unique shared Event/KLine file directory; default system temp\n"
+        << "  --event-journal-dir DIR  deprecated alias for --fact-journal-dir\n"
         << "  --event-construction-smoke validate Event construction without network I/O\n";
+    std::cout
+        << "  --kline-enable           enable KLine worker + KLine ClickHouse\n"
+        << "  --kline-interval-seconds N repeatable; default 1\n"
+        << "  --kline-micro-batch-rows N default 256\n"
+        << "  --kline-micro-batch-max-delay-ns N default 1000000\n"
+        << "  --kline-insert-request-max-rows N default 1024\n"
+        << "  --kline-insert-request-max-bytes N default 1048576\n"
+        << "  --kline-physical-group-max-batches N default 256\n"
+        << "  --kline-physical-group-max-delay-ns N default 1000000\n"
+        << "  --kline-writer-lanes N (1,2,4,8,16,32) default 1\n"
+        << "  --kline-queue-revision-batches N default 1024\n"
+        << "  --kline-queue-revision-rows N default 1048576\n"
+        << "  --kline-maximum-raw-ack-backlog N default 65536\n"
+        << "  --kline-maximum-occurrence-join N default 65536\n";
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::cout
@@ -692,19 +742,122 @@ void PrintUsage() {
                 return false;
             }
             parsed.event_configuration_set = true;
-        } else if (argument == "--event-journal-dir") {
+        } else if (argument == "--event-journal-dir" ||
+                   argument == "--fact-journal-dir") {
             const std::string_view value = next(argument);
             if (value.empty()) {
                 if (error->empty()) {
-                    *error = "invalid --event-journal-dir";
+                    *error = "invalid --fact-journal-dir";
                 }
                 return false;
             }
-            parsed.event_journal_directory = value;
-            parsed.event_configuration_set = true;
+            parsed.fact_journal_directory = value;
         } else if (argument == "--event-construction-smoke") {
             parsed.event_construction_smoke = true;
             parsed.event_configuration_set = true;
+        } else if (argument == "--kline-enable") {
+            parsed.kline_enabled = true;
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-interval-seconds") {
+            std::uint32_t interval = 0U;
+            if (!ParseInteger(next(argument), &interval)) {
+                *error = "invalid --kline-interval-seconds";
+                return false;
+            }
+            if (!parsed.kline_interval_set) {
+                parsed.kline.worker.interval_seconds.clear();
+                parsed.kline_interval_set = true;
+            }
+            parsed.kline.worker.interval_seconds.push_back(interval);
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-micro-batch-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.micro_batch_rows)) {
+                *error = "invalid --kline-micro-batch-rows";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-micro-batch-max-delay-ns") {
+            if (!ParseInteger(next(argument),
+                              &parsed.kline.micro_batch_max_delay_ns)) {
+                *error = "invalid --kline-micro-batch-max-delay-ns";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-insert-request-max-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.insert_request_max_rows)) {
+                *error = "invalid --kline-insert-request-max-rows";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-insert-request-max-bytes") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.insert_request_max_bytes)) {
+                *error = "invalid --kline-insert-request-max-bytes";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-physical-group-max-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.physical_group_max_batches)) {
+                *error = "invalid --kline-physical-group-max-batches";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-physical-group-max-delay-ns") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.physical_group_max_delay_ns)) {
+                *error = "invalid --kline-physical-group-max-delay-ns";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-writer-lanes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.clickhouse_kline.writer_lanes)) {
+                *error = "invalid --kline-writer-lanes";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-queue-revision-batches") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.queue_revision_batches)) {
+                *error = "invalid --kline-queue-revision-batches";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-queue-revision-rows") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.clickhouse_kline.queue_revision_rows)) {
+                *error = "invalid --kline-queue-revision-rows";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-maximum-raw-ack-backlog") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.kline.maximum_raw_ack_backlog_per_owner)) {
+                *error = "invalid --kline-maximum-raw-ack-backlog";
+                return false;
+            }
+            parsed.kline.worker.maximum_acknowledged_raw_dependencies =
+                parsed.kline.maximum_raw_ack_backlog_per_owner;
+            parsed.kline_configuration_set = true;
+        } else if (argument == "--kline-maximum-occurrence-join") {
+            if (!ParseInteger(
+                    next(argument),
+                    &parsed.kline
+                         .maximum_occurrence_join_entries_per_owner)) {
+                *error = "invalid --kline-maximum-occurrence-join";
+                return false;
+            }
+            parsed.kline_configuration_set = true;
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         } else if (argument == "--arrow-ring-dir") {
@@ -880,6 +1033,46 @@ void PrintUsage() {
         parsed.clickhouse_event.tls_verify_peer =
             parsed.clickhouse.tls_verify_peer;
     }
+    if (parsed.kline_configuration_set && !parsed.kline_enabled) {
+        *error = "KLine benchmark options require --kline-enable";
+        return false;
+    }
+    if (parsed.kline_enabled && !parsed.clickhouse_enabled) {
+        *error = "--kline-enable requires --clickhouse-url";
+        return false;
+    }
+    if (parsed.kline_enabled) {
+        std::sort(parsed.kline.worker.interval_seconds.begin(),
+                  parsed.kline.worker.interval_seconds.end());
+        parsed.kline.worker.interval_seconds.erase(
+            std::unique(parsed.kline.worker.interval_seconds.begin(),
+                        parsed.kline.worker.interval_seconds.end()),
+            parsed.kline.worker.interval_seconds.end());
+        parsed.clickhouse_kline.endpoint = parsed.clickhouse.endpoint;
+        parsed.clickhouse_kline.database = parsed.clickhouse.database;
+        parsed.clickhouse_kline.username = parsed.clickhouse.username;
+        parsed.clickhouse_kline.password = parsed.clickhouse.password;
+        parsed.clickhouse_kline.no_proxy = parsed.clickhouse.no_proxy;
+        parsed.clickhouse_kline.connect_timeout_ms =
+            parsed.clickhouse.connect_timeout_ms;
+        parsed.clickhouse_kline.request_timeout_ms =
+            parsed.clickhouse.request_timeout_ms;
+        parsed.clickhouse_kline.retry_initial_backoff_ms =
+            parsed.clickhouse.retry_initial_backoff_ms;
+        parsed.clickhouse_kline.retry_max_backoff_ms =
+            parsed.clickhouse.retry_max_backoff_ms;
+        parsed.clickhouse_kline.maximum_retry_elapsed_ms =
+            parsed.clickhouse.maximum_retry_elapsed_ms;
+        parsed.clickhouse_kline.shutdown_timeout_ms =
+            parsed.clickhouse.shutdown_timeout_ms;
+        parsed.clickhouse_kline.insert_quorum = parsed.clickhouse.insert_quorum;
+        parsed.clickhouse_kline.insert_quorum_parallel =
+            parsed.clickhouse.insert_quorum_parallel;
+        parsed.clickhouse_kline.ensure_local_tables =
+            parsed.clickhouse.ensure_local_tables;
+        parsed.clickhouse_kline.tls_verify_peer =
+            parsed.clickhouse.tls_verify_peer;
+    }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     const bool arrow_enabled = !parsed.arrow_ring_directory.empty();
@@ -911,6 +1104,15 @@ void PrintUsage() {
                 arrow_config, error)) {
             return false;
         }
+    }
+#endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW) && \
+    defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (parsed.clickhouse_enabled && arrow_enabled &&
+        parsed.clickhouse.feed_session_epoch !=
+            parsed.arrow_feed_session_epoch) {
+        *error = "--clickhouse-feed-epoch and --arrow-feed-epoch must match";
+        return false;
     }
 #endif
 #if defined(__linux__)
@@ -1318,39 +1520,43 @@ int main(int argc, char** argv) {
         std::max<std::size_t>(
             8U, (options.channels + options.tick_lanes - 1U) /
                     options.tick_lanes + 4U);
-    config.reorder_entries_per_channel = 256U;
-    config.maximum_reorder_span = 255U;
+    // Exercise the requested 4,096 x 64 per-Channel sequence window.
+    config.reorder_entries_per_channel = 4'096U * 64U;
+    config.maximum_reorder_span = 4'096U * 64U;
     config.from_open_gap_wait_ns = options.gap_wait_ns;
     config.first_decoder_cpu = options.first_decoder_cpu;
     constexpr MessageKey kBenchmarkStream{4U, 101U, 24U};
     config.enabled_streams = StreamBit(kBenchmarkStream);
 
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-    std::filesystem::path event_journal_path;
-    std::unique_ptr<EventJournalFileCleanup> event_journal_cleanup;
-    std::shared_ptr<l2flow::journal::CanonicalFactJournal>
-        event_fact_journal;
+    std::filesystem::path fact_journal_path;
+    std::unique_ptr<EventJournalFileCleanup> fact_journal_cleanup;
+    std::shared_ptr<l2flow::journal::CanonicalFactJournal> fact_journal;
     std::unique_ptr<l2flow::clickhouse::EventClickHouseSink>
         clickhouse_event;
     std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
-    bool event_journal_shared_by_all_owners = true;
-    if (options.event_enabled) {
+    std::unique_ptr<l2flow::clickhouse::KLineClickHouseSink>
+        clickhouse_kline;
+    std::unique_ptr<l2flow::kline::KLineRuntime> kline_runtime;
+    RawTickBatchAckFanout raw_ack_fanout;
+    bool fact_journal_shared_by_all_owners = true;
+    if (options.event_enabled || options.kline_enabled) {
         if (total_count >
             (std::numeric_limits<std::uint64_t>::max() -
              l2flow::journal::kFactJournalFileHeaderBytes) /
                 l2flow::journal::kFactJournalRecordBytes) {
-            std::cerr << "Event journal byte size overflows uint64_t\n";
+            std::cerr << "FactJournal byte size overflows uint64_t\n";
             return 2;
         }
         std::error_code filesystem_error;
         std::filesystem::path journal_directory =
-            options.event_journal_directory;
+            options.fact_journal_directory;
         if (journal_directory.empty()) {
             journal_directory = std::filesystem::temp_directory_path(
                 filesystem_error);
         }
         if (filesystem_error || journal_directory.empty()) {
-            std::cerr << "cannot resolve Event journal directory: "
+            std::cerr << "cannot resolve FactJournal directory: "
                       << filesystem_error.message() << '\n';
             return 2;
         }
@@ -1360,36 +1566,38 @@ int main(int argc, char** argv) {
             !std::filesystem::is_directory(
                 journal_directory, filesystem_error) ||
             filesystem_error) {
-            std::cerr << "cannot create Event journal directory: "
+            std::cerr << "cannot create FactJournal directory: "
                       << filesystem_error.message() << '\n';
             return 2;
         }
-        event_journal_path = MakeUniqueEventJournalPath(
+        fact_journal_path = MakeUniqueEventJournalPath(
             journal_directory, &error);
-        if (event_journal_path.empty()) {
-            std::cerr << "Event journal path creation failed: " << error
+        if (fact_journal_path.empty()) {
+            std::cerr << "FactJournal path creation failed: " << error
                       << '\n';
             return 2;
         }
-        event_journal_cleanup =
-            std::make_unique<EventJournalFileCleanup>(event_journal_path);
+        fact_journal_cleanup =
+            std::make_unique<EventJournalFileCleanup>(fact_journal_path);
         l2flow::journal::FactJournalConfig journal_config{};
         journal_config.trade_date = config.trade_date;
-        journal_config.path = event_journal_path;
+        journal_config.path = fact_journal_path;
         journal_config.maximum_records = total_count;
         std::unique_ptr<l2flow::journal::CanonicalFactJournal>
             created_journal =
                 l2flow::journal::CanonicalFactJournal::Create(
                     std::move(journal_config), &error);
         if (created_journal == nullptr) {
-            std::cerr << "Event FactJournal creation failed: " << error
+            std::cerr << "FactJournal creation failed: " << error
                       << '\n';
             return 1;
         }
-        event_fact_journal = std::shared_ptr<
+        fact_journal = std::shared_ptr<
             l2flow::journal::CanonicalFactJournal>(
                 std::move(created_journal));
+    }
 
+    if (options.event_enabled) {
         options.event.worker.trade_date = config.trade_date;
         options.event.feed_session_epoch = config.feed_session_epoch;
         options.event.worker.feed_session_epoch =
@@ -1405,7 +1613,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         l2flow::event::EventRuntimeConfig event_config = options.event;
-        event_config.worker.fact_journal = event_fact_journal;
+        event_config.worker.fact_journal = fact_journal;
         if (!l2flow::event::ValidateEventRuntimeConfig(
                 event_config, &error) ||
             !l2flow::clickhouse::ValidateEventClickHouseConfig(
@@ -1428,38 +1636,102 @@ int main(int argc, char** argv) {
             std::cerr << "Event runtime creation failed: " << error << '\n';
             return 1;
         }
-        event_journal_shared_by_all_owners =
+        fact_journal_shared_by_all_owners =
             event_runtime->config().worker.fact_journal ==
-            event_fact_journal;
+            fact_journal;
         for (std::size_t owner = 0U;
              owner < options.instrument_owners; ++owner) {
             const l2flow::event::EventWorker* const worker =
                 event_runtime->worker(owner);
-            event_journal_shared_by_all_owners =
-                event_journal_shared_by_all_owners && worker != nullptr &&
-                worker->config().fact_journal == event_fact_journal;
+            fact_journal_shared_by_all_owners =
+                fact_journal_shared_by_all_owners && worker != nullptr &&
+                worker->config().fact_journal == fact_journal;
         }
-        options.clickhouse.tick_ack_listener = event_runtime.get();
+    }
 
+    if (options.kline_enabled) {
+        options.kline.worker.trade_date = config.trade_date;
+        options.kline.feed_session_epoch = config.feed_session_epoch;
+        options.kline.worker.feed_session_epoch = config.feed_session_epoch;
+        options.kline.worker.owner_count =
+            static_cast<std::uint32_t>(options.instrument_owners);
+        options.kline.worker.revision_epoch = 2U;
+        options.kline.worker.logic_version = 1U;
+        if (!l2flow::clickhouse::ParseIdentifier(
+                "00000000000000000000000000000002",
+                &options.kline.worker.calculation_run_id)) {
+            std::cerr << "failed to initialize KLine calculation run ID\n";
+            return 2;
+        }
+        l2flow::kline::KLineRuntimeConfig kline_config = options.kline;
+        kline_config.worker.fact_journal = fact_journal;
+        if (!l2flow::kline::ValidateKLineRuntimeConfig(
+                kline_config, &error) ||
+            !l2flow::clickhouse::ValidateKLineClickHouseConfig(
+                options.clickhouse_kline, &error)) {
+            std::cerr << "KLine benchmark configuration invalid: "
+                      << error << '\n';
+            return 2;
+        }
+        clickhouse_kline =
+            l2flow::clickhouse::KLineClickHouseSink::Create(
+                options.clickhouse_kline, &error);
+        if (clickhouse_kline == nullptr) {
+            std::cerr << "ClickHouse KLine sink creation failed: "
+                      << error << '\n';
+            return 1;
+        }
+        kline_runtime = l2flow::kline::KLineRuntime::Create(
+            std::move(kline_config), clickhouse_kline.get(), &error);
+        if (kline_runtime == nullptr) {
+            std::cerr << "KLine runtime creation failed: " << error << '\n';
+            return 1;
+        }
+        fact_journal_shared_by_all_owners =
+            fact_journal_shared_by_all_owners &&
+            kline_runtime->config().worker.fact_journal == fact_journal;
+        for (std::size_t owner = 0U;
+             owner < options.instrument_owners; ++owner) {
+            const l2flow::kline::KLineWorker* const worker =
+                kline_runtime->worker(owner);
+            fact_journal_shared_by_all_owners =
+                fact_journal_shared_by_all_owners && worker != nullptr &&
+                worker->config().fact_journal == fact_journal;
+        }
+    }
+
+    if (event_runtime != nullptr || kline_runtime != nullptr) {
+        raw_ack_fanout.Configure(event_runtime.get(), kline_runtime.get());
+        options.clickhouse.tick_ack_listener = &raw_ack_fanout;
+    }
+
+    if (options.event_enabled) {
         if (options.event_construction_smoke) {
             const bool runtime_healthy = event_runtime->healthy();
             const bool sink_healthy = clickhouse_event->healthy();
-            const bool journal_flushed = event_fact_journal->Flush();
+            const bool kline_runtime_healthy =
+                kline_runtime == nullptr || kline_runtime->healthy();
+            const bool kline_sink_healthy =
+                clickhouse_kline == nullptr || clickhouse_kline->healthy();
+            const bool journal_flushed = fact_journal->Flush();
             const l2flow::journal::FactJournalStats journal_stats =
-                event_fact_journal->stats();
-            const bool journal_healthy = event_fact_journal->healthy();
+                fact_journal->stats();
+            const bool journal_healthy = fact_journal->healthy();
             std::error_code file_size_error;
             const std::uintmax_t observed_file_bytes =
                 std::filesystem::file_size(
-                    event_journal_path, file_size_error);
+                    fact_journal_path, file_size_error);
             event_runtime.reset();
+            kline_runtime.reset();
             clickhouse_event.reset();
-            event_fact_journal.reset();
+            clickhouse_kline.reset();
+            fact_journal.reset();
             std::error_code cleanup_error;
             const bool cleanup_ok =
-                event_journal_cleanup->Remove(&cleanup_error);
+                fact_journal_cleanup->Remove(&cleanup_error);
             const bool valid = runtime_healthy && sink_healthy &&
-                event_journal_shared_by_all_owners && journal_flushed &&
+                kline_runtime_healthy && kline_sink_healthy &&
+                fact_journal_shared_by_all_owners && journal_flushed &&
                 journal_healthy && journal_stats.records == 0U &&
                 journal_stats.file_bytes ==
                     l2flow::journal::kFactJournalFileHeaderBytes &&
@@ -1478,7 +1750,7 @@ int main(int argc, char** argv) {
                 cleanup_ok;
             std::cout
                 << "event_construction_smoke shared_journal="
-                << (event_journal_shared_by_all_owners ? "true" : "false")
+                << (fact_journal_shared_by_all_owners ? "true" : "false")
                 << " records=" << journal_stats.records
                 << " file_bytes=" << journal_stats.file_bytes
                 << " observed_file_bytes=" << observed_file_bytes
@@ -1490,10 +1762,14 @@ int main(int argc, char** argv) {
                 << " journal_healthy="
                 << (journal_healthy ? "true" : "false")
                 << " sink_healthy=" << (sink_healthy ? "true" : "false")
+                << " kline_runtime_healthy="
+                << (kline_runtime_healthy ? "true" : "false")
+                << " kline_sink_healthy="
+                << (kline_sink_healthy ? "true" : "false")
                 << " cleanup=" << (cleanup_ok ? "removed" : "failed")
                 << " status=" << (valid ? "PASS" : "FAIL") << '\n';
             if (!cleanup_ok) {
-                std::cerr << "Event FactJournal cleanup failed: "
+                std::cerr << "FactJournal cleanup failed: "
                           << cleanup_error.message() << '\n';
             }
             return valid ? 0 : 1;
@@ -1605,11 +1881,47 @@ int main(int argc, char** argv) {
             << " writer_lanes=" << options.clickhouse_event.writer_lanes
             << '\n';
     }
+    if (clickhouse_kline != nullptr) {
+        if (!clickhouse_kline->Start(&error)) {
+            if (clickhouse_event != nullptr) {
+                std::string event_stop_error;
+                static_cast<void>(clickhouse_event->Stop(&event_stop_error));
+            }
+            std::cerr << "ClickHouse KLine sink start failed: "
+                      << error << '\n';
+            return 1;
+        }
+        std::cout
+            << "clickhouse_kline_writer_instance="
+            << l2flow::clickhouse::IdentifierString(
+                   clickhouse_kline->writer_instance_id())
+            << " calculation_run_id="
+            << l2flow::clickhouse::IdentifierString(
+                   options.kline.worker.calculation_run_id)
+            << " intervals=" << options.kline.worker.interval_seconds.size()
+            << " micro_batch_rows=" << options.kline.micro_batch_rows
+            << " micro_batch_max_delay_ns="
+            << options.kline.micro_batch_max_delay_ns
+            << " insert_request_max_rows="
+            << options.clickhouse_kline.insert_request_max_rows
+            << " insert_request_max_bytes="
+            << options.clickhouse_kline.insert_request_max_bytes
+            << " physical_group_max_batches="
+            << options.clickhouse_kline.physical_group_max_batches
+            << " physical_group_max_delay_ns="
+            << options.clickhouse_kline.physical_group_max_delay_ns
+            << " writer_lanes=" << options.clickhouse_kline.writer_lanes
+            << '\n';
+    }
     if (clickhouse_raw != nullptr) {
         if (!clickhouse_raw->Start(&error)) {
             if (clickhouse_event != nullptr) {
                 std::string event_stop_error;
                 static_cast<void>(clickhouse_event->Stop(&event_stop_error));
+            }
+            if (clickhouse_kline != nullptr) {
+                std::string kline_stop_error;
+                static_cast<void>(clickhouse_kline->Stop(&kline_stop_error));
             }
             std::cerr << "ClickHouse raw sink start failed: "
                       << error << '\n';
@@ -1638,6 +1950,14 @@ int main(int argc, char** argv) {
             std::string stop_error;
             static_cast<void>(clickhouse_raw->Stop(&stop_error));
         }
+        if (clickhouse_event != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_event->Stop(&stop_error));
+        }
+        if (clickhouse_kline != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_kline->Stop(&stop_error));
+        }
 #endif
         std::cerr << error << '\n';
         return 2;
@@ -1647,6 +1967,14 @@ int main(int argc, char** argv) {
         if (clickhouse_raw != nullptr) {
             std::string stop_error;
             static_cast<void>(clickhouse_raw->Stop(&stop_error));
+        }
+        if (clickhouse_event != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_event->Stop(&stop_error));
+        }
+        if (clickhouse_kline != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_kline->Stop(&stop_error));
         }
 #endif
         std::cerr << error << '\n';
@@ -1856,7 +2184,15 @@ int main(int argc, char** argv) {
 #endif
             while (local_consumed < total_per_channel &&
                    !abort.load(std::memory_order_acquire)) {
-                if (!engine->TryPollTickDispatch(owner, &dispatch)) {
+                const bool can_poll_dispatch =
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                    event_runtime == nullptr ||
+                    event_runtime->CanPollDispatch(owner);
+#else
+                    true;
+#endif
+                if (!can_poll_dispatch ||
+                    !engine->TryPollTickDispatch(owner, &dispatch)) {
                     ++idle_spins;
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
                     if (arrow_egress != nullptr) {
@@ -1880,6 +2216,23 @@ int main(int argc, char** argv) {
                             state.error =
                                 "Event worker flush failed: " +
                                 event_runtime->fatal_error();
+                            abort.store(true, std::memory_order_release);
+                            break;
+                        }
+                        const std::uint64_t operation_finish_ns =
+                            MonotonicNowNs();
+                        RecordMaximumElapsed(
+                            operation_start_ns, operation_finish_ns,
+                            &state.maximum_sink_operation_ns);
+                    }
+                    if (kline_runtime != nullptr) {
+                        const std::uint64_t operation_start_ns =
+                            MonotonicNowNs();
+                        if (!kline_runtime->FlushDue(
+                                owner, operation_start_ns)) {
+                            state.error =
+                                "KLine worker flush failed: " +
+                                kline_runtime->fatal_error();
                             abort.store(true, std::memory_order_release);
                             break;
                         }
@@ -1953,6 +2306,22 @@ int main(int argc, char** argv) {
                         operation_start_ns, operation_finish_ns,
                         &state.maximum_sink_operation_ns);
                 }
+                if (kline_runtime != nullptr) {
+                    const std::uint64_t operation_start_ns =
+                        MonotonicNowNs();
+                    if (!kline_runtime->AppendDispatch(owner, dispatch)) {
+                        state.error =
+                            "KLine worker append failed: " +
+                            kline_runtime->fatal_error();
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                    const std::uint64_t operation_finish_ns =
+                        MonotonicNowNs();
+                    RecordMaximumElapsed(
+                        operation_start_ns, operation_finish_ns,
+                        &state.maximum_sink_operation_ns);
+                }
 #endif
                 if (tick.common.native_sequence > warmup_per_channel) {
                     const std::uint64_t now = MonotonicNowNs();
@@ -1989,6 +2358,11 @@ int main(int argc, char** argv) {
             if (event_runtime != nullptr && !event_runtime->Flush(owner)) {
                 state.error = "Event worker final flush failed: " +
                     event_runtime->fatal_error();
+                abort.store(true, std::memory_order_release);
+            }
+            if (kline_runtime != nullptr && !kline_runtime->Flush(owner)) {
+                state.error = "KLine worker final flush failed: " +
+                    kline_runtime->fatal_error();
                 abort.store(true, std::memory_order_release);
             }
             state.measured = measured_index;
@@ -2037,6 +2411,9 @@ int main(int argc, char** argv) {
         if (event_runtime != nullptr) {
             static_cast<void>(event_runtime->FlushAll());
         }
+        if (kline_runtime != nullptr) {
+            static_cast<void>(kline_runtime->FlushAll());
+        }
         if (clickhouse_raw != nullptr) {
             std::string stop_error;
             if (!clickhouse_raw->Stop(&stop_error)) {
@@ -2047,9 +2424,16 @@ int main(int argc, char** argv) {
         if (event_runtime != nullptr) {
             static_cast<void>(event_runtime->DrainAll());
         }
+        if (kline_runtime != nullptr) {
+            static_cast<void>(kline_runtime->DrainAll());
+        }
         if (clickhouse_event != nullptr) {
             std::string stop_error;
             static_cast<void>(clickhouse_event->Stop(&stop_error));
+        }
+        if (clickhouse_kline != nullptr) {
+            std::string stop_error;
+            static_cast<void>(clickhouse_kline->Stop(&stop_error));
         }
 #endif
         return 1;
@@ -2107,17 +2491,18 @@ int main(int argc, char** argv) {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     l2flow::clickhouse::RawClickHouseStats
         clickhouse_measurement_end_stats{};
-    l2flow::event::EventRuntimeStats event_measurement_end_stats{};
     l2flow::clickhouse::EventClickHouseStats
         event_measurement_event_stats{};
+    l2flow::clickhouse::KLineClickHouseStats
+        kline_measurement_sink_stats{};
     if (clickhouse_raw != nullptr) {
         clickhouse_measurement_end_stats = clickhouse_raw->stats();
     }
-    if (event_runtime != nullptr) {
-        event_measurement_end_stats = event_runtime->stats();
-    }
     if (clickhouse_event != nullptr) {
         event_measurement_event_stats = clickhouse_event->stats();
+    }
+    if (clickhouse_kline != nullptr) {
+        kline_measurement_sink_stats = clickhouse_kline->stats();
     }
 #endif
 
@@ -2178,6 +2563,17 @@ int main(int argc, char** argv) {
     const bool event_runtime_created = event_runtime != nullptr;
     bool event_runtime_healthy = true;
     std::string event_runtime_fatal;
+    bool kline_flush_ok = true;
+    bool kline_drain_ok = true;
+    bool kline_stop_ok = true;
+    std::string kline_stop_error;
+    std::uint64_t kline_stop_start_ns = 0U;
+    std::uint64_t kline_stop_finish_ns = 0U;
+    l2flow::kline::KLineRuntimeStats kline_final_runtime_stats{};
+    l2flow::clickhouse::KLineClickHouseStats kline_final_stats{};
+    const bool kline_runtime_created = kline_runtime != nullptr;
+    bool kline_runtime_healthy = true;
+    std::string kline_runtime_fatal;
     bool event_journal_flush_ok = true;
     std::uint64_t event_journal_flush_start_ns = 0U;
     std::uint64_t event_journal_flush_finish_ns = 0U;
@@ -2194,6 +2590,9 @@ int main(int argc, char** argv) {
         // ACKs can release already-created immutable Event batches.
         event_flush_ok = event_runtime->FlushAll();
     }
+    if (kline_runtime != nullptr) {
+        kline_flush_ok = kline_runtime->FlushAll();
+    }
     if (clickhouse_raw != nullptr) {
         clickhouse_stop_start_ns = MonotonicNowNs();
         clickhouse_stop_ok =
@@ -2205,30 +2604,45 @@ int main(int argc, char** argv) {
         event_drain_ok = event_runtime->DrainAll();
         event_final_runtime_stats = event_runtime->stats();
     }
+    if (kline_runtime != nullptr) {
+        kline_drain_ok = kline_runtime->DrainAll();
+        kline_final_runtime_stats = kline_runtime->stats();
+    }
     if (clickhouse_event != nullptr) {
         event_stop_start_ns = MonotonicNowNs();
         event_stop_ok = clickhouse_event->Stop(&event_stop_error);
         event_stop_finish_ns = MonotonicNowNs();
         event_final_stats = clickhouse_event->stats();
     }
+    if (clickhouse_kline != nullptr) {
+        kline_stop_start_ns = MonotonicNowNs();
+        kline_stop_ok = clickhouse_kline->Stop(&kline_stop_error);
+        kline_stop_finish_ns = MonotonicNowNs();
+        kline_final_stats = clickhouse_kline->stats();
+    }
     if (event_runtime != nullptr) {
         event_runtime_healthy = event_runtime->healthy();
         event_runtime_fatal = event_runtime->fatal_error();
         event_runtime.reset();
     }
-    if (event_fact_journal != nullptr) {
+    if (kline_runtime != nullptr) {
+        kline_runtime_healthy = kline_runtime->healthy();
+        kline_runtime_fatal = kline_runtime->fatal_error();
+        kline_runtime.reset();
+    }
+    if (fact_journal != nullptr) {
         event_journal_flush_start_ns = MonotonicNowNs();
-        event_journal_flush_ok = event_fact_journal->Flush();
+        event_journal_flush_ok = fact_journal->Flush();
         event_journal_flush_finish_ns = MonotonicNowNs();
-        event_journal_stats = event_fact_journal->stats();
-        event_journal_healthy = event_fact_journal->healthy();
-        event_journal_fatal = event_fact_journal->fatal_error();
+        event_journal_stats = fact_journal->stats();
+        event_journal_healthy = fact_journal->healthy();
+        event_journal_fatal = fact_journal->fatal_error();
         event_journal_observed_file_bytes = std::filesystem::file_size(
-            event_journal_path, event_journal_file_size_error);
-        event_fact_journal.reset();
-        event_journal_cleanup_ok = event_journal_cleanup != nullptr &&
-            event_journal_cleanup->Remove(&event_journal_cleanup_error);
-    } else if (options.event_enabled) {
+            fact_journal_path, event_journal_file_size_error);
+        fact_journal.reset();
+        event_journal_cleanup_ok = fact_journal_cleanup != nullptr &&
+            fact_journal_cleanup->Remove(&event_journal_cleanup_error);
+    } else if (options.event_enabled || options.kline_enabled) {
         event_journal_flush_ok = false;
         event_journal_healthy = false;
         event_journal_cleanup_ok = false;
@@ -2459,14 +2873,16 @@ int main(int argc, char** argv) {
     const std::uint64_t expected_event_journal_file_bytes =
         expected_event_journal_record_bytes +
         l2flow::journal::kFactJournalFileHeaderBytes;
-    bool event_valid = true;
-    if (options.event_enabled) {
-        event_valid = event_flush_ok && event_drain_ok && event_stop_ok &&
-            event_runtime_created && event_runtime_healthy &&
-            clickhouse_event != nullptr && clickhouse_event->healthy() &&
-            event_journal_shared_by_all_owners && event_journal_flush_ok &&
-            event_journal_healthy && event_journal_cleanup_ok &&
-            !event_journal_file_size_error &&
+    const std::uint64_t derived_consumer_count =
+        static_cast<std::uint64_t>(options.event_enabled) +
+        static_cast<std::uint64_t>(options.kline_enabled);
+    const std::uint64_t expected_consumer_new =
+        total_count * derived_consumer_count;
+    bool fact_journal_valid = true;
+    if (derived_consumer_count != 0U) {
+        fact_journal_valid = fact_journal_shared_by_all_owners &&
+            event_journal_flush_ok && event_journal_healthy &&
+            event_journal_cleanup_ok && !event_journal_file_size_error &&
             event_journal_stats.records == total_count &&
             event_journal_stats.record_bytes ==
                 expected_event_journal_record_bytes &&
@@ -2476,7 +2892,7 @@ int main(int argc, char** argv) {
                 expected_event_journal_file_bytes &&
             event_journal_observed_file_bytes ==
                 expected_event_journal_file_bytes &&
-            event_journal_stats.consumer_new == total_count &&
+            event_journal_stats.consumer_new == expected_consumer_new &&
             event_journal_stats.duplicates == 0U &&
             event_journal_stats.conflicts == 0U &&
             event_journal_stats.partial_writes == 0U &&
@@ -2486,7 +2902,14 @@ int main(int argc, char** argv) {
             event_journal_stats.reserved_records == 0U &&
             event_journal_stats.waiting_admissions == 0U &&
             event_journal_stats.errors == 0U &&
-            event_journal_stats.flush_calls >= 1U &&
+            event_journal_stats.flush_calls >= 1U;
+    }
+    bool event_valid = true;
+    if (options.event_enabled) {
+        event_valid = event_flush_ok && event_drain_ok && event_stop_ok &&
+            event_runtime_created && event_runtime_healthy &&
+            clickhouse_event != nullptr && clickhouse_event->healthy() &&
+            fact_journal_valid &&
             event_final_runtime_stats.ordered_dispositions_received ==
                 total_count &&
             event_final_runtime_stats.hole_fill_dispositions_received == 0U &&
@@ -2507,6 +2930,74 @@ int main(int argc, char** argv) {
             event_final_stats.retry_attempts == 0U &&
             event_final_stats.unknown_outcomes == 0U &&
             event_revision_ack_rate >= minimum_pass_rate;
+    }
+    const double kline_processing_seconds =
+        !options.kline_enabled || first_measured_callback_ns == 0U ||
+                dispatch_finish_ns <= first_measured_callback_ns
+            ? 0.0
+            : static_cast<double>(dispatch_finish_ns -
+                                  first_measured_callback_ns) /
+                  1'000'000'000.0;
+    const std::uint64_t kline_measured_facts =
+        kline_final_runtime_stats.workers.facts_journaled > warmup_count
+            ? kline_final_runtime_stats.workers.facts_journaled - warmup_count
+            : 0U;
+    const double kline_worker_rate = kline_processing_seconds == 0.0
+        ? 0.0
+        : static_cast<double>(kline_measured_facts) /
+              kline_processing_seconds;
+    const double kline_sink_seconds =
+        !options.kline_enabled || kline_stop_finish_ns <= schedule_origin_ns
+            ? 0.0
+            : static_cast<double>(kline_stop_finish_ns - schedule_origin_ns) /
+                  1'000'000'000.0;
+    const double kline_revision_ack_rate = kline_sink_seconds == 0.0
+        ? 0.0
+        : static_cast<double>(kline_final_stats.revision_rows_acked) /
+              kline_sink_seconds;
+    const double kline_measurement_ack_rate =
+        clickhouse_measurement_seconds == 0.0
+            ? 0.0
+            : static_cast<double>(
+                  kline_measurement_sink_stats.revision_rows_acked) /
+                  clickhouse_measurement_seconds;
+    const std::uint64_t kline_revision_lag_rows =
+        kline_measurement_sink_stats.revision_rows_queued >=
+                kline_measurement_sink_stats.revision_rows_acked
+            ? kline_measurement_sink_stats.revision_rows_queued -
+                  kline_measurement_sink_stats.revision_rows_acked
+            : 0U;
+    bool kline_valid = true;
+    if (options.kline_enabled) {
+        kline_valid = kline_flush_ok && kline_drain_ok && kline_stop_ok &&
+            kline_runtime_created && kline_runtime_healthy &&
+            clickhouse_kline != nullptr && clickhouse_kline->healthy() &&
+            fact_journal_valid &&
+            kline_final_runtime_stats.ordered_dispositions_received ==
+                total_count &&
+            kline_final_runtime_stats.hole_fill_dispositions_received == 0U &&
+            kline_final_runtime_stats.rejected_dispositions_received == 0U &&
+            kline_final_runtime_stats.occurrence_join_entries == 0U &&
+            kline_final_runtime_stats.workers.facts_journaled == total_count &&
+            kline_final_runtime_stats.workers.trades_projected == total_count &&
+            kline_final_runtime_stats.raw_tick_acks_received == total_count &&
+            kline_final_runtime_stats.invalid_inputs == 0U &&
+            kline_final_runtime_stats.workers.invalid_facts == 0U &&
+            kline_final_runtime_stats.workers
+                    .invalid_trade_exchange_times == 0U &&
+            kline_final_runtime_stats.workers.pending_raw_commits == 0U &&
+            kline_final_stats.revision_rows_acked ==
+                kline_final_runtime_stats.workers.revisions_created &&
+            kline_final_stats.revision_batches_queued ==
+                kline_final_stats.revision_batches_acked &&
+            kline_final_stats.revision_batches_acked ==
+                kline_final_stats.revision_batches_released &&
+            kline_final_stats.revision_rows_queued ==
+                kline_final_stats.revision_rows_acked &&
+            kline_final_stats.queued_revision_batches == 0U &&
+            kline_final_stats.queued_revision_rows == 0U &&
+            kline_final_stats.retry_attempts == 0U &&
+            kline_final_stats.unknown_outcomes == 0U;
     }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -2570,6 +3061,9 @@ int main(int argc, char** argv) {
     if (options.event_enabled) {
         valid = valid && event_valid && event_worker_rate >= minimum_pass_rate;
     }
+    if (options.kline_enabled) {
+        valid = valid && kline_valid && kline_worker_rate >= minimum_pass_rate;
+    }
 #endif
 
     const auto to_us = [](std::uint64_t nanoseconds) {
@@ -2592,6 +3086,9 @@ int main(int argc, char** argv) {
               << options.dispatch_queue_capacity
               << " pattern=" << PatternName(options.pattern)
               << " reorder_window=" << options.reorder_window
+              << " sequence_entries_per_channel="
+              << config.reorder_entries_per_channel
+              << " maximum_reorder_span=" << config.maximum_reorder_span
               << " latency_sample_every="
               << options.latency_sample_every
               << " gap_wait_ns=" << options.gap_wait_ns << '\n'
@@ -2904,12 +3401,106 @@ int main(int argc, char** argv) {
                          : 0U) /
                    1'000.0
             << " healthy="
-            << (clickhouse_event->healthy() ? "true" : "false") << '\n'
-            << "event_journal path=" << event_journal_path.string()
+            << (clickhouse_event->healthy() ? "true" : "false") << '\n';
+    }
+    if (options.kline_enabled) {
+        std::cout
+            << "kline_config enabled=true intervals="
+            << options.kline.worker.interval_seconds.size()
+            << " micro_batch_rows=" << options.kline.micro_batch_rows
+            << " micro_batch_max_delay_ns="
+            << options.kline.micro_batch_max_delay_ns
+            << " insert_request_max_rows="
+            << options.clickhouse_kline.insert_request_max_rows
+            << " insert_request_max_bytes="
+            << options.clickhouse_kline.insert_request_max_bytes
+            << " physical_group_max_batches="
+            << options.clickhouse_kline.physical_group_max_batches
+            << " physical_group_max_delay_ns="
+            << options.clickhouse_kline.physical_group_max_delay_ns
+            << " writer_lanes=" << options.clickhouse_kline.writer_lanes
+            << " calculation_run_id="
+            << l2flow::clickhouse::IdentifierString(
+                   options.kline.worker.calculation_run_id) << '\n'
+            << "kline_throughput worker_facts_msg_s=" << kline_worker_rate
+            << " kline_revision_rows_ack_msg_s=" << kline_revision_ack_rate
+            << " measurement_revision_ack_msg_s="
+            << kline_measurement_ack_rate
+            << " processing_seconds=" << kline_processing_seconds
+            << " sink_seconds=" << kline_sink_seconds
+            << " revision_rows_per_callback="
+            << (kline_final_runtime_stats.workers.facts_journaled == 0U
+                    ? 0.0
+                    : static_cast<double>(
+                          kline_final_runtime_stats.workers.revisions_created) /
+                          static_cast<double>(
+                              kline_final_runtime_stats.workers.facts_journaled))
+            << '\n'
+            << "kline_final ordered_dispositions="
+            << kline_final_runtime_stats.ordered_dispositions_received
+            << " occurrence_join_entries="
+            << kline_final_runtime_stats.occurrence_join_entries
+            << " raw_tick_acks="
+            << kline_final_runtime_stats.raw_tick_acks_received
+            << " facts_journaled="
+            << kline_final_runtime_stats.workers.facts_journaled
+            << " trades_projected="
+            << kline_final_runtime_stats.workers.trades_projected
+            << " bars_created="
+            << kline_final_runtime_stats.workers.bars_created
+            << " bars_updated="
+            << kline_final_runtime_stats.workers.bars_updated
+            << " revisions_created="
+            << kline_final_runtime_stats.workers.revisions_created
+            << " micro_batches="
+            << kline_final_runtime_stats.micro_batches_applied
+            << " pending_raw_commits="
+            << kline_final_runtime_stats.workers.pending_raw_commits
+            << " invalid_inputs=" << kline_final_runtime_stats.invalid_inputs
+            << " invalid_trade_times="
+            << kline_final_runtime_stats.workers.invalid_trade_exchange_times
+            << '\n'
+            << "clickhouse_kline_final revision_rows_queued="
+            << kline_final_stats.revision_rows_queued
+            << " revision_rows_acked="
+            << kline_final_stats.revision_rows_acked
+            << " revision_batches_queued="
+            << kline_final_stats.revision_batches_queued
+            << " revision_batches_acked="
+            << kline_final_stats.revision_batches_acked
+            << " revision_batches_released="
+            << kline_final_stats.revision_batches_released
+            << " physical_groups="
+            << kline_final_stats.physical_groups_committed
+            << " revision_insert_requests="
+            << kline_final_stats.revision_insert_requests_acked
+            << " marker_insert_requests="
+            << kline_final_stats.marker_insert_requests_acked
+            << " recovery_runs_committed="
+            << kline_final_stats.recovery_runs_committed
+            << " retries=" << kline_final_stats.retry_attempts
+            << " unknown_outcomes=" << kline_final_stats.unknown_outcomes
+            << " queued_rows_at_measurement_end="
+            << kline_revision_lag_rows
+            << " queued_rows_hwm="
+            << kline_final_stats.queued_revision_rows_high_water
+            << " bytes_sent=" << kline_final_stats.bytes_sent
+            << " stop_drain_ms="
+            << to_us(kline_stop_finish_ns >= kline_stop_start_ns
+                         ? kline_stop_finish_ns - kline_stop_start_ns
+                         : 0U) /
+                   1'000.0
+            << " healthy="
+            << (clickhouse_kline->healthy() ? "true" : "false") << '\n';
+    }
+    if (options.event_enabled || options.kline_enabled) {
+        std::cout
+            << "fact_journal path=" << fact_journal_path.string()
             << " shared_by_all_owners="
-            << (event_journal_shared_by_all_owners ? "true" : "false")
+            << (fact_journal_shared_by_all_owners ? "true" : "false")
             << " records=" << event_journal_stats.records
             << " consumer_new=" << event_journal_stats.consumer_new
+            << " expected_consumer_new=" << expected_consumer_new
             << " record_bytes=" << event_journal_stats.record_bytes
             << " file_bytes=" << event_journal_stats.file_bytes
             << " observed_file_bytes="
@@ -2935,7 +3526,8 @@ int main(int argc, char** argv) {
                          : 0U) /
                    1'000.0
             << " runtime_healthy="
-            << (event_runtime_healthy ? "true" : "false")
+            << ((event_runtime_healthy && kline_runtime_healthy)
+                    ? "true" : "false")
             << " journal_healthy="
             << (event_journal_healthy ? "true" : "false")
             << " cleanup="
@@ -2962,9 +3554,7 @@ int main(int argc, char** argv) {
     if (options.event_enabled &&
         (!event_flush_ok || !event_drain_ok || !event_stop_ok ||
          !event_runtime_created || !event_runtime_healthy ||
-         !event_journal_shared_by_all_owners ||
-         !event_journal_flush_ok || !event_journal_healthy ||
-         !event_journal_cleanup_ok || clickhouse_event == nullptr ||
+         !fact_journal_valid || clickhouse_event == nullptr ||
          !clickhouse_event->healthy())) {
         std::cerr << "Event path fatal: ";
         if (!event_stop_error.empty()) {
@@ -2975,13 +3565,37 @@ int main(int argc, char** argv) {
             std::cerr << event_runtime_fatal;
         } else if (!event_journal_fatal.empty()) {
             std::cerr << event_journal_fatal;
-        } else if (!event_journal_shared_by_all_owners) {
-            std::cerr << "Event owners do not share one FactJournal";
+        } else if (!fact_journal_shared_by_all_owners) {
+            std::cerr << "derived owners do not share one FactJournal";
         } else if (!event_journal_cleanup_ok) {
             std::cerr << "FactJournal cleanup failed: "
                       << event_journal_cleanup_error.message();
         } else {
             std::cerr << clickhouse_event->fatal_error();
+        }
+        std::cerr << '\n';
+    }
+    if (options.kline_enabled &&
+        (!kline_flush_ok || !kline_drain_ok || !kline_stop_ok ||
+         !kline_runtime_created || !kline_runtime_healthy ||
+         !fact_journal_valid || clickhouse_kline == nullptr ||
+         !clickhouse_kline->healthy())) {
+        std::cerr << "KLine path fatal: ";
+        if (!kline_stop_error.empty()) {
+            std::cerr << kline_stop_error;
+        } else if (!kline_runtime_created) {
+            std::cerr << "runtime unavailable";
+        } else if (!kline_runtime_fatal.empty()) {
+            std::cerr << kline_runtime_fatal;
+        } else if (!event_journal_fatal.empty()) {
+            std::cerr << event_journal_fatal;
+        } else if (!fact_journal_shared_by_all_owners) {
+            std::cerr << "derived owners do not share one FactJournal";
+        } else if (!event_journal_cleanup_ok) {
+            std::cerr << "FactJournal cleanup failed: "
+                      << event_journal_cleanup_error.message();
+        } else {
+            std::cerr << clickhouse_kline->fatal_error();
         }
         std::cerr << '\n';
     }

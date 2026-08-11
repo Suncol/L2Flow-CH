@@ -1,4 +1,5 @@
 #include "l2flow/kline/runtime.h"
+#include "l2flow/ingest/engine.h"
 
 #include <algorithm>
 #include <atomic>
@@ -259,8 +260,29 @@ struct AtomicRuntimeStats final {
     std::atomic<std::uint64_t> occurrence_rejections_resolved{0U};
     std::atomic<std::uint64_t> occurrence_duplicate_sides{0U};
     std::atomic<std::uint64_t> micro_batches_applied{0U};
+    std::atomic<std::uint64_t> facts_in_micro_batches{0U};
+    std::atomic<std::uint64_t> micro_batch_rows_max{0U};
+    std::atomic<std::uint64_t> micro_batch_source_age_ns_max{0U};
+    std::atomic<std::uint64_t> row_limit_flushes{0U};
+    std::atomic<std::uint64_t> timer_flushes{0U};
+    std::atomic<std::uint64_t> explicit_flushes{0U};
     std::atomic<std::uint64_t> source_conflicts{0U};
     std::atomic<std::uint64_t> invalid_inputs{0U};
+};
+
+void PublishMaximum(std::atomic<std::uint64_t>* target,
+                    std::uint64_t value) noexcept {
+    std::uint64_t current = target->load(std::memory_order_relaxed);
+    while (current < value &&
+           !target->compare_exchange_weak(
+               current, value, std::memory_order_relaxed)) {
+    }
+}
+
+enum class MicroBatchFlushReason : std::uint8_t {
+    kRowLimit = 0U,
+    kTimer,
+    kExplicit,
 };
 
 void AddWorkerStats(KLineWorkerStats* destination,
@@ -276,6 +298,14 @@ void AddWorkerStats(KLineWorkerStats* destination,
     destination->bars_updated += source.bars_updated;
     destination->revisions_created += source.revisions_created;
     destination->pending_raw_commits += source.pending_raw_commits;
+    destination->pending_revision_rows += source.pending_revision_rows;
+    destination->pending_revision_rows_high_watermark = std::max(
+        destination->pending_revision_rows_high_watermark,
+        source.pending_revision_rows_high_watermark);
+    destination->pending_revision_bytes += source.pending_revision_bytes;
+    destination->pending_revision_bytes_high_watermark = std::max(
+        destination->pending_revision_bytes_high_watermark,
+        source.pending_revision_bytes_high_watermark);
     destination->acknowledged_raw_dependencies +=
         source.acknowledged_raw_dependencies;
     destination->revision_batches_submitted +=
@@ -354,7 +384,7 @@ public:
             monotonic_ns >= state.active_started_ns &&
             monotonic_ns - state.active_started_ns >=
                 config_.micro_batch_max_delay_ns) {
-            return FlushActive(owner);
+            return FlushActive(owner, MicroBatchFlushReason::kTimer);
         }
         return ServiceWorker(owner);
     }
@@ -363,14 +393,25 @@ public:
         if (!ValidOwner(owner) || !healthy() || !DrainAckInbox(owner)) {
             return false;
         }
-        return FlushActive(owner);
+        return FlushActive(owner, MicroBatchFlushReason::kExplicit);
     }
 
-    [[nodiscard]] bool FlushActive(std::size_t owner) noexcept {
+    [[nodiscard]] bool FlushActive(
+        std::size_t owner,
+        MicroBatchFlushReason reason) noexcept {
         OwnerState& state = *owners_[owner];
         if (state.active.empty()) {
+            if (reason == MicroBatchFlushReason::kExplicit) {
+                stats_.explicit_flushes.fetch_add(
+                    1U, std::memory_order_relaxed);
+            }
             return ServiceWorker(owner);
         }
+        const std::uint64_t rows = state.active.size();
+        const std::uint64_t now = ingest::MonotonicNowNs();
+        const std::uint64_t source_age = now >= state.active_started_ns
+            ? now - state.active_started_ns
+            : 0U;
         const KLineApplyResult applied = state.worker->ApplyBatch(
             std::span<const KLineInput>(state.active.data(),
                                         state.active.size()));
@@ -378,6 +419,24 @@ public:
         state.active_started_ns = 0U;
         stats_.micro_batches_applied.fetch_add(
             1U, std::memory_order_relaxed);
+        stats_.facts_in_micro_batches.fetch_add(
+            rows, std::memory_order_relaxed);
+        PublishMaximum(&stats_.micro_batch_rows_max, rows);
+        PublishMaximum(&stats_.micro_batch_source_age_ns_max, source_age);
+        switch (reason) {
+            case MicroBatchFlushReason::kRowLimit:
+                stats_.row_limit_flushes.fetch_add(
+                    1U, std::memory_order_relaxed);
+                break;
+            case MicroBatchFlushReason::kTimer:
+                stats_.timer_flushes.fetch_add(
+                    1U, std::memory_order_relaxed);
+                break;
+            case MicroBatchFlushReason::kExplicit:
+                stats_.explicit_flushes.fetch_add(
+                    1U, std::memory_order_relaxed);
+                break;
+        }
         if (applied.code == KLineApplyCode::kSourceConflict) {
             stats_.source_conflicts.fetch_add(
                 1U, std::memory_order_relaxed);
@@ -523,6 +582,19 @@ public:
             stats_.occurrence_duplicate_sides.load(
                 std::memory_order_relaxed);
         result.micro_batches_applied = stats_.micro_batches_applied.load(
+            std::memory_order_relaxed);
+        result.facts_in_micro_batches = stats_.facts_in_micro_batches.load(
+            std::memory_order_relaxed);
+        result.micro_batch_rows_max = stats_.micro_batch_rows_max.load(
+            std::memory_order_relaxed);
+        result.micro_batch_source_age_ns_max =
+            stats_.micro_batch_source_age_ns_max.load(
+                std::memory_order_relaxed);
+        result.row_limit_flushes = stats_.row_limit_flushes.load(
+            std::memory_order_relaxed);
+        result.timer_flushes = stats_.timer_flushes.load(
+            std::memory_order_relaxed);
+        result.explicit_flushes = stats_.explicit_flushes.load(
             std::memory_order_relaxed);
         result.source_conflicts = stats_.source_conflicts.load(
             std::memory_order_relaxed);
@@ -726,7 +798,7 @@ private:
         OwnerState& state = *owners_[owner];
         try {
             if (state.active.size() >= config_.micro_batch_rows &&
-                !FlushActive(owner)) {
+                !FlushActive(owner, MicroBatchFlushReason::kRowLimit)) {
                 return false;
             }
             if (state.active.empty()) {
@@ -734,7 +806,7 @@ private:
             }
             state.active.push_back(std::move(input));
             if (state.active.size() >= config_.micro_batch_rows) {
-                return FlushActive(owner);
+                return FlushActive(owner, MicroBatchFlushReason::kRowLimit);
             }
             return true;
         } catch (...) {

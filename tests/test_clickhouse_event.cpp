@@ -119,6 +119,12 @@ void TestConfigValidation() {
     CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
     config.writer_lanes = 8U;
     CHECK(l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
+    config.writer_lanes = 16U;
+    CHECK(l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
+    config.writer_lanes = 32U;
+    CHECK(l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
+    config.writer_lanes = 64U;
+    CHECK(!l2flow::clickhouse::ValidateEventClickHouseConfig(config, &error));
 }
 
 #if defined(__linux__)
