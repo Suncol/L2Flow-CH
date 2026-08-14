@@ -110,7 +110,7 @@ is likewise not claimed.
   requires one I/O thread. The admission API detects concurrent producers and
   fails the engine rather than corrupting SPSC ownership.
 - Default PARTIAL initial hold is 200 microseconds. FROM_OPEN and PARTIAL gap
-  waits both default to 500 microseconds but remain separately configurable.
+  waits both default to 20 milliseconds but remain separately configurable.
   These values are tuning defaults, not protocol constants or statements
   about upstream backfill latency.
 - TickDispatch/fault overload, admission-lane exhaustion, raw ClickHouse

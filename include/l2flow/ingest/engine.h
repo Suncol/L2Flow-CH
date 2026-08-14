@@ -42,12 +42,12 @@ struct EngineConfig final {
     std::uint64_t maximum_reorder_span = 4'096U;
 
     // These are bounded-reorder policies, not MDL protocol constants.
-    // The initial hold applies only to PARTIAL. The two gap waits intentionally
-    // share the same default; they remain separate deployment policies so a
-    // measured upstream backfill distribution can tune them independently.
+    // The initial hold applies only to PARTIAL. Both gap waits default to
+    // 20 milliseconds, but remain separate deployment policies so measured
+    // upstream backfill distributions can tune them independently.
     std::uint64_t partial_initial_hold_ns = 200'000U;
-    std::uint64_t partial_gap_wait_ns = 500'000U;
-    std::uint64_t from_open_gap_wait_ns = 500'000U;
+    std::uint64_t partial_gap_wait_ns = 20'000'000U;
+    std::uint64_t from_open_gap_wait_ns = 20'000'000U;
     std::uint64_t recovery_timer_scan_ns = 25'000U;
 
     // Optional decode-complete, pre-SequenceRecovery fact tap. Its lifetime

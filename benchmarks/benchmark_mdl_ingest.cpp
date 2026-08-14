@@ -71,7 +71,7 @@ struct Options final {
     std::size_t instrument_owners = 16U;
     std::size_t dispatch_queue_capacity = 4'096U;
     std::uint64_t latency_sample_every = 1U;
-    std::uint64_t gap_wait_ns = 500'000U;
+    std::uint64_t gap_wait_ns = 20'000'000U;
     ArrivalPattern pattern = ArrivalPattern::kOrdered;
     std::size_t reorder_window = 1U;
     int producer_cpu = 0;
@@ -349,7 +349,7 @@ void PrintUsage() {
         << "  --owners N               must equal channels; default 16\n"
         << "  --dispatch-queue-capacity N default 4096\n"
         << "  --sample-every N         latency percentile sample stride\n"
-        << "  --gap-wait-ns N          FROM_OPEN reorder wait; default 500000\n"
+        << "  --gap-wait-ns N          FROM_OPEN reorder wait; default 20000000\n"
         << "  --producer-cpu N         default 0\n"
         << "  --first-consumer-cpu N   default 1\n"
         << "  --first-decoder-cpu N    default 17\n";

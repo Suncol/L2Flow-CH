@@ -465,10 +465,10 @@ The volatile-memory state-compute isolation benchmark and its 800k/1M
 results are in
 [docs/event-state-capacity-benchmark-report.md](docs/event-state-capacity-benchmark-report.md).
 
-`from-open` and `partial` both default to a 500,000 ns gap wait. The two
-settings remain independent (`--from-open-gap-wait-ns` and
-`--partial-gap-wait-ns`) for measured production tuning; `from-open` does not
-receive a longer default merely because upstream/network backfill is possible.
+`from-open` and `partial` both default to a 20,000,000 ns (20 ms) gap wait. The
+two settings remain independent (`--from-open-gap-wait-ns` and
+`--partial-gap-wait-ns`) for measured production tuning. PARTIAL's separate
+initial hold remains 200,000 ns by default.
 `--maximum-reorder-span` configures the online hole-admission window `W`.
 `--reorder-entries-per-channel` configures the preallocated pending-record and
 hole-interval capacity; it must be a power of two and at least `W`. Tune both
@@ -504,7 +504,7 @@ numactl --physcpubind=32-63 --membind=1 \
 Use `--pattern local-reverse --reorder-window 8` to inject bounded local
 out-of-order delivery independently within every Channel. `--gap-wait-ns`
 is an explicit benchmark override; omitting it preserves the production
-FROM_OPEN default of 500,000 ns. When decoder CPU affinity is configured,
+FROM_OPEN default of 20,000,000 ns. When decoder CPU affinity is configured,
 decoder idle loops use pause-spin instead of yielding, so each configured
 decoder, including an idle snapshot decoder in this benchmark, consumes a
 dedicated logical CPU by design.

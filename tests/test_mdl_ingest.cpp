@@ -571,10 +571,11 @@ void TestFromOpenReordersShanghai() {
     engine->Stop();
 }
 
-void TestGapWaitDefaultsAreEqual() {
+void TestGapWaitDefaultsAreTwentyMilliseconds() {
     const EngineConfig config{};
     CHECK(config.from_open_gap_wait_ns == config.partial_gap_wait_ns);
-    CHECK(config.from_open_gap_wait_ns == UINT64_C(500'000));
+    CHECK(config.partial_gap_wait_ns == UINT64_C(20'000'000));
+    CHECK(config.from_open_gap_wait_ns == UINT64_C(20'000'000));
 }
 
 void TestFromOpenGapTimeoutAcceptsOpenHoleFill() {
@@ -2184,7 +2185,7 @@ int main() {
     TestHeaderAndUnsupportedTuple();
     TestStreamSelectionDisablesUnlistedTuple();
     TestFromOpenReordersShanghai();
-    TestGapWaitDefaultsAreEqual();
+    TestGapWaitDefaultsAreTwentyMilliseconds();
     TestFromOpenGapTimeoutAcceptsOpenHoleFill();
     TestFromOpenCapacityExpiresBackfillOutsideWindow();
     TestFilledGapRestoresCompletePrefix();
