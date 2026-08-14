@@ -198,7 +198,7 @@ public:
     }
 
     [[nodiscard]] bool CanPollDispatch(std::size_t owner) const noexcept {
-        if (!ValidOwner(owner)) {
+        if (!ValidOwner(owner) || !healthy()) {
             return false;
         }
         const OwnerState& state = *owners_[owner];

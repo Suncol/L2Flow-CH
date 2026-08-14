@@ -252,9 +252,9 @@ The current host allocation is:
 | `136-187` | initially idle SMT siblings of ingest physical cores `8-59` |
 
 The 32 owner drain threads are the parallel Event and KLine calculation actors;
-there is no additional background calculation pool. Four Event and four KLine
-writer lanes independently parallelize ClickHouse INSERTs while retaining FIFO
-for each owner. The configured process mask permits all non-decoder ingest
+there is no additional background calculation pool. Eight Event and eight
+KLine writer lanes independently parallelize ClickHouse INSERTs while retaining
+FIFO for each owner. The configured process mask permits all non-decoder ingest
 threads on `8-59`; `28-59` is a scheduling budget, not a per-thread hard pin.
 
 The ClickHouse server is outside `mdl_ingestd`, so the profile configures its

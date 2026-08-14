@@ -3266,6 +3266,7 @@ void TestRuntimeFailsClosedWhenRevisionSinkRejects() {
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(tick, 0U)));
     CHECK(!runtime->DrainAll());
     CHECK(!runtime->healthy());
+    CHECK(!runtime->CanPollDispatch(0U));
     CHECK(runtime->fatal_error().find("revision sink rejected") !=
           std::string::npos);
 }

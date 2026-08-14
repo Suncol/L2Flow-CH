@@ -2873,7 +2873,12 @@ int main(int argc, char** argv) {
                             dispatch.tick.common.receive_monotonic_ns,
                             &latency_samplers[owner]);
                     }
-                    deliver(dispatch);
+                    // TryPoll has already advanced this plane's cursor. Stop
+                    // the burst on rejection so no later records are removed
+                    // after the destination has gone unhealthy.
+                    if (!deliver(dispatch)) {
+                        break;
+                    }
                     consumed_dispatches.fetch_add(
                         1U, std::memory_order_relaxed);
                     consumed = true;
@@ -2892,25 +2897,23 @@ int main(int argc, char** argv) {
                     progress = consume_dispatch(
                                    event_consumer,
                                    [&](const TickDispatch& value) {
-                                       static_cast<void>(
-                                           event_runtime->AppendDispatch(
-                                               owner, value));
+                                       return event_runtime->AppendDispatch(
+                                           owner, value);
                                    }) ||
                         progress;
                 }
-                if (kline_runtime != nullptr) {
+                if (kline_runtime != nullptr && kline_runtime->healthy()) {
                     progress = consume_dispatch(
                                    kline_consumer,
                                    [&](const TickDispatch& value) {
-                                       static_cast<void>(
-                                           kline_runtime->AppendDispatch(
-                                               owner, value));
+                                       return kline_runtime->AppendDispatch(
+                                           owner, value);
                                    }) ||
                         progress;
                 }
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
-                if (arrow_egress != nullptr) {
+                if (arrow_egress != nullptr && arrow_egress->healthy()) {
                     progress = consume_dispatch(
                                    arrow_consumer,
                                    [&](const TickDispatch& value) {
@@ -2921,12 +2924,9 @@ int main(int argc, char** argv) {
                                            value.kind ==
                                                TickDispatchKind::
                                                    kProjectHoleFill;
-                                       if (projectable) {
-                                           static_cast<void>(
-                                               arrow_egress->
-                                                   AppendTickDispatch(
-                                                       owner, value));
-                                       }
+                                       return !projectable ||
+                                           arrow_egress->AppendTickDispatch(
+                                               owner, value);
                                    }) ||
                         progress;
                 }
@@ -2934,7 +2934,8 @@ int main(int argc, char** argv) {
 #if !defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW) && \
     !defined(L2FLOW_CH_HAS_ARROW_RING)
                 progress = consume_dispatch(
-                               0U, [&](const TickDispatch&) {}) ||
+                               0U,
+                               [&](const TickDispatch&) { return true; }) ||
                     progress;
 #endif
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
@@ -2944,18 +2945,23 @@ int main(int argc, char** argv) {
 #endif
                 ) {
                     progress = consume_dispatch(
-                                   0U, [&](const TickDispatch&) {}) ||
+                                   0U,
+                                   [&](const TickDispatch&) { return true; }) ||
                         progress;
                 }
 #elif defined(L2FLOW_CH_HAS_ARROW_RING)
                 if (arrow_egress == nullptr) {
                     progress = consume_dispatch(
-                                   0U, [&](const TickDispatch&) {}) ||
+                                   0U,
+                                   [&](const TickDispatch&) { return true; }) ||
                         progress;
                 }
 #endif
                 for (std::size_t drained = 0U;
                      drained < kDrainBurstMessages &&
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                     (arrow_egress == nullptr || arrow_egress->healthy()) &&
+#endif
                      engine->TryPollSnapshot(owner, &snapshot);
                      ++drained) {
                     if (latency_samplers != nullptr) {
@@ -2966,8 +2972,9 @@ int main(int argc, char** argv) {
                     }
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
                     if (arrow_egress != nullptr) {
-                        static_cast<void>(
-                            arrow_egress->AppendSnapshot(owner, snapshot));
+                        if (!arrow_egress->AppendSnapshot(owner, snapshot)) {
+                            break;
+                        }
                     }
 #endif
                     consumed_snapshots.fetch_add(
@@ -2977,11 +2984,17 @@ int main(int argc, char** argv) {
                 if (owner == 0U) {
                     for (std::size_t drained = 0U;
                          drained < kDrainBurstMessages &&
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                         (arrow_egress == nullptr ||
+                          arrow_egress->healthy()) &&
+#endif
                          engine->TryPollGap(&gap);
                          ++drained) {
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
                         if (arrow_egress != nullptr) {
-                            static_cast<void>(arrow_egress->AppendGap(gap));
+                            if (!arrow_egress->AppendGap(gap)) {
+                                break;
+                            }
                         }
 #endif
                         consumed_gaps.fetch_add(
@@ -2990,12 +3003,17 @@ int main(int argc, char** argv) {
                     }
                     for (std::size_t drained = 0U;
                          drained < kDrainBurstMessages &&
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                         (arrow_egress == nullptr ||
+                          arrow_egress->healthy()) &&
+#endif
                          engine->TryPollChannelFault(&fault);
                          ++drained) {
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
                         if (arrow_egress != nullptr) {
-                            static_cast<void>(
-                                arrow_egress->AppendFault(fault));
+                            if (!arrow_egress->AppendFault(fault)) {
+                                break;
+                            }
                         }
 #endif
                         consumed_faults.fetch_add(

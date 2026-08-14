@@ -620,7 +620,8 @@ into one transaction.
 
 ### Ordered writer lanes
 
-`EventClickHouseConfig::writer_lanes` accepts exactly `1`, `2`, `4`, or `8`.
+`EventClickHouseConfig::writer_lanes` accepts exactly `1`, `2`, `4`, `8`,
+`16`, or `32`.
 Each lane has one HTTP client, one writer thread, and one bounded volatile
 queue. An owner persistence group is routed by `owner % writer_lanes`;
 therefore all logical commits from one Event owner remain FIFO even when a
