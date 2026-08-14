@@ -55,7 +55,8 @@ void AddWorkerStats(KLineWorkerStats* destination,
     destination->bars_created += source.bars_created;
     destination->bars_updated += source.bars_updated;
     destination->revisions_created += source.revisions_created;
-    destination->pending_raw_commits += source.pending_raw_commits;
+    destination->pending_revision_batches +=
+        source.pending_revision_batches;
     destination->pending_revision_rows += source.pending_revision_rows;
     destination->pending_revision_rows_high_watermark = std::max(
         destination->pending_revision_rows_high_watermark,
@@ -216,13 +217,14 @@ public:
         for (std::size_t owner = 0U; owner < owners_.size(); ++owner) {
             KLineWorker* const worker = owners_[owner]->worker.get();
             result = worker->DrainDurableCommits() && result;
-            if (worker->stats().pending_raw_commits != 0U) {
+            if (worker->stats().pending_revision_batches != 0U) {
                 pending_commits = true;
                 result = false;
             }
         }
         if (pending_commits) {
-            SetFatal("KLine runtime drain has unresolved pending commits");
+            SetFatal(
+                "KLine runtime drain has unresolved pending revision batches");
             result = false;
         }
         return result;

@@ -577,6 +577,19 @@ void TestGapWaitDefaultsAreEqual() {
     CHECK(config.from_open_gap_wait_ns == UINT64_C(500'000));
 }
 
+void TestDefaultOutboxCapacityOverflowIsRejected() {
+    EngineConfig config = MakeConfig(StartMode::kFromOpen);
+    config.instrument_workers = 3U;
+    config.outbox_records_per_lane = 0U;
+    config.dispatch_queue_capacity =
+        std::numeric_limits<std::size_t>::max() /
+            config.instrument_workers +
+        1U;
+    std::string error;
+    CHECK(IngestEngine::Create(config, MakeCatalog(), &error) == nullptr);
+    CHECK(error.find("storage size overflows") != std::string::npos);
+}
+
 void TestFromOpenGapTimeoutAcceptsOpenHoleFill() {
     EngineConfig config = MakeConfig(StartMode::kFromOpen);
     config.from_open_gap_wait_ns = 0U;
@@ -2185,6 +2198,7 @@ int main() {
     TestStreamSelectionDisablesUnlistedTuple();
     TestFromOpenReordersShanghai();
     TestGapWaitDefaultsAreEqual();
+    TestDefaultOutboxCapacityOverflowIsRejected();
     TestFromOpenGapTimeoutAcceptsOpenHoleFill();
     TestFromOpenCapacityExpiresBackfillOutsideWindow();
     TestFilledGapRestoresCompletePrefix();

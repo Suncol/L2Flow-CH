@@ -2,6 +2,12 @@
 
 Test date: 2026-08-09 (Asia/Shanghai)
 
+> Archived architecture result: this run predates the independent raw and
+> derived persistence contract. References below to synthetic raw ACKs,
+> pending raw commits, and ACK indexes describe the tested historical build;
+> they are not current runtime metrics or capacity controls. The current batch
+> count metric is `pending_revision_batches`.
+
 ## Outcome
 
 The current file-backed Event path did not qualify at the lower 800,000 fact/s

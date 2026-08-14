@@ -445,7 +445,7 @@ loop services normal traffic between ordinary repair slices. A pending phase
 cut has higher priority: it fences that traffic and pauses active-repair
 advancement until cut finalization. A sliced Shanghai END also fences input only
 until its fixed candidate prefix has been attached; ordinary order repair then
-resumes without the fence. If the pending raw-commit FIFO is full after
+resumes without the fence. If the pending revision-batch FIFO is full after
 calculation, the finished repair waits without leaking its private state.
 
 ### Shanghai END
@@ -483,9 +483,11 @@ After classification, each decoder lane appends one sequenced `TickDispatch`
 to a process-lifetime outbox and stamps `dispatch_fence = outbox_lsn`.
 Controls occupy one LSN and are broadcast to every owner cursor. Event, KLine,
 and Arrow consume with independent cursors, so one plane can lag without
-stopping the others. Outbox exhaustion is `FATAL_CONTINUITY`. Derived
-ClickHouse or runtime failure does not stop raw ingest; the process publishes
-`DERIVED_CATCHUP` or `RAW_ONLY_STALE` and `event_authoritative=0`.
+blocking another cursor. Outbox exhaustion is `FATAL_CONTINUITY`. A lagging or
+unhealthy derived plane publishes `DERIVED_CATCHUP` and clears only that
+plane's authoritative flag. There is no elapsed-time transition to a separate
+raw-only state. The live executable still treats failure of any enabled
+persistence plane as a session-ending health failure.
 
 `REJECT_LATE_FACT` is counted and discarded. It never journals, repairs, or
 enqueues a revision.
@@ -498,7 +500,10 @@ that the bounded volatile sink queue retained the immutable objects. Derived
 durability still requires successful ClickHouse responses for all physical
 revision requests followed by the marker request that contains one marker row
 per logical batch. Pending commit count and pending immutable-revision bytes
-remain bounded; exhausting either bound stops the Event plane, not raw.
+remain bounded. The count exported as `pending_revision_batches` is the number
+of immutable logical batches not yet accepted by the Event revision sink; it
+does not represent rows, raw commits, or raw ACK dependencies. Exhausting
+either bound fails the enabled Event plane and therefore ends the live session.
 
 ## 9. Revision and version semantics
 
@@ -643,11 +648,11 @@ empty control flushes plus applied/coalesced/pending seals.
 The shared journal has one global physical-record bound for the trading date.
 Event carry-order count, conservative order-history owned bytes, hot fact count,
 conservative hot-fact owned bytes, cached Event rows, combined active-repair and
-pending-phase-cut bytes, pending commit count, pending immutable revision
+pending-phase-cut bytes, pending revision-batch count, pending immutable revision
 bytes, Shanghai END candidates/rows/staging bytes, and Event sink batch/row
-queues have configured hard
-bounds. The pending phase cut and active repair specifically share
-`maximum_repair_bytes`; they do not each receive that allowance. Exhaustion
+queues have configured hard bounds. The pending phase cut and active repair
+specifically share `maximum_repair_bytes`; they do not each receive that
+allowance. Exhaustion
 fails the relevant journal/worker/runtime/sink closed rather than dropping a
 revision and continuing with an unprovable current view.
 
@@ -672,7 +677,7 @@ The Event worker enforces count and conservative byte caps over retained fact,
 Bundle, and head nodes and the channel/instrument/phase/barrier indexes. It uses
 a separate byte cap for carry-order baselines and order-use suffixes. Its
 complete logical capacity also includes private repair, END staging, pending
-revisions, ACK join, micro-batches, and sink queues. A slow repair or eviction
+revisions, micro-batches, and sink queues. A slow repair or eviction
 backlog never expands the admission window; it eventually reaches a configured
 cap and fails closed. `order_history_bytes` and `hot_fact_bytes` export the two
 live estimates and their high-water marks.
@@ -685,7 +690,6 @@ M_event_owner_logical <= maximum_hot_fact_bytes
                        + maximum_repair_bytes
                        + maximum_end_staging_bytes
                        + maximum_pending_revision_bytes
-                       + bounded ACK join/inbox/index storage
                        + bounded micro-batch and eviction-task storage
 ```
 

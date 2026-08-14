@@ -2,6 +2,11 @@
 
 Test date: 2026-08-11 (Asia/Shanghai)
 
+> Historical-measurement note: the throughput numbers remain a record of this
+> dated run, but raw-ACK queue/index names in the report belong to the retired
+> ACK-gated design. Current raw and derived persistence are independent, and
+> the current pending logical-batch metric is `pending_revision_batches`.
+
 This report covers the current Event batching implementation after correctness
 fences, logical recovery commits, owner persistence submissions, and physical
 ClickHouse requests were separated. It replaces the former report for the old

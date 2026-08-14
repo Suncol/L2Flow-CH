@@ -361,7 +361,7 @@ struct AtomicStats final {
     std::atomic<std::uint64_t> bars_created{0U};
     std::atomic<std::uint64_t> bars_updated{0U};
     std::atomic<std::uint64_t> revisions_created{0U};
-    std::atomic<std::uint64_t> pending_raw_commits{0U};
+    std::atomic<std::uint64_t> pending_revision_batches{0U};
     std::atomic<std::uint64_t> pending_revision_rows{0U};
     std::atomic<std::uint64_t> pending_revision_rows_high_watermark{0U};
     std::atomic<std::uint64_t> pending_revision_bytes{0U};
@@ -425,8 +425,9 @@ public:
             return result;
         }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
-            return CapacityFailure(&result,
-                                   "KLine pending raw commit capacity exhausted");
+            return CapacityFailure(
+                &result,
+                "KLine pending revision batch capacity exhausted");
         }
 
         try {
@@ -654,7 +655,7 @@ public:
                     pending_revision_rows_, revision_count);
                 pending_revision_bytes_ = SaturatingAdd(
                     pending_revision_bytes_, owned_bytes);
-                stats_.pending_raw_commits.store(
+                stats_.pending_revision_batches.store(
                     pending_commits_.size(), std::memory_order_relaxed);
                 PublishPendingRevisionStats();
             }
@@ -710,7 +711,7 @@ public:
             pending_commits_.pop_front();
             pending_revision_rows_ -= released_rows;
             pending_revision_bytes_ -= released_bytes;
-            stats_.pending_raw_commits.store(
+            stats_.pending_revision_batches.store(
                 pending_commits_.size(), std::memory_order_relaxed);
             PublishPendingRevisionStats();
         }
@@ -760,8 +761,9 @@ public:
             std::memory_order_relaxed);
         result.revisions_created = stats_.revisions_created.load(
             std::memory_order_relaxed);
-        result.pending_raw_commits = stats_.pending_raw_commits.load(
-            std::memory_order_relaxed);
+        result.pending_revision_batches =
+            stats_.pending_revision_batches.load(
+                std::memory_order_relaxed);
         result.pending_revision_rows = stats_.pending_revision_rows.load(
             std::memory_order_relaxed);
         result.pending_revision_rows_high_watermark =

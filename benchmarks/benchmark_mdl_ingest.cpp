@@ -70,6 +70,7 @@ struct Options final {
     std::size_t tick_lanes = 12U;
     std::size_t instrument_owners = 16U;
     std::size_t dispatch_queue_capacity = 4'096U;
+    std::size_t tick_consumer_count = 1U;
     std::uint64_t latency_sample_every = 1U;
     std::uint64_t gap_wait_ns = 500'000U;
     ArrivalPattern pattern = ArrivalPattern::kOrdered;
@@ -134,6 +135,8 @@ struct Options final {
 
 struct alignas(64) ConsumerState final {
     std::atomic<std::uint64_t> consumed{0U};
+    std::uint64_t secondary_consumed = 0U;
+    std::uint64_t secondary_errors = 0U;
     std::uint64_t measured = 0U;
     std::uint64_t latency_samples = 0U;
     std::uint64_t maximum_latency_ns = 0U;
@@ -322,6 +325,7 @@ void PrintUsage() {
         << "  --tick-lanes N           default 12\n"
         << "  --owners N               must equal channels; default 16\n"
         << "  --dispatch-queue-capacity N default 4096\n"
+        << "  --tick-consumers N       independent outbox cursors; default 1\n"
         << "  --sample-every N         latency percentile sample stride\n"
         << "  --gap-wait-ns N          FROM_OPEN reorder wait; default 500000\n"
         << "  --producer-cpu N         default 0\n"
@@ -355,10 +359,7 @@ void PrintUsage() {
         << "  --event-writer-lanes N (1,2,4,8,16,32) default 1\n"
         << "  --event-queue-revision-batches N default 1024\n"
         << "  --event-queue-revision-rows N default 1048576\n"
-        << "  --event-maximum-raw-ack-backlog N default 65536\n"
         << "  --event-maximum-pending-channel-seals N default 4096\n"
-        << "  --event-raw-ack-drain-max-entries N default 1024\n"
-        << "  --event-raw-ack-drain-max-cpu-ns N default 150000\n"
         << "  --fact-journal-dir DIR   unique shared Event/KLine file directory; default system temp\n"
         << "  --event-journal-dir DIR  deprecated alias for --fact-journal-dir\n"
         << "  --event-construction-smoke validate Event construction without network I/O\n";
@@ -374,7 +375,6 @@ void PrintUsage() {
         << "  --kline-writer-lanes N (1,2,4,8,16,32) default 1\n"
         << "  --kline-queue-revision-batches N default 1024\n"
         << "  --kline-queue-revision-rows N default 1048576\n"
-        << "  --kline-maximum-raw-ack-backlog N default 65536\n"
         << "  --kline-maximum-occurrence-join N default 65536\n";
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -448,6 +448,12 @@ void PrintUsage() {
             if (!ParseInteger(next(argument),
                               &parsed.dispatch_queue_capacity)) {
                 *error = "invalid --dispatch-queue-capacity";
+                return false;
+            }
+        } else if (argument == "--tick-consumers") {
+            if (!ParseInteger(next(argument),
+                              &parsed.tick_consumer_count)) {
+                *error = "invalid --tick-consumers";
                 return false;
             }
         } else if (argument == "--sample-every") {
@@ -876,6 +882,8 @@ void PrintUsage() {
         parsed.channels > 100'000U || parsed.tick_lanes == 0U ||
         parsed.instrument_owners != parsed.channels ||
         parsed.dispatch_queue_capacity == 0U ||
+        parsed.tick_consumer_count == 0U ||
+        parsed.tick_consumer_count > kMaximumTickConsumers ||
         parsed.reorder_window == 0U ||
         parsed.latency_sample_every == 0U ||
         (parsed.pattern == ArrivalPattern::kLocalReverse &&
@@ -1380,6 +1388,16 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::uint64_t total_count = warmup_count + measured_count;
+    if (options.tick_consumer_count > 1U &&
+        total_count > std::numeric_limits<std::uint64_t>::max() /
+                          static_cast<std::uint64_t>(
+                              options.tick_consumer_count - 1U)) {
+        std::cerr << "secondary outbox read count overflows\n";
+        return 2;
+    }
+    const std::uint64_t expected_secondary_consumed =
+        total_count * static_cast<std::uint64_t>(
+                          options.tick_consumer_count - 1U);
     const std::uint64_t warmup_per_channel =
         warmup_count / static_cast<std::uint64_t>(options.channels);
     const std::uint64_t total_per_channel =
@@ -1444,6 +1462,7 @@ int main(int argc, char** argv) {
     config.maximum_tick_body_bytes = 256U;
     config.maximum_snapshot_body_bytes = 1'024U;
     config.dispatch_queue_capacity = options.dispatch_queue_capacity;
+    config.tick_consumer_count = options.tick_consumer_count;
     config.diagnostic_queue_capacity = 256U;
     config.maximum_channels_per_tick_lane =
         std::max<std::size_t>(
@@ -2101,6 +2120,7 @@ int main(int argc, char** argv) {
             state.observed_cpu = CurrentCpu();
             ready.fetch_add(1U, std::memory_order_release);
             TickDispatch dispatch{};
+            TickDispatch secondary_dispatch{};
             std::uint64_t local_consumed = 0U;
             std::uint64_t expected_sequence = 1U;
             std::uint64_t measured_index = 0U;
@@ -2178,6 +2198,36 @@ int main(int argc, char** argv) {
                     state.error =
                         "unexpected non-ordered benchmark dispatch";
                     abort.store(true, std::memory_order_release);
+                    break;
+                }
+                for (std::size_t consumer = 1U;
+                     consumer < options.tick_consumer_count; ++consumer) {
+                    if (!engine->TryPollTickDispatch(
+                            consumer, owner, &secondary_dispatch)) {
+                        state.error =
+                            "secondary outbox cursor did not mirror primary";
+                        ++state.secondary_errors;
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                    ++state.secondary_consumed;
+                    if (secondary_dispatch.kind != dispatch.kind ||
+                        secondary_dispatch.owner != dispatch.owner ||
+                        secondary_dispatch.outbox_lane !=
+                            dispatch.outbox_lane ||
+                        secondary_dispatch.outbox_lsn != dispatch.outbox_lsn ||
+                        secondary_dispatch.tick.common.native_sequence !=
+                            dispatch.tick.common.native_sequence ||
+                        secondary_dispatch.tick.common.ingress_sequence !=
+                            dispatch.tick.common.ingress_sequence) {
+                        state.error =
+                            "secondary outbox cursor diverged from primary";
+                        ++state.secondary_errors;
+                        abort.store(true, std::memory_order_release);
+                        break;
+                    }
+                }
+                if (abort.load(std::memory_order_acquire)) {
                     break;
                 }
                 const CanonicalTick& tick = dispatch.tick;
@@ -2512,9 +2562,7 @@ int main(int argc, char** argv) {
     bool event_journal_cleanup_ok = true;
     std::error_code event_journal_cleanup_error;
     if (event_runtime != nullptr) {
-        // Keep calculation batches pending until the raw sink has ACKed their
-        // exact source occurrences.  Flush before stopping raw so the final
-        // ACKs can release already-created immutable Event batches.
+        // Submit pending Event revisions independently of raw persistence.
         event_flush_ok = event_runtime->FlushAll();
     }
     if (kline_runtime != nullptr) {
@@ -2586,6 +2634,8 @@ int main(int argc, char** argv) {
 
     std::uint64_t total_consumed = 0U;
     std::uint64_t total_measured = 0U;
+    std::uint64_t total_secondary_consumed = 0U;
+    std::uint64_t secondary_errors = 0U;
     std::uint64_t ordering_errors = 0U;
     std::uint64_t clock_errors = 0U;
     std::uint64_t maximum_latency_ns = 0U;
@@ -2600,6 +2650,8 @@ int main(int argc, char** argv) {
         const ConsumerState& state = consumers[owner];
         total_consumed += state.consumed.load(std::memory_order_acquire);
         total_measured += state.measured;
+        total_secondary_consumed += state.secondary_consumed;
+        secondary_errors += state.secondary_errors;
         maximum_latency_ns = std::max(
             maximum_latency_ns, state.maximum_latency_ns);
         maximum_sink_operation_ns = std::max(
@@ -2843,7 +2895,8 @@ int main(int argc, char** argv) {
             event_final_runtime_stats.rejected_dispositions_received == 0U &&
             event_final_runtime_stats.workers.facts_journaled == total_count &&
             event_final_runtime_stats.invalid_inputs == 0U &&
-            event_final_runtime_stats.workers.pending_raw_commits == 0U &&
+            event_final_runtime_stats.workers.pending_revision_batches ==
+                0U &&
             event_final_stats.revision_rows_acked ==
                 event_final_runtime_stats.workers.revisions_created &&
             event_final_stats.revision_batches_queued ==
@@ -2908,7 +2961,8 @@ int main(int argc, char** argv) {
             kline_final_runtime_stats.workers.invalid_facts == 0U &&
             kline_final_runtime_stats.workers
                     .invalid_trade_exchange_times == 0U &&
-            kline_final_runtime_stats.workers.pending_raw_commits == 0U &&
+            kline_final_runtime_stats.workers.pending_revision_batches ==
+                0U &&
             kline_final_stats.revision_rows_acked ==
                 kline_final_runtime_stats.workers.revisions_created &&
             kline_final_stats.revision_batches_queued ==
@@ -2962,6 +3016,8 @@ int main(int argc, char** argv) {
     const bool base_valid =
         admission_failure == AdmissionResult::kAccepted &&
         admitted_count == total_count && total_consumed == total_count &&
+        total_secondary_consumed == expected_secondary_consumed &&
+        secondary_errors == 0U &&
         total_measured == measured_count &&
         latencies.size() ==
             static_cast<std::size_t>(expected_latency_samples) &&
@@ -3007,6 +3063,7 @@ int main(int argc, char** argv) {
               << " owners=" << options.instrument_owners
               << " dispatch_queue_capacity="
               << options.dispatch_queue_capacity
+              << " tick_consumers=" << options.tick_consumer_count
               << " pattern=" << PatternName(options.pattern)
               << " reorder_window=" << options.reorder_window
               << " sequence_entries_per_channel="
@@ -3044,6 +3101,8 @@ int main(int argc, char** argv) {
               << " max_all=" << to_us(maximum_latency_ns) << '\n'
               << "quality admitted=" << stats.admitted
               << " consumed=" << total_consumed
+              << " secondary_consumed=" << total_secondary_consumed
+              << " secondary_errors=" << secondary_errors
               << " measured_dispatched=" << total_measured
               << " ordering_errors=" << ordering_errors
               << " lane_full=" << stats.lane_full
@@ -3246,8 +3305,8 @@ int main(int argc, char** argv) {
                    .persistence_group_batches_max
             << " persistence_group_rows_max="
             << event_final_runtime_stats.workers.persistence_group_rows_max
-            << " pending_raw_commits="
-            << event_final_runtime_stats.workers.pending_raw_commits
+            << " pending_revision_batches="
+            << event_final_runtime_stats.workers.pending_revision_batches
             << " invalid_inputs="
             << event_final_runtime_stats.invalid_inputs
             << " source_conflicts="
@@ -3369,8 +3428,8 @@ int main(int argc, char** argv) {
             << kline_final_runtime_stats.workers.revisions_created
             << " micro_batches="
             << kline_final_runtime_stats.micro_batches_applied
-            << " pending_raw_commits="
-            << kline_final_runtime_stats.workers.pending_raw_commits
+            << " pending_revision_batches="
+            << kline_final_runtime_stats.workers.pending_revision_batches
             << " invalid_inputs=" << kline_final_runtime_stats.invalid_inputs
             << " invalid_trade_times="
             << kline_final_runtime_stats.workers.invalid_trade_exchange_times

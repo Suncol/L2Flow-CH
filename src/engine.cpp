@@ -1675,6 +1675,10 @@ private:
         config.snapshot_slots_per_lane >
             std::numeric_limits<std::size_t>::max() /
                 config.maximum_snapshot_body_bytes ||
+        (config.outbox_records_per_lane == 0U &&
+         config.dispatch_queue_capacity >
+             std::numeric_limits<std::size_t>::max() /
+                 config.instrument_workers) ||
         config.instrument_workers >
             static_cast<std::size_t>(
                 std::numeric_limits<std::uint32_t>::max()) ||

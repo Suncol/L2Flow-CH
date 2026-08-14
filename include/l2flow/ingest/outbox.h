@@ -17,7 +17,6 @@ inline constexpr std::size_t kMaximumTickConsumers = 8U;
 enum class ContinuityMode : std::uint8_t {
     kCaughtUp = 0U,
     kDerivedCatchup,
-    kRawOnlyStale,
     kFatalContinuity,
 };
 
@@ -26,6 +25,8 @@ struct FreshnessFrontier final {
     std::uint64_t feed_session_epoch = 0U;
     std::uint64_t published_monotonic_ns = 0U;
     std::uint64_t max_lag_lsn = 0U;
+    // Each derived plane is authoritative independently; one lagging plane
+    // does not clear the other plane's flag.
     bool event_authoritative = false;
     bool kline_authoritative = false;
 };
@@ -40,8 +41,6 @@ struct ContinuityInputs final {
     bool kline_pending = false;
     std::uint64_t now_monotonic_ns = 0U;
     std::uint64_t catchup_lsn_slack = 65'536U;
-    std::uint64_t stale_timeout_ns = UINT64_C(2'000'000'000);
-    std::uint64_t derived_unhealthy_elapsed_ns = 0U;
 };
 
 struct DispositionOutboxStats final {

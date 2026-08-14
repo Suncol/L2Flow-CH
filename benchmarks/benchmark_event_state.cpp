@@ -778,7 +778,7 @@ int main(int argc, char** argv) {
         stats.workers.duplicate_facts == 0U &&
         stats.workers.source_conflicts == 0U &&
         stats.workers.revisions_created == total &&
-        stats.workers.pending_raw_commits == 0U &&
+        stats.workers.pending_revision_batches == 0U &&
         stats.workers.revision_batches_submitted == sink.batches() &&
         stats.workers.source_only_fast_path ==
             stats.micro_batches_applied &&
@@ -851,8 +851,8 @@ int main(int argc, char** argv) {
               << " revisions_per_persistence_group="
               << revisions_per_persistence_group
               << " revision_rows_acked_in_memory=" << sink.rows()
-              << " pending_raw_commits="
-              << stats.workers.pending_raw_commits << '\n'
+              << " pending_revision_batches="
+              << stats.workers.pending_revision_batches << '\n'
               << "event_state_journal records=" << journal_stats.records
               << " consumer_new=" << journal_stats.consumer_new
               << " record_bytes=" << journal_stats.record_bytes

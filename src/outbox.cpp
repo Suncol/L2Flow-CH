@@ -59,7 +59,8 @@ public:
           slots_(lane_count * records_per_lane),
           head_lsn_(lane_count),
           cursor_next_(consumer_count * owner_count * lane_count),
-          lane_poll_(consumer_count * owner_count) {
+          lane_poll_(consumer_count * owner_count),
+          cursor_stats_(consumer_count * owner_count) {
         for (std::size_t index = 0U; index < slots_.size(); ++index) {
             slots_[index].sequence.store(0U, std::memory_order_relaxed);
         }
@@ -115,7 +116,17 @@ public:
             owner >= owner_count_) {
             return false;
         }
-        std::size_t& poll = lane_poll_[PollIndex(consumer, owner)];
+        const std::size_t poll_index = PollIndex(consumer, owner);
+        std::size_t& poll = lane_poll_[poll_index];
+        CursorStats& cursor_stats = cursor_stats_[poll_index];
+        std::uint64_t skipped = 0U;
+        const auto publish_skipped = [&cursor_stats, &skipped]() noexcept {
+            if (skipped != 0U) {
+                cursor_stats.records_skipped.fetch_add(
+                    skipped, std::memory_order_relaxed);
+                skipped = 0U;
+            }
+        };
         for (std::size_t count = 0U; count < lane_count_; ++count) {
             const std::size_t lane = (poll + count) % lane_count_;
             std::atomic<std::uint64_t>& next_cell =
@@ -126,6 +137,7 @@ public:
             while (next <= head) {
                 const Slot& slot = SlotAt(lane, next);
                 if (slot.sequence.load(std::memory_order_acquire) != next) {
+                    publish_skipped();
                     return false;
                 }
                 const TickDispatch& record = slot.dispatch;
@@ -137,12 +149,15 @@ public:
                     *output = record;
                     output->owner = static_cast<std::uint32_t>(owner);
                     poll = (lane + 1U) % lane_count_;
-                    stats_read_.fetch_add(1U, std::memory_order_relaxed);
+                    publish_skipped();
+                    cursor_stats.records_read.fetch_add(
+                        1U, std::memory_order_relaxed);
                     return true;
                 }
-                stats_skipped_.fetch_add(1U, std::memory_order_relaxed);
+                ++skipped;
             }
         }
+        publish_skipped();
         return false;
     }
 
@@ -208,25 +223,15 @@ public:
         const bool kline_behind = inputs.kline_enabled &&
             (!inputs.kline_healthy || inputs.kline_pending ||
              kline_lag > inputs.catchup_lsn_slack);
-        const bool stale_elapsed =
-            inputs.stale_timeout_ns != 0U &&
-            inputs.derived_unhealthy_elapsed_ns >= inputs.stale_timeout_ns;
-        const bool derived_unhealthy =
-            (inputs.event_enabled && !inputs.event_healthy) ||
-            (inputs.kline_enabled && !inputs.kline_healthy);
-        if (derived_unhealthy && stale_elapsed) {
-            frontier.mode = ContinuityMode::kRawOnlyStale;
-        } else if (event_behind || kline_behind) {
+        if (event_behind || kline_behind) {
             frontier.mode = ContinuityMode::kDerivedCatchup;
         } else {
             frontier.mode = ContinuityMode::kCaughtUp;
         }
         frontier.event_authoritative =
-            inputs.event_enabled &&
-            frontier.mode == ContinuityMode::kCaughtUp;
+            inputs.event_enabled && !event_behind;
         frontier.kline_authoritative =
-            inputs.kline_enabled &&
-            frontier.mode == ContinuityMode::kCaughtUp;
+            inputs.kline_enabled && !kline_behind;
         return frontier;
     }
 
@@ -250,9 +255,12 @@ public:
         DispositionOutboxStats result{};
         result.records_appended =
             stats_appended_.load(std::memory_order_relaxed);
-        result.records_read = stats_read_.load(std::memory_order_relaxed);
-        result.records_skipped =
-            stats_skipped_.load(std::memory_order_relaxed);
+        for (const CursorStats& cursor : cursor_stats_) {
+            result.records_read +=
+                cursor.records_read.load(std::memory_order_relaxed);
+            result.records_skipped +=
+                cursor.records_skipped.load(std::memory_order_relaxed);
+        }
         result.append_rejected_full =
             stats_append_rejected_full_.load(std::memory_order_relaxed);
         return result;
@@ -262,6 +270,15 @@ private:
     struct Slot final {
         std::atomic<std::uint64_t> sequence{0U};
         TickDispatch dispatch{};
+    };
+
+    // TryRead already requires exclusive ownership of one (consumer, owner)
+    // cursor because lane_poll_ is mutable non-atomic state. Keep its hot
+    // observability counters on the same exclusive shard and a separate cache
+    // line, then aggregate only on the cold stats() path.
+    struct alignas(64) CursorStats final {
+        std::atomic<std::uint64_t> records_read{0U};
+        std::atomic<std::uint64_t> records_skipped{0U};
     };
 
     [[nodiscard]] std::size_t SlotOffset(
@@ -317,9 +334,8 @@ private:
     std::vector<std::atomic<std::uint64_t>> head_lsn_;
     std::vector<std::atomic<std::uint64_t>> cursor_next_;
     std::vector<std::size_t> lane_poll_;
+    std::vector<CursorStats> cursor_stats_;
     std::atomic<std::uint64_t> stats_appended_{0U};
-    std::atomic<std::uint64_t> stats_read_{0U};
-    std::atomic<std::uint64_t> stats_skipped_{0U};
     std::atomic<std::uint64_t> stats_append_rejected_full_{0U};
 };
 
@@ -436,8 +452,6 @@ const char* ContinuityModeName(ContinuityMode mode) noexcept {
             return "CAUGHT_UP";
         case ContinuityMode::kDerivedCatchup:
             return "DERIVED_CATCHUP";
-        case ContinuityMode::kRawOnlyStale:
-            return "RAW_ONLY_STALE";
         case ContinuityMode::kFatalContinuity:
             return "FATAL_CONTINUITY";
     }

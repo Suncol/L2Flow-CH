@@ -78,7 +78,8 @@ void AddWorkerStats(EventWorkerStats* destination,
     destination->bundles_reassembled += source.bundles_reassembled;
     destination->revisions_created += source.revisions_created;
     destination->tombstones_created += source.tombstones_created;
-    destination->pending_raw_commits += source.pending_raw_commits;
+    destination->pending_revision_batches +=
+        source.pending_revision_batches;
     destination->revision_batches_submitted +=
         source.revision_batches_submitted;
     destination->persistence_groups_submitted +=
@@ -384,7 +385,7 @@ public:
                              : worker->fatal_error());
                 result = false;
             }
-            if (worker->stats().pending_raw_commits != 0U) {
+            if (worker->stats().pending_revision_batches != 0U) {
                 pending_commits = true;
                 result = false;
             }
@@ -396,7 +397,8 @@ public:
             }
         }
         if (pending_commits) {
-            SetFatal("Event runtime drain has unresolved pending commits");
+            SetFatal(
+                "Event runtime drain has unresolved pending revision batches");
             result = false;
         }
         return result;

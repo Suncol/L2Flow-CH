@@ -270,7 +270,7 @@ The profile disables table auto-creation; provision the selected single-node
 or replicated production schema first. Its 32-owner Arrow layout preallocates
 approximately 17.13 GiB of ring payload capacity in `/dev/shm`, plus metadata
 and alignment overhead. Event hot-fact count/bytes, carry orders, private
-repair, pending revision bytes, Shanghai END staging, ACK joins, and sink queues
+repair, pending revision batches/bytes, Shanghai END staging, and sink queues
 have independent per-owner or global hard bounds and fail closed on exhaustion.
 Those logical bounds do not include allocator-retained buckets/pages, the
 process-lifetime FactJournal directory/file, or KLine bar state. These settings
@@ -494,10 +494,14 @@ numactl --physcpubind=32-63 --membind=1 \
   ./build/benchmark_mdl_ingest \
   --rate 1000000 --seconds 300 --warmup-seconds 5 \
   --pattern ordered --sample-every 67 \
-  --channels 16 --tick-lanes 12 --owners 16 \
+  --channels 16 --tick-lanes 12 --owners 16 --tick-consumers 3 \
   --producer-cpu 63 --first-consumer-cpu 32 \
   --first-decoder-cpu 48
 ```
+
+`--tick-consumers` must match the number of independent TickDispatch planes
+being qualified. The production Event + KLine + Arrow profile uses three;
+the benchmark default of one is only an ingest/single-plane measurement.
 
 Use `--pattern local-reverse --reorder-window 8` to inject bounded local
 out-of-order delivery independently within every Channel. `--gap-wait-ns`

@@ -116,6 +116,11 @@ void TestBroadcastReachesEveryOwnerAndOccurrenceIsFiltered() {
     CHECK(owner1.owner == 1U);
     CHECK(owner1.kind == TickDispatchKind::kProjectOrdered);
     CHECK(owner1.outbox_lsn == 3U);
+
+    const DispositionOutboxStats stats = outbox->stats();
+    CHECK(stats.records_appended == 3U);
+    CHECK(stats.records_read == 4U);
+    CHECK(stats.records_skipped == 2U);
 }
 
 void TestLanesHaveIndependentLsns() {
@@ -160,10 +165,16 @@ void TestFreshnessModes() {
     frontier = outbox->EvaluateFreshness(inputs);
     CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
     CHECK(!frontier.event_authoritative);
-    inputs.derived_unhealthy_elapsed_ns = inputs.stale_timeout_ns;
+    CHECK(frontier.kline_authoritative);
+    CHECK(std::string(ContinuityModeName(frontier.mode)) ==
+          "DERIVED_CATCHUP");
+
+    inputs.event_healthy = true;
+    inputs.kline_healthy = false;
     frontier = outbox->EvaluateFreshness(inputs);
-    CHECK(frontier.mode == ContinuityMode::kRawOnlyStale);
-    CHECK(!frontier.event_authoritative);
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+    CHECK(frontier.event_authoritative);
+    CHECK(!frontier.kline_authoritative);
 
     inputs.fatal = true;
     frontier = outbox->EvaluateFreshness(inputs);

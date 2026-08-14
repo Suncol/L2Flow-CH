@@ -143,8 +143,8 @@ is likewise not claimed.
 - Event projection is optional and still requires the raw ClickHouse path to
   be configured for the same feed epoch, but Event persist is not gated on
   raw ACK. Event repair/index capacity failure or Event sink queue failure
-  stops the Event plane and publishes a non-authoritative freshness mode; it
-  does not kill raw. Outbox exhaustion is a sticky process boundary.
+  publishes a non-authoritative freshness mode and ends the live session;
+  outbox exhaustion is also a sticky process boundary.
 - The default stream file selects the five implemented Shanghai/Shenzhen
   L2 message families used for A-share processing. Tuple subscription and
   instrument-universe filtering are separate: the immutable daily catalog is
@@ -390,12 +390,11 @@ subsequence as a completeness proof. Channel faults retain the separate
 diagnostic endpoint. Gap telemetry uses the fixed per-lane/per-channel mailbox
 and dirty bitmap described above.
 
-The executable gives each owner endpoint to exactly one drain thread. That
-thread also owns the corresponding Event and KLine workers when those outputs
-are enabled. It polls `TryPollTickDispatch(owner, ...)` and forwards each record
-to both enabled runtimes; only projectable kinds enter Arrow. It never assigns a
-second consumer to the owner endpoint. Calling one owner endpoint from multiple
-consumers violates the SPSC contract.
+The executable gives every enabled `(consumer, owner)` cursor to exactly one
+owner drain thread. That thread also owns the corresponding Event and KLine
+workers. It polls `TryPollTickDispatch(consumer, owner, ...)` independently for
+Event, KLine, and Arrow; only projectable kinds enter Arrow. Calling the same
+cursor from multiple threads violates its exclusive-consumer contract.
 
 ### Disposition outbox
 
@@ -457,15 +456,15 @@ hole ledger         = observed_channels * reorder_entries * sizeof(hole interval
 gap state           = tick_lanes * max_channels * sizeof(gap mailbox slot)
 Event hot suffix    = sum_channels(E-R) + accepted inflight + eviction lag
 Event carry orders  = full baselines + retained order-use suffixes
-Event staging       = repair + END + pending revisions + ACK joins
-KLine               = bars + heads + pending revisions + ACK joins
+Event staging       = repair + END + pending revision batches
+KLine               = bars + heads + pending revision batches
 FactJournal         = process-lifetime file + directory + hot cache
 ```
 
 Event enforces independent hard caps for hot fact count/estimated bytes, carry
 order count, conservative order-history bytes, repair bytes, Shanghai END
-candidates/rows/staging bytes, pending revision bytes, and ACK join entries. Its
-eviction is node/estimated-byte sliced and compacts order histories to a full
+candidates/rows/staging bytes, and pending revision-batch count. Its eviction
+is node/estimated-byte sliced and compacts order histories to a full
 private-state baseline before erasing closed fact/Bundle/head/phase/barrier
 state. In no-gap traffic `R=E`, so the logical Event fact suffix normally
 approaches zero instead of retaining a fixed full window.
@@ -524,7 +523,8 @@ Shutdown order is fixed:
 
 Owner consumers no longer wait on a raw ACK inbox. Raw `Stop()` and derived
 flush can proceed independently once decoder lanes have published the last
-outbox records. A slow Event or KLine plane does not require killing raw.
+outbox records. This ordering independence does not weaken the executable's
+fail-stop policy: failure of any enabled persistence plane ends the session.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
 to reach zero before releasing Subscriber and IOManager. If vendor shutdown

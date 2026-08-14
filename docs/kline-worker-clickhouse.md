@@ -283,15 +283,17 @@ limitations are documented in
 
 ### 7.1 Batch observability
 
-KLine metrics are updated at micro-batch, pending-commit, request, group, or
-queue transitions; no new atomic operation is performed for each serialized
-revision row. `mdl_ingestd` exports raw cumulative counters so a monitoring
-system can compute rates and averages from interval deltas:
+KLine metrics are updated at micro-batch, pending-revision-batch, request,
+group, or queue transitions; no new atomic operation is performed for each
+serialized revision row. `mdl_ingestd` exports unaggregated cumulative counters
+so a monitoring system can compute rates and averages from interval deltas:
 
 - runtime micro-batch facts, maximum rows, maximum source age, and row-limit,
   timer, and explicit flush counts;
 - worker pending revision rows and conservative logical-owned bytes, with
   per-owner high-water marks aggregated as the maximum owner HWM;
+- `pending_revision_batches`, the number of immutable logical batches not yet
+  accepted by the KLine revision sink; it has no raw-ACK dependency;
 - cumulative logical rows/batches queued, ACKed, and released;
 - successful revision and marker request counts, rows, bytes, latency totals,
   and lifetime maxima;
@@ -306,11 +308,10 @@ counts an explicit flush call whose active batch is empty and which only
 services pending worker state; it therefore need not equal the number of
 explicitly applied micro-batches.
 
-Pending owned bytes include the immutable batch object/control estimate,
-revision vector capacity, and raw-dependency tree nodes. They exclude deque
-implementation storage and are not allocator RSS. They return to zero when the
-worker pending FIFO drains; the sink queue has separate current row/batch
-gauges.
+Pending owned bytes include the immutable batch object/control estimate and
+revision vector capacity. They exclude deque implementation storage and
+are not allocator RSS. They return to zero when the worker pending FIFO drains;
+the sink queue has separate current row/batch gauges.
 
 For a window `[t0,t1]`, request density is
 `delta(revision_insert_rows) / delta(revision_insert_requests)` and mean client

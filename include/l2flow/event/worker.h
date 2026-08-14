@@ -78,6 +78,8 @@ struct EventWorkerConfig final {
     std::size_t maximum_hot_fact_bytes =
         4ULL * 1'024ULL * 1'024ULL * 1'024ULL;
     std::size_t maximum_cached_events = 16U * 1'024U * 1'024U;
+    // Maximum immutable logical revision batches awaiting submission to the
+    // derived Event sink; the unit is batches, not rows or raw ACKs.
     std::size_t maximum_pending_commits = 1'024U;
     std::size_t maximum_pending_revision_bytes =
         256U * 1'024U * 1'024U;
@@ -158,7 +160,9 @@ struct EventWorkerStats final {
     std::uint64_t bundles_reassembled = 0U;
     std::uint64_t revisions_created = 0U;
     std::uint64_t tombstones_created = 0U;
-    std::uint64_t pending_raw_commits = 0U;
+    // Immutable logical revision batches waiting for submission to the Event
+    // revision sink. This count has no raw-persistence or raw-ACK dependency.
+    std::uint64_t pending_revision_batches = 0U;
     std::uint64_t revision_batches_submitted = 0U;
     std::uint64_t persistence_groups_submitted = 0U;
     std::uint64_t persistence_group_batches_max = 0U;
@@ -233,9 +237,10 @@ public:
     [[nodiscard]] bool ApplyChannelSeal(const ChannelSeal& seal) noexcept;
     [[nodiscard]] bool ContinueEviction() noexcept;
     [[nodiscard]] bool AdvanceRepair() noexcept;
-    // Advance closes only full or timed-out persistence groups. Flush also
-    // closes a final partial group and is reserved for quiescent shutdown and
-    // explicit durability barriers.
+    // Advance closes only full or timed-out derived persistence groups. Flush
+    // also submits a final partial group and is reserved for quiescent
+    // shutdown and explicit derived-persistence barriers. Neither method
+    // consults raw persistence state or waits for a raw ACK.
     [[nodiscard]] bool AdvanceDurableCommits() noexcept;
     [[nodiscard]] bool FlushDurableCommits() noexcept;
     [[nodiscard]] bool repair_pending() const noexcept;

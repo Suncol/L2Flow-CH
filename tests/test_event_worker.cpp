@@ -466,7 +466,7 @@ const EventPayload& FindPayload(
     return found->second;
 }
 
-void TestLateAddRepairsOnlyReferencedChainAndWaitsForRawAck() {
+void TestLateAddRepairsOnlyReferencedChainAndFlushesDerivedBatch() {
     RecordingSink sink;
     const std::filesystem::path path = TestJournalPath("cold-repair");
     const auto fact_journal = MakeTestJournal(path);
@@ -580,7 +580,7 @@ void TestJournalFirstSameBatchDoesNotPublishUnknownIntermediate() {
         bundle, EventKind::kShenzhenOrderRevision, 101));
 }
 
-void TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo() {
+void TestRevisionBatchesPreserveFifoWithoutRawAckGate() {
     RecordingSink sink;
     std::string error;
     std::unique_ptr<EventWorker> worker =
@@ -2292,9 +2292,9 @@ void TestPendingCommitDequeAccountingReturnsToBaseline() {
         previous = current;
     }
     CHECK(saw_deque_block_growth);
-    CHECK(worker->stats().pending_raw_commits == kCommitCount);
+    CHECK(worker->stats().pending_revision_batches == kCommitCount);
     AckAll(worker.get(), ticks);
-    CHECK(worker->stats().pending_raw_commits == 0U);
+    CHECK(worker->stats().pending_revision_batches == 0U);
     CHECK(worker->stats().pending_revision_bytes == baseline);
     CHECK(worker->stats().pending_revision_bytes_high_watermark > baseline);
 }
@@ -2679,7 +2679,7 @@ void TestEvictionByteSliceIncludesCarryOrderRetirement() {
     CHECK(sliced->stats().hot_facts == 0U);
 }
 
-void TestRuntimeRoutesOwnersAndJoinsRawAcks() {
+void TestRuntimeRoutesOwnersAndFlushesDerivedBatches() {
     RecordingSink sink;
     EventRuntimeConfig config = RuntimeConfig();
     config.worker.owner_count = 2U;
@@ -2827,7 +2827,7 @@ void TestPersistenceGroupingIsIndependentFromControlFences() {
     CHECK(before_drain.facts_in_micro_batches == 1U);
     CHECK(before_drain.forced_active_flushes == 1U);
     CHECK(before_drain.empty_control_flushes == 1U);
-    CHECK(before_drain.workers.pending_raw_commits == 1U);
+    CHECK(before_drain.workers.pending_revision_batches == 1U);
     CHECK(before_drain.workers.persistence_groups_submitted == 0U);
 
     CHECK(runtime->DrainAll());
@@ -2873,7 +2873,7 @@ void TestOwnerPersistenceAggregatorClosesAtBatchBound() {
     CHECK(stats.persistence_group_batches_max == 2U);
     CHECK(stats.persistence_group_rows_max == 2U);
     CHECK(stats.revision_batches_submitted == 2U);
-    CHECK(stats.pending_raw_commits == 0U);
+    CHECK(stats.pending_revision_batches == 0U);
 }
 
 void TestOwnerPersistenceAggregatorClosesAtPendingCapacity() {
@@ -2903,7 +2903,7 @@ void TestOwnerPersistenceAggregatorClosesAtPendingCapacity() {
     CHECK(sink.group_sizes.size() == 1U);
     CHECK(sink.group_sizes.front() == 2U);
     CHECK(sink.batches.size() == 2U);
-    CHECK(worker->stats().pending_raw_commits == 0U);
+    CHECK(worker->stats().pending_revision_batches == 0U);
 }
 
 void TestRuntimeAckDrainIsBoundedAndSourceTimeDoesNotDriveTimer() {
@@ -3456,9 +3456,9 @@ void TestJournalCorruptionFailsClosed() {
 }  // namespace
 
 int main() {
-    TestLateAddRepairsOnlyReferencedChainAndWaitsForRawAck();
+    TestLateAddRepairsOnlyReferencedChainAndFlushesDerivedBatch();
     TestJournalFirstSameBatchDoesNotPublishUnknownIntermediate();
-    TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo();
+    TestRevisionBatchesPreserveFifoWithoutRawAckGate();
     TestUnresolvedLateCancelConvergesBeforeLaterTrade();
     TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment();
     TestShanghaiBarrierBulkRolesStayOrdered();
@@ -3495,7 +3495,7 @@ int main() {
     TestPhaseDequeBlockGrowthIsPreflightedAndCompactsToAnchor();
     TestEndBarrierIndexIsPreflightedAndReleased();
     TestEvictionByteSliceIncludesCarryOrderRetirement();
-    TestRuntimeRoutesOwnersAndJoinsRawAcks();
+    TestRuntimeRoutesOwnersAndFlushesDerivedBatches();
     TestRuntimeDrainAllFlushesFinalPartialBatch();
     TestPersistenceGroupingIsIndependentFromControlFences();
     TestOwnerPersistenceAggregatorClosesAtBatchBound();

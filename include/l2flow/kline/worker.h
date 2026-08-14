@@ -50,6 +50,8 @@ struct KLineWorkerConfig final {
     std::shared_ptr<journal::CanonicalFactJournal> fact_journal;
 
     std::size_t maximum_bars = 4U * 1'024U * 1'024U;
+    // Maximum immutable logical revision batches awaiting submission to the
+    // derived KLine sink; the unit is batches, not rows or raw ACKs.
     std::size_t maximum_pending_commits = 1'024U;
 };
 
@@ -82,7 +84,9 @@ struct KLineWorkerStats final {
     std::uint64_t bars_created = 0U;
     std::uint64_t bars_updated = 0U;
     std::uint64_t revisions_created = 0U;
-    std::uint64_t pending_raw_commits = 0U;
+    // Immutable logical revision batches waiting for submission to the KLine
+    // revision sink. This count has no raw-persistence or raw-ACK dependency.
+    std::uint64_t pending_revision_batches = 0U;
     // Conservative logical-owned bytes for immutable revision batches and
     // revision vector capacity. This excludes the deque's implementation
     // storage and is not allocator RSS.
@@ -110,6 +114,8 @@ public:
 
     [[nodiscard]] KLineApplyResult ApplyBatch(
         std::span<const KLineInput> inputs) noexcept;
+    // Submit every pending derived revision batch. This has no dependency on
+    // raw persistence state or raw acknowledgements.
     [[nodiscard]] bool DrainDurableCommits() noexcept;
 
     [[nodiscard]] bool CopyBar(const KLineKey& key,

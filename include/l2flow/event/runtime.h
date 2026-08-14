@@ -80,8 +80,8 @@ public:
         std::uint64_t monotonic_ns) noexcept;
     [[nodiscard]] bool Flush(std::size_t owner) noexcept;
 
-    // Call with owner threads quiesced. DrainAll is useful after the raw sink
-    // has stopped and delivered the final partial-batch ACKs.
+    // Call with owner threads quiesced. Raw and derived persistence are
+    // independent; neither operation waits for raw acknowledgements.
     [[nodiscard]] bool FlushAll() noexcept;
     [[nodiscard]] bool DrainAll() noexcept;
 

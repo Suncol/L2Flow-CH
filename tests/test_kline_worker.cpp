@@ -651,7 +651,7 @@ void TestPendingRevisionRowsAndOwnedBytesAccounting() {
     CHECK(applied.revisions_created == 2U);
 
     KLineWorkerStats stats = worker->stats();
-    CHECK(stats.pending_raw_commits == 0U);
+    CHECK(stats.pending_revision_batches == 0U);
     CHECK(stats.pending_revision_rows == 0U);
     CHECK(stats.pending_revision_bytes == 0U);
     CHECK(stats.pending_revision_rows_high_watermark == 2U);
@@ -703,7 +703,7 @@ void TestRuntimeMicroBatchFlushMetrics() {
     CHECK(stats.row_limit_flushes == 1U);
     CHECK(stats.timer_flushes == 1U);
     CHECK(stats.explicit_flushes == 2U);
-    CHECK(stats.workers.pending_raw_commits == 0U);
+    CHECK(stats.workers.pending_revision_batches == 0U);
     CHECK(stats.workers.pending_revision_rows == 0U);
     CHECK(stats.workers.pending_revision_bytes == 0U);
     CHECK(runtime->DrainAll());

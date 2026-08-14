@@ -316,7 +316,7 @@ void PrintUsage() {
         << "  --event-maximum-hot-facts N default 16777216 per owner\n"
         << "  --event-maximum-hot-fact-bytes N default 4294967296 per owner\n"
         << "  --event-maximum-cached-events N default 16777216 per owner\n"
-        << "  --event-maximum-pending-commits N default 1024 per owner\n"
+        << "  --event-maximum-pending-revision-batches N default 1024 per owner\n"
         << "  --event-maximum-pending-revision-bytes N default 268435456 per owner\n"
         << "  --event-maximum-repair-bytes N default 536870912 per owner\n"
         << "  --event-maximum-end-candidates N default 2097152 per owner\n"
@@ -348,7 +348,7 @@ void PrintUsage() {
         << "  --kline-queue-revision-batches N default 1024\n"
         << "  --kline-queue-revision-rows N default 1048576\n"
         << "  --kline-maximum-bars N     default 4194304 per owner\n"
-        << "  --kline-maximum-pending-commits N default 1024 per owner\n"
+        << "  --kline-maximum-pending-revision-batches N default 1024 per owner\n"
 #endif
         << "  --run-seconds N            test mode only; 0 means until signal, "
            "max 86400\n"
@@ -1317,11 +1317,14 @@ struct CpuSelection final {
                 return false;
             }
             event_option_seen = true;
-        } else if (argument == "--event-maximum-pending-commits") {
+        } else if (
+            argument == "--event-maximum-pending-revision-batches" ||
+            argument == "--event-maximum-pending-commits") {
             if (!ParseInteger(
                     next(argument),
                     &parsed.event.worker.maximum_pending_commits)) {
-                *error = "invalid --event-maximum-pending-commits";
+                *error =
+                    "invalid --event-maximum-pending-revision-batches";
                 return false;
             }
             event_option_seen = true;
@@ -1567,11 +1570,14 @@ struct CpuSelection final {
                 return false;
             }
             kline_option_seen = true;
-        } else if (argument == "--kline-maximum-pending-commits") {
+        } else if (
+            argument == "--kline-maximum-pending-revision-batches" ||
+            argument == "--kline-maximum-pending-commits") {
             if (!ParseInteger(
                     next(argument),
                     &parsed.kline.worker.maximum_pending_commits)) {
-                *error = "invalid --kline-maximum-pending-commits";
+                *error =
+                    "invalid --kline-maximum-pending-revision-batches";
                 return false;
             }
             kline_option_seen = true;
@@ -2104,8 +2110,8 @@ void PrintEventStats(
               << " event_hot_fact_bytes_hwm="
               << runtime.workers.hot_fact_bytes_high_watermark
               << " event_revisions=" << runtime.workers.revisions_created
-              << " event_pending_raw="
-              << runtime.workers.pending_raw_commits
+              << " event_pending_revision_batches="
+              << runtime.workers.pending_revision_batches
               << " event_persistence_groups_submitted="
               << runtime.workers.persistence_groups_submitted
               << " event_persistence_group_batches_max="
@@ -2190,8 +2196,8 @@ void PrintKLineStats(
               << " kline_bars_created=" << runtime.workers.bars_created
               << " kline_bars_updated=" << runtime.workers.bars_updated
               << " kline_revisions=" << runtime.workers.revisions_created
-              << " kline_pending_raw="
-              << runtime.workers.pending_raw_commits
+              << " kline_pending_revision_batches="
+              << runtime.workers.pending_revision_batches
               << " kline_pending_revision_rows="
               << runtime.workers.pending_revision_rows
               << " kline_pending_revision_rows_owner_hwm_max="
@@ -3137,9 +3143,8 @@ int main(int argc, char** argv) {
         print_mdl_readiness_summary();
         stop_engine_producers();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-        // Raw Stop joins every writer and therefore closes the ACK producer
-        // side. Owner threads remain alive until then so ACK-first joins cannot
-        // overflow merely because shutdown has begun.
+        // Raw and derived writers have independent persistence lifecycles.
+        // Stop raw first here only to preserve the common shutdown ordering.
         stop_clickhouse_raw();
 #endif
         finish_owner_drain();
@@ -3190,10 +3195,10 @@ int main(int argc, char** argv) {
                 event_runtime == nullptr || event_runtime->healthy(),
                 kline_runtime == nullptr || kline_runtime->healthy(),
                 event_runtime != nullptr &&
-                    event_runtime->stats().workers.pending_raw_commits !=
+                    event_runtime->stats().workers.pending_revision_batches !=
                         0U,
                 kline_runtime != nullptr &&
-                    kline_runtime->stats().workers.pending_raw_commits !=
+                    kline_runtime->stats().workers.pending_revision_batches !=
                         0U,
 #else
                 false, false, true, true, false, false,
@@ -3302,8 +3307,8 @@ int main(int argc, char** argv) {
     }
 
     // Shutdown order is contractual: quiesce SDK callbacks and decoder
-    // producers, keep owner service alive while raw writers deliver their last
-    // ACKs, then close the owner consumers and derived sinks.
+    // producers, stop the independent raw writers, drain every owner cursor,
+    // then flush and stop the derived writers.
     sdk->Shutdown();
     stop_engine_producers();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
@@ -3331,9 +3336,9 @@ int main(int argc, char** argv) {
         event_runtime == nullptr || event_runtime->healthy(),
         kline_runtime == nullptr || kline_runtime->healthy(),
         event_runtime != nullptr &&
-            event_runtime->stats().workers.pending_raw_commits != 0U,
+            event_runtime->stats().workers.pending_revision_batches != 0U,
         kline_runtime != nullptr &&
-            kline_runtime->stats().workers.pending_raw_commits != 0U,
+            kline_runtime->stats().workers.pending_revision_batches != 0U,
 #else
         false, false, true, true, false, false,
 #endif

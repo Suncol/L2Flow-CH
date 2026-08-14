@@ -1725,7 +1725,7 @@ struct AtomicEventWorkerStats final {
     std::atomic<std::uint64_t> bundles_reassembled{0U};
     std::atomic<std::uint64_t> revisions_created{0U};
     std::atomic<std::uint64_t> tombstones_created{0U};
-    std::atomic<std::uint64_t> pending_raw_commits{0U};
+    std::atomic<std::uint64_t> pending_revision_batches{0U};
     std::atomic<std::uint64_t> revision_batches_submitted{0U};
     std::atomic<std::uint64_t> persistence_groups_submitted{0U};
     std::atomic<std::uint64_t> persistence_group_batches_max{0U};
@@ -2125,7 +2125,7 @@ public:
         if (pending_revision_bytes_ >
             config_.maximum_pending_revision_bytes) {
             throw std::length_error(
-                "Event pending-commit deque exceeds byte cap");
+                "Event pending revision-batch deque exceeds byte cap");
         }
         if (order_history_bytes_ >
             config_.maximum_order_history_bytes) {
@@ -2788,17 +2788,9 @@ public:
         return AdvanceRepairSlice(nullptr);
     }
 
-
-
-    [[nodiscard]] bool PendingCommitDurable(
-        const PendingCommit& commit) const noexcept {
-        static_cast<void>(commit);
-        return true;
-    }
-
     [[nodiscard]] bool ReleaseFrontPendingCommit() noexcept {
         if (pending_commits_.empty()) {
-            SetFatal("Event pending commit release underflow");
+            SetFatal("Event pending revision batch release underflow");
             return false;
         }
         PendingCommit& commit = pending_commits_.front();
@@ -2807,7 +2799,8 @@ public:
         const std::size_t new_queue = DequeOwnedBytes<PendingCommit>(
             pending_commits_.size() - 1U);
         if (new_queue > old_queue) {
-            SetFatal("Event pending-commit deque accounting increased");
+            SetFatal(
+                "Event pending revision-batch deque accounting increased");
             return false;
         }
         const std::size_t released_bytes = SaturatingAdd(
@@ -2818,7 +2811,7 @@ public:
         }
         pending_revision_bytes_ -= released_bytes;
         pending_commits_.pop_front();
-        stats_.pending_raw_commits.store(
+        stats_.pending_revision_batches.store(
             pending_commits_.size(), std::memory_order_relaxed);
         PublishPendingRevisionBytes();
         return true;
@@ -2831,9 +2824,6 @@ public:
         try {
             while (!pending_commits_.empty()) {
                 PendingCommit& front = pending_commits_.front();
-                if (!PendingCommitDurable(front)) {
-                    return true;
-                }
                 if (front.batch->revisions.empty()) {
                     if (!ReleaseFrontPendingCommit()) {
                         return false;
@@ -2846,9 +2836,6 @@ public:
                 std::size_t byte_count = 0U;
                 bool closed = false;
                 for (const PendingCommit& commit : pending_commits_) {
-                    if (!PendingCommitDurable(commit)) {
-                        break;
-                    }
                     if (commit.batch->revisions.empty()) {
                         closed = true;
                         break;
@@ -3039,8 +3026,9 @@ public:
             std::memory_order_relaxed);
         result.tombstones_created = stats_.tombstones_created.load(
             std::memory_order_relaxed);
-        result.pending_raw_commits = stats_.pending_raw_commits.load(
-            std::memory_order_relaxed);
+        result.pending_revision_batches =
+            stats_.pending_revision_batches.load(
+                std::memory_order_relaxed);
         result.revision_batches_submitted =
             stats_.revision_batches_submitted.load(
                 std::memory_order_relaxed);
@@ -3687,7 +3675,7 @@ private:
             return true;
         }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
-            SetFatal("Event pending raw commit capacity exhausted");
+            SetFatal("Event pending revision batch capacity exhausted");
             return false;
         }
         const std::size_t payload_bytes = PendingCommitPayloadOwnedBytes(
@@ -3703,7 +3691,7 @@ private:
         pending_commits_.push_back(PendingCommit{
             std::move(batch), payload_bytes, ingest::MonotonicNowNs()});
         pending_revision_bytes_ += additional_bytes;
-        stats_.pending_raw_commits.store(
+        stats_.pending_revision_batches.store(
             pending_commits_.size(), std::memory_order_relaxed);
         PublishPendingRevisionBytes();
         return true;
@@ -4893,7 +4881,7 @@ private:
         }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
             static_cast<void>(CapacityFailure(
-                result, "Event pending raw commit capacity exhausted"));
+                result, "Event pending revision batch capacity exhausted"));
             return false;
         }
 

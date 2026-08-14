@@ -284,6 +284,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --fact-journal-maximum-directory-pages 16
                 --event-revision-epoch 9
                 --event-writer-lanes 4
+                --event-maximum-pending-revision-batches 32
                 --event-calculation-run-id
                     000102030405060708090a0b0c0d0e0f
                 --validate-only)
@@ -345,6 +346,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --kline-interval-seconds 5
                 --kline-revision-epoch 10
                 --kline-writer-lanes 4
+                --kline-maximum-pending-revision-batches 32
                 --kline-calculation-run-id
                     101112131415161718191a1b1c1d1e1f
                 --validate-only)
@@ -597,9 +599,16 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
         add_test(
             NAME fact_journal_benchmark_smoke
             COMMAND benchmark_fact_journal
-                --rate 10000 --seconds 1 --batch-rows 128 --owners 4
+                --rate 10000 --seconds 5 --batch-rows 128 --owners 4
                 --journal-dir /tmp --hot-cache 4096 --probe-samples 64
                 --mixed-read-rate 100 --seed-records 16)
+        # The final fdatasync is inside the timed boundary. A five-second
+        # window gives the 1% gate a 50 ms shutdown-tail budget; the previous
+        # one-second window flaked when an otherwise healthy fdatasync took
+        # just over 10 ms. Keep the test serial so unrelated disk/CPU work
+        # does not consume that budget.
+        set_tests_properties(
+            fact_journal_benchmark_smoke PROPERTIES RUN_SERIAL TRUE)
     endif()
 
     add_executable(benchmark_mdl_ingest benchmarks/benchmark_mdl_ingest.cpp)
