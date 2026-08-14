@@ -1,5 +1,6 @@
 #include "l2flow/ingest/engine.h"
 
+#include "l2flow/ingest/outbox.h"
 #include "l2flow/ingest/raw_tap.h"
 
 #include "decoder_internal.h"
@@ -429,7 +430,10 @@ public:
                std::size_t owners,
                std::size_t queue_capacity,
                std::size_t fault_capacity,
-               std::size_t maximum_channels_per_tick_producer)
+               std::size_t maximum_channels_per_tick_producer,
+               std::size_t tick_consumer_count,
+               std::size_t outbox_records_per_lane,
+               std::uint64_t feed_session_epoch)
         : tick_producers_(tick_producers),
           snapshot_producers_(snapshot_producers),
           owners_(owners),
@@ -442,14 +446,19 @@ public:
               tick_producers * gap_words_per_producer_)),
           gap_consumer_pending_(
               tick_producers * gap_words_per_producer_, 0U),
-          tick_dispatch_fences_(tick_producers * owners, 0U),
-          tick_consumer_cursor_(owners, 0U),
           snapshot_consumer_cursor_(owners, 0U) {
-        tick_dispatch_queues_.reserve(tick_producers * owners);
-        for (std::size_t index = 0U; index < tick_producers * owners;
-             ++index) {
-            tick_dispatch_queues_.push_back(
-                std::make_unique<SpscRing<TickDispatch>>(queue_capacity));
+        const std::size_t resolved_outbox =
+            outbox_records_per_lane == 0U
+                ? queue_capacity * owners
+                : outbox_records_per_lane;
+        std::string outbox_error;
+        tick_outbox_ = DispositionOutbox::Create(
+            tick_producers, owners, tick_consumer_count, resolved_outbox,
+            feed_session_epoch, &outbox_error);
+        if (tick_outbox_ == nullptr) {
+            throw std::runtime_error(
+                outbox_error.empty() ? "tick outbox creation failed"
+                                     : outbox_error);
         }
         snapshot_queues_.reserve(snapshot_producers * owners);
         for (std::size_t index = 0U; index < snapshot_producers * owners;
@@ -477,19 +486,9 @@ public:
         if (producer >= tick_producers_ || owner >= owners_) {
             return false;
         }
-        const std::size_t index = producer * owners_ + owner;
-        std::uint64_t& fence = tick_dispatch_fences_[index];
-        if (fence == std::numeric_limits<std::uint64_t>::max()) {
-            return false;
-        }
         TickDispatch published = dispatch;
         published.owner = static_cast<std::uint32_t>(owner);
-        published.dispatch_fence = fence + 1U;
-        if (!tick_dispatch_queues_[index]->TryPush(published)) {
-            return false;
-        }
-        ++fence;
-        return true;
+        return tick_outbox_->Append(producer, published);
     }
 
     [[nodiscard]] bool PublishTickControl(
@@ -498,25 +497,9 @@ public:
         if (producer >= tick_producers_) {
             return false;
         }
-        const std::size_t first = producer * owners_;
-        for (std::size_t owner = 0U; owner < owners_; ++owner) {
-            const std::size_t index = first + owner;
-            if (tick_dispatch_fences_[index] ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                !tick_dispatch_queues_[index]->CanPush()) {
-                return false;
-            }
-        }
-        for (std::size_t owner = 0U; owner < owners_; ++owner) {
-            const std::size_t index = first + owner;
-            TickDispatch published = control;
-            published.owner = static_cast<std::uint32_t>(owner);
-            published.dispatch_fence = ++tick_dispatch_fences_[index];
-            if (!tick_dispatch_queues_[index]->TryPush(published)) {
-                return false;
-            }
-        }
-        return true;
+        TickDispatch published = control;
+        published.owner = kOutboxBroadcastOwner;
+        return tick_outbox_->Append(producer, published);
     }
 
     [[nodiscard]] bool PublishSnapshot(
@@ -556,21 +539,18 @@ public:
     }
 
     [[nodiscard]] bool TryPollTickDispatch(
+        std::size_t consumer,
         std::size_t owner,
         TickDispatch* output) noexcept {
-        if (owner >= owners_ || output == nullptr) {
-            return false;
-        }
-        std::size_t& cursor = tick_consumer_cursor_[owner];
-        for (std::size_t count = 0U; count < tick_producers_; ++count) {
-            const std::size_t producer = (cursor + count) % tick_producers_;
-            if (tick_dispatch_queues_[producer * owners_ + owner]->TryPop(
-                    output)) {
-                cursor = (producer + 1U) % tick_producers_;
-                return true;
-            }
-        }
-        return false;
+        return tick_outbox_->TryRead(consumer, owner, output);
+    }
+
+    [[nodiscard]] DispositionOutbox* tick_outbox() noexcept {
+        return tick_outbox_.get();
+    }
+
+    [[nodiscard]] const DispositionOutbox* tick_outbox() const noexcept {
+        return tick_outbox_.get();
     }
 
     [[nodiscard]] bool TryPollSnapshot(
@@ -660,8 +640,7 @@ private:
     std::size_t tick_producers_ = 0U;
     std::size_t snapshot_producers_ = 0U;
     std::size_t owners_ = 0U;
-    std::vector<std::unique_ptr<SpscRing<TickDispatch>>>
-        tick_dispatch_queues_;
+    std::unique_ptr<DispositionOutbox> tick_outbox_;
     std::vector<std::unique_ptr<SpscRing<CanonicalSnapshot>>>
         snapshot_queues_;
     std::vector<std::unique_ptr<SpscRing<ChannelFault>>> fault_queues_;
@@ -670,8 +649,6 @@ private:
     std::unique_ptr<GapMailboxSlot[]> gap_slots_;
     std::unique_ptr<std::atomic<std::uint64_t>[]> gap_dirty_words_;
     std::vector<std::uint64_t> gap_consumer_pending_;
-    std::vector<std::uint64_t> tick_dispatch_fences_;
-    std::vector<std::size_t> tick_consumer_cursor_;
     std::vector<std::size_t> snapshot_consumer_cursor_;
     std::size_t gap_consumer_word_cursor_ = 0U;
     std::size_t fault_consumer_cursor_ = 0U;
@@ -1675,6 +1652,14 @@ private:
         config.diagnostic_queue_capacity < 2U) {
         return fail("slot, body, or dispatch capacity is too small");
     }
+    if (config.tick_consumer_count == 0U ||
+        config.tick_consumer_count > kMaximumTickConsumers) {
+        return fail("tick_consumer_count must be in [1, 8]");
+    }
+    if (config.outbox_records_per_lane != 0U &&
+        config.outbox_records_per_lane < 2U) {
+        return fail("outbox_records_per_lane must be 0 or at least 2");
+    }
     if (config.maximum_channels_per_tick_lane == 0U) {
         return fail("maximum_channels_per_tick_lane must be positive");
     }
@@ -1752,7 +1737,10 @@ public:
                       config.instrument_workers,
                       config.dispatch_queue_capacity,
                       config.diagnostic_queue_capacity,
-                      config.maximum_channels_per_tick_lane) {
+                      config.maximum_channels_per_tick_lane,
+                      config.tick_consumer_count,
+                      config.outbox_records_per_lane,
+                      config.feed_session_epoch) {
         tick_lanes_.reserve(config_.tick_decoder_lanes);
         tick_recovery_.reserve(config_.tick_decoder_lanes);
         for (std::size_t index = 0U; index < config_.tick_decoder_lanes;
@@ -2002,9 +1990,18 @@ public:
     }
 
     [[nodiscard]] bool TryPollTickDispatch(
+        std::size_t consumer,
         std::size_t owner,
         TickDispatch* output) noexcept {
-        return dispatcher_.TryPollTickDispatch(owner, output);
+        return dispatcher_.TryPollTickDispatch(consumer, owner, output);
+    }
+
+    [[nodiscard]] DispositionOutbox* tick_outbox() noexcept {
+        return dispatcher_.tick_outbox();
+    }
+
+    [[nodiscard]] const DispositionOutbox* tick_outbox() const noexcept {
+        return dispatcher_.tick_outbox();
     }
 
     [[nodiscard]] bool TryPollSnapshot(
@@ -2600,7 +2597,22 @@ AdmissionResult IngestEngine::AdmitMdlMessage(
 bool IngestEngine::TryPollTickDispatch(
     std::size_t owner,
     TickDispatch* output) noexcept {
-    return impl_->TryPollTickDispatch(owner, output);
+    return impl_->TryPollTickDispatch(0U, owner, output);
+}
+
+bool IngestEngine::TryPollTickDispatch(
+    std::size_t consumer,
+    std::size_t owner,
+    TickDispatch* output) noexcept {
+    return impl_->TryPollTickDispatch(consumer, owner, output);
+}
+
+DispositionOutbox* IngestEngine::tick_outbox() noexcept {
+    return impl_->tick_outbox();
+}
+
+const DispositionOutbox* IngestEngine::tick_outbox() const noexcept {
+    return impl_->tick_outbox();
 }
 
 bool IngestEngine::TryPollSnapshot(std::size_t owner,

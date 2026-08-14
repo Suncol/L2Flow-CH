@@ -11,7 +11,6 @@
 namespace l2flow::kline {
 
 using l2flow::common::Identifier128;
-using l2flow::ingest::CanonicalKind;
 using l2flow::ingest::Market;
 
 inline constexpr std::uint32_t kKLineSchemaVersion = 1U;
@@ -126,16 +125,6 @@ public:
 
     [[nodiscard]] virtual bool AppendRevisionBatch(
         std::shared_ptr<const KLineRevisionBatch> batch) noexcept = 0;
-};
-
-struct RawTickDependency final {
-    std::uint64_t ingress_sequence = 0U;
-    CanonicalKind kind = CanonicalKind::kShanghaiTick;
-
-    friend constexpr bool operator==(const RawTickDependency&,
-                                     const RawTickDependency&) = default;
-    friend constexpr auto operator<=>(const RawTickDependency&,
-                                      const RawTickDependency&) = default;
 };
 
 }  // namespace l2flow::kline

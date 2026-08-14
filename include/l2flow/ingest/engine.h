@@ -3,6 +3,7 @@
 #include "l2flow/ingest/canonical.h"
 #include "l2flow/ingest/catalog.h"
 #include "l2flow/ingest/message.h"
+#include "l2flow/ingest/outbox.h"
 
 #include <atomic>
 #include <cstddef>
@@ -31,8 +32,13 @@ struct EngineConfig final {
     std::size_t snapshot_slots_per_lane = 512U;
     std::size_t maximum_tick_body_bytes = 512U;
     std::size_t maximum_snapshot_body_bytes = 64U * 1024U;
-    // Capacity is per producer-lane -> instrument-owner SPSC edge.
+    // Snapshot/fault SPSC capacity per producer-owner edge.
     std::size_t dispatch_queue_capacity = 1'024U;
+    // Independent TickDispatch consumers (Event, KLine, Arrow, or a
+    // test drain). Each owner of each consumer has its own outbox cursor.
+    std::size_t tick_consumer_count = 1U;
+    // Per-lane outbox slots. Zero uses dispatch_queue_capacity * owners.
+    std::size_t outbox_records_per_lane = 0U;
     // Gap telemetry uses one coalescing mailbox per native Channel plus a dirty
     // bitmap. Correctness controls use the owner TickDispatch FIFOs.
     std::size_t diagnostic_queue_capacity = 4'096U;
@@ -108,12 +114,16 @@ public:
         std::span<const std::byte> body,
         std::uint64_t receive_monotonic_ns) noexcept;
 
-    // Each owner index is a single-consumer endpoint. Production mdl_ingestd
-    // assigns one owner drain thread to these calls and forwards TickDispatch
-    // records to the Event/KLine runtimes.
+    // Consumer 0 drain. Ingest-only tests use this single consumer.
     [[nodiscard]] bool TryPollTickDispatch(
         std::size_t owner,
         TickDispatch* output) noexcept;
+    [[nodiscard]] bool TryPollTickDispatch(
+        std::size_t consumer,
+        std::size_t owner,
+        TickDispatch* output) noexcept;
+    [[nodiscard]] DispositionOutbox* tick_outbox() noexcept;
+    [[nodiscard]] const DispositionOutbox* tick_outbox() const noexcept;
     [[nodiscard]] bool TryPollSnapshot(
         std::size_t owner,
         CanonicalSnapshot* output) noexcept;

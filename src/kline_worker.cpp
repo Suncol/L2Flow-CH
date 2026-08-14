@@ -17,7 +17,6 @@
 #include <stdexcept>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -54,16 +53,6 @@ struct KLineKeyHash final {
         HashAppend(&state, key.instrument_id);
         HashAppend(&state, key.interval_seconds);
         HashAppend(&state, key.bucket_start_ns_from_midnight);
-        return static_cast<std::size_t>(state);
-    }
-};
-
-struct RawTickDependencyHash final {
-    [[nodiscard]] std::size_t operator()(
-        const RawTickDependency& dependency) const noexcept {
-        std::uint64_t state = UINT64_C(0xa4093822299f31d0);
-        HashAppend(&state, dependency.ingress_sequence);
-        HashAppend(&state, dependency.kind);
         return static_cast<std::size_t>(state);
     }
 };
@@ -350,8 +339,7 @@ template <typename Value>
 }
 
 [[nodiscard]] std::size_t PendingCommitOwnedBytes(
-    const std::shared_ptr<const KLineRevisionBatch>& batch,
-    std::size_t dependency_count) noexcept {
+    const std::shared_ptr<const KLineRevisionBatch>& batch) noexcept {
     std::size_t bytes = 0U;
     if (batch != nullptr) {
         bytes = sizeof(KLineRevisionBatch) + 4U * sizeof(void*);
@@ -360,11 +348,7 @@ template <typename Value>
             SaturatingMultiply(batch->revisions.capacity(),
                                sizeof(KLineRevision)));
     }
-    return SaturatingAdd(
-        bytes,
-        SaturatingMultiply(
-            dependency_count,
-            TreeNodeOwnedBytes<RawTickDependency>()));
+    return bytes;
 }
 
 struct AtomicStats final {
@@ -382,7 +366,6 @@ struct AtomicStats final {
     std::atomic<std::uint64_t> pending_revision_rows_high_watermark{0U};
     std::atomic<std::uint64_t> pending_revision_bytes{0U};
     std::atomic<std::uint64_t> pending_revision_bytes_high_watermark{0U};
-    std::atomic<std::uint64_t> acknowledged_raw_dependencies{0U};
     std::atomic<std::uint64_t> revision_batches_submitted{0U};
 };
 
@@ -420,7 +403,6 @@ public:
 
     struct PendingCommit final {
         std::shared_ptr<const KLineRevisionBatch> batch;
-        std::set<RawTickDependency> raw_dependencies;
         std::size_t revision_rows = 0U;
         std::size_t owned_bytes = 0U;
     };
@@ -429,8 +411,6 @@ public:
         : config_(std::move(config)), sink_(sink) {
         bars_.reserve(config_.maximum_bars);
         heads_.reserve(config_.maximum_bars);
-        acknowledged_raw_.reserve(
-            config_.maximum_acknowledged_raw_dependencies);
     }
 
     [[nodiscard]] KLineApplyResult ApplyBatch(
@@ -450,7 +430,6 @@ public:
         }
 
         try {
-            std::set<RawTickDependency> dependencies;
             std::vector<CanonicalTick> admission_ticks;
             std::vector<const KLineInput*> admission_inputs;
             admission_ticks.reserve(inputs.size());
@@ -472,9 +451,6 @@ public:
                     return Failure(&result,
                                    "KLine admission token is invalid");
                 }
-                dependencies.insert(RawTickDependency{
-                    input.tick.common.ingress_sequence,
-                    input.tick.common.kind});
                 admission_ticks.push_back(input.tick);
                 admission_inputs.push_back(&input);
             }
@@ -669,12 +645,11 @@ public:
             const std::size_t revision_count = revision_batch == nullptr
                 ? 0U
                 : revision_batch->revisions.size();
-            if (revision_count != 0U || !dependencies.empty()) {
-                const std::size_t owned_bytes = PendingCommitOwnedBytes(
-                    revision_batch, dependencies.size());
+            if (revision_count != 0U) {
+                const std::size_t owned_bytes =
+                    PendingCommitOwnedBytes(revision_batch);
                 pending_commits_.push_back(PendingCommit{
-                    std::move(revision_batch), std::move(dependencies),
-                    revision_count, owned_bytes});
+                    std::move(revision_batch), revision_count, owned_bytes});
                 pending_revision_rows_ = SaturatingAdd(
                     pending_revision_rows_, revision_count);
                 pending_revision_bytes_ = SaturatingAdd(
@@ -710,45 +685,12 @@ public:
         }
     }
 
-    void AcknowledgeRawTicks(
-        std::span<const RawTickDependency> dependencies) noexcept {
-        if (!healthy_) {
-            return;
-        }
-        try {
-            for (const RawTickDependency& dependency : dependencies) {
-                if (acknowledged_raw_.contains(dependency)) {
-                    continue;
-                }
-                if (acknowledged_raw_.size() >=
-                    config_.maximum_acknowledged_raw_dependencies) {
-                    SetFatal("KLine raw ACK index capacity exhausted");
-                    return;
-                }
-                acknowledged_raw_.insert(dependency);
-            }
-            stats_.acknowledged_raw_dependencies.store(
-                acknowledged_raw_.size(), std::memory_order_relaxed);
-        } catch (...) {
-            SetFatal("KLine raw ACK index allocation failed");
-        }
-    }
-
     [[nodiscard]] bool DrainDurableCommits() noexcept {
         if (!healthy_) {
             return false;
         }
         while (!pending_commits_.empty()) {
             PendingCommit& pending = pending_commits_.front();
-            const bool durable = std::all_of(
-                pending.raw_dependencies.begin(),
-                pending.raw_dependencies.end(),
-                [this](const RawTickDependency& dependency) {
-                    return acknowledged_raw_.contains(dependency);
-                });
-            if (!durable) {
-                break;
-            }
             if (pending.batch != nullptr &&
                 !pending.batch->revisions.empty()) {
                 if (!sink_->AppendRevisionBatch(pending.batch)) {
@@ -757,10 +699,6 @@ public:
                 }
                 stats_.revision_batches_submitted.fetch_add(
                     1U, std::memory_order_relaxed);
-            }
-            for (const RawTickDependency& dependency :
-                 pending.raw_dependencies) {
-                acknowledged_raw_.erase(dependency);
             }
             const std::size_t released_rows = pending.revision_rows;
             const std::size_t released_bytes = pending.owned_bytes;
@@ -775,8 +713,6 @@ public:
             stats_.pending_raw_commits.store(
                 pending_commits_.size(), std::memory_order_relaxed);
             PublishPendingRevisionStats();
-            stats_.acknowledged_raw_dependencies.store(
-                acknowledged_raw_.size(), std::memory_order_relaxed);
         }
         return true;
     }
@@ -835,9 +771,6 @@ public:
             std::memory_order_relaxed);
         result.pending_revision_bytes_high_watermark =
             stats_.pending_revision_bytes_high_watermark.load(
-                std::memory_order_relaxed);
-        result.acknowledged_raw_dependencies =
-            stats_.acknowledged_raw_dependencies.load(
                 std::memory_order_relaxed);
         result.revision_batches_submitted =
             stats_.revision_batches_submitted.load(
@@ -973,8 +906,6 @@ private:
     std::deque<PendingCommit> pending_commits_;
     std::size_t pending_revision_rows_ = 0U;
     std::size_t pending_revision_bytes_ = 0U;
-    std::unordered_set<RawTickDependency, RawTickDependencyHash>
-        acknowledged_raw_;
     std::uint32_t next_revision_counter_ = 1U;
     std::uint64_t next_batch_sequence_ = 1U;
     AtomicStats stats_{};
@@ -999,8 +930,7 @@ bool ValidateKLineWorkerConfig(const KLineWorkerConfig& config,
         config.logic_version == 0U || config.feed_session_epoch == 0U ||
         IsZero(config.calculation_run_id) ||
         config.interval_seconds.empty() ||
-        config.maximum_bars == 0U || config.maximum_pending_commits == 0U ||
-        config.maximum_acknowledged_raw_dependencies == 0U) {
+        config.maximum_bars == 0U || config.maximum_pending_commits == 0U) {
         return fail("invalid KLine worker configuration");
     }
     if (!std::is_sorted(config.interval_seconds.begin(),
@@ -1067,11 +997,6 @@ KLineWorker::~KLineWorker() = default;
 KLineApplyResult KLineWorker::ApplyBatch(
     std::span<const KLineInput> inputs) noexcept {
     return impl_->ApplyBatch(inputs);
-}
-
-void KLineWorker::AcknowledgeRawTicks(
-    std::span<const RawTickDependency> dependencies) noexcept {
-    impl_->AcknowledgeRawTicks(dependencies);
 }
 
 bool KLineWorker::DrainDurableCommits() noexcept {

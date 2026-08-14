@@ -79,6 +79,7 @@ add_library(l2flow_ch_ingest STATIC
     src/catalog.cpp
     src/decoder.cpp
     src/engine.cpp
+    src/outbox.cpp
     src/stream_config.cpp
     src/sdk_runtime.cpp)
 add_library(L2FlowCH::ingest ALIAS l2flow_ch_ingest)
@@ -156,6 +157,11 @@ if(L2FLOW_CH_BUILD_TESTS)
     l2flow_ch_configure(test_mdl_ingest)
     target_link_libraries(test_mdl_ingest PRIVATE L2FlowCH::ingest)
     add_test(NAME mdl_ingest_core COMMAND test_mdl_ingest)
+
+    add_executable(test_outbox tests/test_outbox.cpp)
+    l2flow_ch_configure(test_outbox)
+    target_link_libraries(test_outbox PRIVATE L2FlowCH::ingest)
+    add_test(NAME disposition_outbox COMMAND test_outbox)
 
     add_executable(test_fact_journal tests/test_fact_journal.cpp)
     l2flow_ch_configure(test_fact_journal)
@@ -305,6 +311,22 @@ if(L2FLOW_CH_BUILD_TESTS)
                 -DARGUMENT=--event-maximum-facts
                 -DVALUE=4194304
                 "-DEXPECTED=unknown option: --event-maximum-facts"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
+        add_test(
+            NAME mdl_ingest_rejects_removed_event_raw_ack_backlog
+            COMMAND ${CMAKE_COMMAND}
+                -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
+                -DARGUMENT=--event-maximum-raw-ack-backlog
+                -DVALUE=65536
+                "-DEXPECTED=unknown option: --event-maximum-raw-ack-backlog"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
+        add_test(
+            NAME mdl_ingest_rejects_removed_kline_raw_ack_backlog
+            COMMAND ${CMAKE_COMMAND}
+                -DPROGRAM=$<TARGET_FILE:mdl_ingestd>
+                -DARGUMENT=--kline-maximum-raw-ack-backlog
+                -DVALUE=65536
+                "-DEXPECTED=unknown option: --kline-maximum-raw-ack-backlog"
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/expect_command_failure.cmake)
         add_test(
             NAME mdl_ingest_kline_config

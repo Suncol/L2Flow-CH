@@ -27,9 +27,10 @@ consumes projectable facts and channel controls from the unified `TickDispatch`
 FIFO. The optional KLine plane in
 [`kline-worker-clickhouse.md`](kline-worker-clickhouse.md) consumes the same
 stream and uses SDK body exchange time for integer-second windows. Both
-runtimes settle rejected occurrences in a bounded raw-ACK/disposition join;
-only projectable first-wins facts enter their workers, and publication remains
-gated by corresponding raw ACKs. Event and KLine share the local disk-backed
+runtimes consume SequenceRecovery output from a process-lifetime per-lane
+disposition outbox with independent cursors; only projectable first-wins facts
+enter their workers, and publication is not gated on raw ClickHouse ACKs.
+Event and KLine share the local disk-backed
 process-lifetime FactJournal described in
 [`fact-journal.md`](fact-journal.md). That file is not a durable restart/replay
 boundary. The repository does not contain CSV/WAL replay, checkpoint restore,
@@ -139,11 +140,11 @@ is likewise not claimed.
 - For `mdl_ingestd`, the configured stream file is the source of physical
   subscriptions. There is no special-case protection for any unselected
   tuple.
-- Event projection is optional and requires the durable raw ClickHouse path.
-  Revision batches are computed in memory but cannot enter the Event sink
-  before all raw occurrences in their pending FIFO entry are ACKed. A raw ACK
-  listener failure, Event repair/index capacity failure, or Event sink queue
-  failure is a sticky process boundary.
+- Event projection is optional and still requires the raw ClickHouse path to
+  be configured for the same feed epoch, but Event persist is not gated on
+  raw ACK. Event repair/index capacity failure or Event sink queue failure
+  stops the Event plane and publishes a non-authoritative freshness mode; it
+  does not kill raw. Outbox exhaustion is a sticky process boundary.
 - The default stream file selects the five implemented Shanghai/Shenzhen
   L2 message families used for A-share processing. Tuple subscription and
   instrument-universe filtering are separate: the immutable daily catalog is
@@ -351,8 +352,8 @@ feed_session_epoch, native_sequence)`. The first body wins whether later bodies
 are byte-identical or conflicting; every later body is rejected without
 replacement. The raw tap still captured each decoded occurrence before this
 decision. For catalog-resolved ticks, `REJECT_LATE_FACT` is therefore required
-to settle the raw ACK without admitting the body to Event, KLine, or the
-FactJournal.
+so Event and KLine can discard the body without admitting it to the worker or
+the FactJournal. The raw tap has already captured that occurrence independently.
 
 Open holes older than `A` expire and can never reopen. `E` may jump across a
 gap, so `E-1` is not necessarily a complete prefix. `A` is the admission close
@@ -396,25 +397,16 @@ to both enabled runtimes; only projectable kinds enter Arrow. It never assigns a
 second consumer to the owner endpoint. Calling one owner endpoint from multiple
 consumers violates the SPSC contract.
 
-### Raw ACK/disposition join
+### Disposition outbox
 
-The raw tap captures a decoded occurrence before SequenceRecovery, so raw ACK
-and final disposition can arrive in either order. Event and KLine each maintain
-an owner-local bounded join keyed by:
-
-```text
-(feed_session_epoch, ingress_sequence, canonical_kind)
-```
-
-Projectable disposition plus ACK forwards the durability dependency to that
-worker's pending revision FIFO. Rejected disposition plus ACK deletes the join
-slot immediately and never enters the FactJournal, repair, bar projection, or
-derived sink. A duplicate ACK/disposition side is a sticky failure while the
-key still has an unmatched live join slot; inbox overflow and join capacity
-exhaustion are also fail-closed. Resolved slots are reclaimed immediately, so
-the join does not keep an unbounded post-resolution duplicate history. The raw
-callback-once and SequenceRecovery occurrence-once rules are producer
-contracts.
+The raw tap still captures a decoded occurrence before SequenceRecovery. After
+classification, the decoder lane appends the `TickDispatch` to a per-lane
+outbox and assigns a monotone LSN. Event, KLine, and Arrow each have their
+own `(consumer, owner)` cursor. Projectable dispositions enter the worker
+immediately. Rejected dispositions are discarded without entering the
+FactJournal, repair, bar projection, or derived sink. A slow derived plane
+pins only the outbox until its cursor advances; it does not fail the raw
+sink. Outbox exhaustion is fail-closed.
 
 ## 7. 64-core / 1-TiB deployment starting point
 
@@ -516,24 +508,23 @@ Shutdown order is fixed:
 1. stop handler admission;
 2. call `IOManager::Shutdown()` as the callback-quiescence boundary;
 3. release Subscriber, then IOManager;
-4. drain and join decoder lanes, flushing partial raw batches;
-5. keep every owner thread servicing its `TickDispatch` FIFO, Event/KLine
-   background work, and raw-ACK inbox while the ClickHouse raw writers flush;
-6. wait for every ClickHouse raw batch ACK and stop/join the raw writer
-   threads, which closes the only remaining ACK producer side;
-7. only then signal the owner consumers to observe empty engine FIFOs, drain
-   the final ACK inbox entries, collect fault/final dirty gap diagnostics, and
-   exit; flush every final partial Event and KLine micro-batch after they join;
-8. finish private Event repair/eviction, drain both ACK/disposition joins and
-   worker raw-ACK gates, flush the shared FactJournal, submit all now-durable
-   revision batches, and stop the Event/KLine writers after their independent
-   recovery markers are ACKed;
+4. drain and join decoder lanes, flushing partial raw batches and publishing
+   remaining disposition-outbox records;
+5. keep every owner thread consuming its independent Event/KLine/Arrow
+   outbox cursors and servicing Event/KLine background work while raw writers
+   flush already-queued batches;
+6. stop/join the raw writer threads after their in-flight INSERTs finish;
+7. signal the owner consumers to observe empty outbox prefixes, collect
+   fault/final dirty gap diagnostics, and exit; flush every final partial
+   Event and KLine micro-batch;
+8. finish private Event repair/eviction, flush the shared FactJournal, submit
+   remaining revision batches, and stop the Event/KLine writers after their
+   independent recovery markers are ACKed;
 9. seal the optional Arrow hot path and destroy the engine/handler.
 
-Stopping owner consumers before step 6 is invalid: raw `Stop()` can still
-drain more queued rows than one owner ACK inbox can hold. Keeping the consumers
-alive makes shutdown use the same bounded join path as steady state instead of
-turning a legal slow-sink backlog into an artificial capacity failure.
+Owner consumers no longer wait on a raw ACK inbox. Raw `Stop()` and derived
+flush can proceed independently once decoder lanes have published the last
+outbox records. A slow Event or KLine plane does not require killing raw.
 
 After SDK shutdown returns, the session waits for its in-flight callback count
 to reach zero before releasing Subscriber and IOManager. If vendor shutdown
@@ -561,17 +552,18 @@ preallocation accounting, ArrowStream-to-ClickHouse mapping, nested Snapshot
 levels, Date partitioning, occurrence uniqueness, and explicit replay order.
 Event tests cover journal-first same-batch ordering, cross-batch hole-filled Add
 repair, unknown-reference removal, order-baseline/phase-anchor
-compaction, no-gap fact eviction, raw ACK-before/after project and reject joins,
-Shanghai END additions/tombstones and sliced capacity limits, private budgeted
-repair, per-order generation restart, disjoint live publication during repair,
+compaction, no-gap fact eviction, reject-without-journal, Shanghai END
+additions/tombstones and sliced capacity limits, private budgeted repair,
+per-order generation restart, disjoint live publication during repair,
 multi-owner routing, final partial-batch drain, immutable retry bodies,
 current-table replacement/tombstones, recovery markers, and startup rejection
 of a mismatched external schema. KLine tests cover SDK exchange-time windowing
 despite opposing local receive order, invalid-time no-fallback behavior,
 deterministic OHLC, multiple intervals, defensive duplicate/conflict checks,
-ACK-before/after disposition joins, hole-fill historical revision, runtime
-routing, immutable sink retries, owner-affine writer lanes, current-table
-replacement, and schema validation.
+reject-without-journal, hole-fill historical revision, runtime routing,
+immutable sink retries, owner-affine writer lanes, current-table replacement,
+and schema validation. Outbox tests cover independent consumers, broadcast
+controls, per-lane LSN, ring pinning, and freshness modes.
 
 Sanitizer, NUMA, and end-to-end throughput qualification must be rerun against
 the replacement dispatch/retention implementation. The 2026-08-06 numbers in

@@ -81,7 +81,6 @@ struct EventWorkerConfig final {
     std::size_t maximum_pending_commits = 1'024U;
     std::size_t maximum_pending_revision_bytes =
         256U * 1'024U * 1'024U;
-    std::size_t maximum_acknowledged_raw_dependencies = 65'536U;
 
     // Correctness cuts create immutable logical recovery batches. Durable
     // consecutive batches remain owner-local until one of these independent
@@ -160,7 +159,6 @@ struct EventWorkerStats final {
     std::uint64_t revisions_created = 0U;
     std::uint64_t tombstones_created = 0U;
     std::uint64_t pending_raw_commits = 0U;
-    std::uint64_t acknowledged_raw_dependencies = 0U;
     std::uint64_t revision_batches_submitted = 0U;
     std::uint64_t persistence_groups_submitted = 0U;
     std::uint64_t persistence_group_batches_max = 0U;
@@ -235,8 +233,6 @@ public:
     [[nodiscard]] bool ApplyChannelSeal(const ChannelSeal& seal) noexcept;
     [[nodiscard]] bool ContinueEviction() noexcept;
     [[nodiscard]] bool AdvanceRepair() noexcept;
-    void AcknowledgeRawTicks(
-        std::span<const RawTickDependency> dependencies) noexcept;
     // Advance closes only full or timed-out persistence groups. Flush also
     // closes a final partial group and is reserved for quiescent shutdown and
     // explicit durability barriers.

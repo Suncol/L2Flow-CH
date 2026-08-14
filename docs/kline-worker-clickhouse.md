@@ -6,34 +6,29 @@ The optional KLine plane is a sibling of the Event plane. It consumes the same
 unified owner-local `TickDispatch` FIFO:
 
 ```text
-GapOpen / ChannelSeal -> validate owner FIFO control
-REJECT_LATE_FACT ------+
-                       +--> bounded ACK/disposition join -> reject + ACK: settle
-                       |
-PROJECT_* -------------+--> project + ACK: durable dependency
-          |
-          +-> micro-batch -> journal winner -> update intervals
-                                            -> immutable pending batch
-                                                          |
-                                     durable dependency --+-> KLine sink
+per-lane disposition outbox
+  -> independent KLine cursor
+       -> GapOpen / ChannelSeal -> validate control
+       -> REJECT_LATE_FACT -> discard; do not journal
+       -> PROJECT_* -> micro-batch -> journal winner -> update intervals
+                                                   -> immutable pending batch
+                                                   -> KLine sink
 ```
 
-The worker may calculate an in-memory revision before its raw occurrence is
-durable. It cannot submit that revision to the KLine sink until all raw Tick
-dependencies at the head of its pending FIFO have received a successful raw
-ClickHouse ACK. The raw, runtime, and revision queues are volatile memory, not
-a WAL. Event and KLine must share one local disk-backed canonical FactJournal;
+The worker calculates an in-memory revision and submits it without waiting for
+a raw ClickHouse ACK. It consumes SequenceRecovery output from the
+process-lifetime disposition outbox with an independent cursor. The outbox,
+runtime, and revision queues are volatile memory, not a WAL. Event and KLine
+must share one local disk-backed canonical FactJournal;
 that file is a process-lifetime spill/cache and is not reopened after a crash.
 See [fact-journal.md](fact-journal.md) for its capacity, I/O, and recovery
 contract.
 
-The runtime joins either arrival order by `(feed_session_epoch,
-ingress_sequence, canonical_kind)`. `REJECT_LATE_FACT + raw ACK` erases the join
-entry directly and never reaches KLine or the FactJournal. The join, ACK inbox,
-worker ACK index, pending FIFO, bar map, and sink queues are independently
-bounded and fail closed on exhaustion. `GapOpen` and `ChannelSeal` remain in the
-same producer-to-owner FIFO and are validated by KLine, but this worker does not
-use Event's retention frontier to reclaim bar state.
+`REJECT_LATE_FACT` is discarded and never reaches KLine or the FactJournal.
+The pending FIFO, bar map, and sink queues are independently bounded and fail
+closed on exhaustion without stopping raw ingest. `GapOpen` and `ChannelSeal`
+remain in the outbox stream and are validated by KLine, but this worker does
+not use Event's retention frontier to reclaim bar state.
 
 ## 2. Exchange-time-only windows
 

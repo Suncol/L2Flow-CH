@@ -106,33 +106,7 @@ struct Options final {
 #endif
 };
 
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-class RawTickBatchAckFanout final
-    : public l2flow::ingest::RawTickBatchAckListener {
-public:
-    void Configure(l2flow::ingest::RawTickBatchAckListener* first,
-                   l2flow::ingest::RawTickBatchAckListener* second) noexcept {
-        first_ = first;
-        second_ = second;
-    }
 
-    [[nodiscard]] bool OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick> ticks) noexcept override {
-        bool result = true;
-        if (first_ != nullptr) {
-            result = first_->OnRawTickBatchAcknowledged(ticks) && result;
-        }
-        if (second_ != nullptr) {
-            result = second_->OnRawTickBatchAcknowledged(ticks) && result;
-        }
-        return result;
-    }
-
-private:
-    l2flow::ingest::RawTickBatchAckListener* first_ = nullptr;
-    l2flow::ingest::RawTickBatchAckListener* second_ = nullptr;
-};
-#endif
 
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
 [[nodiscard]] l2flow::arrow_hot::ArrowHotEgressConfig MakeArrowConfig(
@@ -705,16 +679,6 @@ void PrintUsage() {
                 return false;
             }
             parsed.event_configuration_set = true;
-        } else if (argument == "--event-maximum-raw-ack-backlog") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.maximum_raw_ack_backlog_per_owner)) {
-                *error = "invalid --event-maximum-raw-ack-backlog";
-                return false;
-            }
-            parsed.event.worker.maximum_acknowledged_raw_dependencies =
-                parsed.event.maximum_raw_ack_backlog_per_owner;
-            parsed.event_configuration_set = true;
         } else if (argument ==
                    "--event-maximum-pending-channel-seals") {
             if (!ParseInteger(
@@ -723,22 +687,6 @@ void PrintUsage() {
                          .maximum_pending_channel_seals_per_owner)) {
                 *error =
                     "invalid --event-maximum-pending-channel-seals";
-                return false;
-            }
-            parsed.event_configuration_set = true;
-        } else if (argument == "--event-raw-ack-drain-max-entries") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.raw_ack_drain_max_entries)) {
-                *error = "invalid --event-raw-ack-drain-max-entries";
-                return false;
-            }
-            parsed.event_configuration_set = true;
-        } else if (argument == "--event-raw-ack-drain-max-cpu-ns") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.raw_ack_drain_max_cpu_ns)) {
-                *error = "invalid --event-raw-ack-drain-max-cpu-ns";
                 return false;
             }
             parsed.event_configuration_set = true;
@@ -836,25 +784,6 @@ void PrintUsage() {
                     next(argument),
                     &parsed.clickhouse_kline.queue_revision_rows)) {
                 *error = "invalid --kline-queue-revision-rows";
-                return false;
-            }
-            parsed.kline_configuration_set = true;
-        } else if (argument == "--kline-maximum-raw-ack-backlog") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.kline.maximum_raw_ack_backlog_per_owner)) {
-                *error = "invalid --kline-maximum-raw-ack-backlog";
-                return false;
-            }
-            parsed.kline.worker.maximum_acknowledged_raw_dependencies =
-                parsed.kline.maximum_raw_ack_backlog_per_owner;
-            parsed.kline_configuration_set = true;
-        } else if (argument == "--kline-maximum-occurrence-join") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.kline
-                         .maximum_occurrence_join_entries_per_owner)) {
-                *error = "invalid --kline-maximum-occurrence-join";
                 return false;
             }
             parsed.kline_configuration_set = true;
@@ -1538,7 +1467,6 @@ int main(int argc, char** argv) {
     std::unique_ptr<l2flow::clickhouse::KLineClickHouseSink>
         clickhouse_kline;
     std::unique_ptr<l2flow::kline::KLineRuntime> kline_runtime;
-    RawTickBatchAckFanout raw_ack_fanout;
     bool fact_journal_shared_by_all_owners = true;
     if (options.event_enabled || options.kline_enabled) {
         if (total_count >
@@ -1701,8 +1629,7 @@ int main(int argc, char** argv) {
     }
 
     if (event_runtime != nullptr || kline_runtime != nullptr) {
-        raw_ack_fanout.Configure(event_runtime.get(), kline_runtime.get());
-        options.clickhouse.tick_ack_listener = &raw_ack_fanout;
+
     }
 
     if (options.event_enabled) {
@@ -2914,9 +2841,7 @@ int main(int argc, char** argv) {
                 total_count &&
             event_final_runtime_stats.hole_fill_dispositions_received == 0U &&
             event_final_runtime_stats.rejected_dispositions_received == 0U &&
-            event_final_runtime_stats.occurrence_join_entries == 0U &&
             event_final_runtime_stats.workers.facts_journaled == total_count &&
-            event_final_runtime_stats.raw_tick_acks_received == total_count &&
             event_final_runtime_stats.invalid_inputs == 0U &&
             event_final_runtime_stats.workers.pending_raw_commits == 0U &&
             event_final_stats.revision_rows_acked ==
@@ -2977,10 +2902,8 @@ int main(int argc, char** argv) {
                 total_count &&
             kline_final_runtime_stats.hole_fill_dispositions_received == 0U &&
             kline_final_runtime_stats.rejected_dispositions_received == 0U &&
-            kline_final_runtime_stats.occurrence_join_entries == 0U &&
             kline_final_runtime_stats.workers.facts_journaled == total_count &&
             kline_final_runtime_stats.workers.trades_projected == total_count &&
-            kline_final_runtime_stats.raw_tick_acks_received == total_count &&
             kline_final_runtime_stats.invalid_inputs == 0U &&
             kline_final_runtime_stats.workers.invalid_facts == 0U &&
             kline_final_runtime_stats.workers
@@ -3281,10 +3204,6 @@ int main(int argc, char** argv) {
             << '\n'
             << "event_final ordered_dispositions="
             << event_final_runtime_stats.ordered_dispositions_received
-            << " occurrence_join_entries="
-            << event_final_runtime_stats.occurrence_join_entries
-            << " raw_tick_acks="
-            << event_final_runtime_stats.raw_tick_acks_received
             << " facts_journaled="
             << event_final_runtime_stats.workers.facts_journaled
             << " revisions_created="
@@ -3438,10 +3357,6 @@ int main(int argc, char** argv) {
             << '\n'
             << "kline_final ordered_dispositions="
             << kline_final_runtime_stats.ordered_dispositions_received
-            << " occurrence_join_entries="
-            << kline_final_runtime_stats.occurrence_join_entries
-            << " raw_tick_acks="
-            << kline_final_runtime_stats.raw_tick_acks_received
             << " facts_journaled="
             << kline_final_runtime_stats.workers.facts_journaled
             << " trades_projected="

@@ -1502,7 +1502,7 @@ void TestDecodeFreezeRejectsEveryRawAcceptedOccurrence() {
     CHECK(fault.feed_session_epoch == 1U);
 
     // Once frozen, later successfully decoded/raw-tapped occurrences are also
-    // explicitly rejected instead of leaving an unmatched raw ACK.
+    // explicitly rejected so Event/KLine never see them as projectable.
     Admit(engine.get(), {4U, 101U, 24U},
           MakeShTick(3, "600000"), base_time + 2U);
     CHECK(WaitFor([&] {

@@ -50,25 +50,6 @@ using namespace l2flow::ingest;
         }                                                                    \
     } while (false)
 
-class RecordingAckListener final : public RawTickBatchAckListener {
-public:
-    [[nodiscard]] bool OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick> ticks) noexcept override {
-        try {
-            ++calls;
-            acknowledged.insert(
-                acknowledged.end(), ticks.begin(), ticks.end());
-            return accept;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    std::vector<CanonicalTick> acknowledged;
-    std::size_t calls = 0U;
-    bool accept = true;
-};
-
 #if defined(__linux__)
 struct CapturedRequest final {
     std::string target;
@@ -445,8 +426,6 @@ void TestUnknownOutcomeRetriesIdenticalBatch() {
     config.retry_max_backoff_ms = 2U;
     config.maximum_retry_elapsed_ms = 1U;
     config.shutdown_timeout_ms = 3'000U;
-    RecordingAckListener listener;
-    config.tick_ack_listener = &listener;
 
     std::string error;
     std::unique_ptr<RawClickHouseSink> sink =
@@ -474,49 +453,6 @@ void TestUnknownOutcomeRetriesIdenticalBatch() {
     CHECK(stats.retry_attempts == 1U);
     CHECK(stats.unknown_outcomes == 1U);
     CHECK(stats.bytes_sent == inserts[0U].body.size() * 2U);
-    CHECK(listener.calls == 1U);
-    CHECK(listener.acknowledged.size() == 1U);
-    CHECK(listener.acknowledged[0U].common.ingress_sequence == 1U);
-}
-
-void TestAckListenerFailureFailsRawSinkClosed() {
-    RetryHttpServer server(std::chrono::milliseconds{0}, false);
-    if (!server.valid()) {
-        std::cout << "ACK-listener HTTP fixture skipped; loopback sockets "
-                     "are unavailable\n";
-        return;
-    }
-    RecordingAckListener listener;
-    listener.accept = false;
-    RawClickHouseConfig config{};
-    config.endpoint = server.endpoint();
-    config.database = "ack_listener_contract";
-    config.feed_session_epoch = 19U;
-    config.tick_decoder_lanes = 1U;
-    config.snapshot_decoder_lanes = 1U;
-    config.writer_threads = 1U;
-    config.tick_batch_rows = 1U;
-    config.snapshot_batch_rows = 1U;
-    config.tick_queue_batches_per_lane = 2U;
-    config.snapshot_queue_batches_per_lane = 2U;
-    config.tick_ack_listener = &listener;
-    config.connect_timeout_ms = 500U;
-    config.request_timeout_ms = 1'000U;
-    config.maximum_retry_elapsed_ms = 1'000U;
-    config.shutdown_timeout_ms = 3'000U;
-
-    std::string error;
-    std::unique_ptr<RawClickHouseSink> sink =
-        RawClickHouseSink::Create(config, &error);
-    CHECK(sink != nullptr);
-    CHECK(sink->Start(&error));
-    CHECK(sink->AppendTick(0U, MakeTick(1U)));
-    CHECK(!sink->Stop(&error));
-    server.Stop();
-
-    CHECK(listener.calls == 1U);
-    CHECK(!sink->healthy());
-    CHECK(error.find("ACK listener rejected") != std::string::npos);
 }
 
 void TestQueueExhaustionFailsClosedAndDrains() {
@@ -711,7 +647,7 @@ int main() {
     TestConfigValidationAndPreallocation();
 #if defined(__linux__)
     TestUnknownOutcomeRetriesIdenticalBatch();
-    TestAckListenerFailureFailsRawSinkClosed();
+
     TestQueueExhaustionFailsClosedAndDrains();
 #endif
     const char* const endpoint = std::getenv("L2FLOW_CH_TEST_URL");

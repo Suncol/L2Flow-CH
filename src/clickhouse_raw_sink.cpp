@@ -1985,19 +1985,6 @@ private:
                 stats_.rows_acked.fetch_add(
                     static_cast<std::uint64_t>(batch.metadata.row_count),
                     std::memory_order_relaxed);
-                if constexpr (std::is_same_v<Record, CanonicalTick>) {
-                    if (config_.tick_ack_listener != nullptr &&
-                        !config_.tick_ack_listener->
-                            OnRawTickBatchAcknowledged(
-                                std::span<const CanonicalTick>(
-                                    batch.rows.get(),
-                                    batch.metadata.row_count))) {
-                        SetFatal(
-                            "raw_tick ACK listener rejected a durable batch",
-                            true);
-                        return false;
-                    }
-                }
                 wake_.notify_all();
                 return true;
             }

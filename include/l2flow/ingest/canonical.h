@@ -256,9 +256,11 @@ struct TickDispatch final {
     std::uint64_t evict_before = 0U;
     std::uint32_t channel = 0U;
     std::uint32_t owner = 0U;
+    std::uint16_t outbox_lane = 0U;
     Market market = Market::kUnknown;
     TickDispatchKind kind = TickDispatchKind::kProjectOrdered;
     bool catalog_match = false;
+    std::uint64_t outbox_lsn = 0U;
 };
 
 enum class ChannelFaultReason : std::uint8_t {

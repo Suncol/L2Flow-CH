@@ -492,14 +492,8 @@ int main(int argc, char** argv) {
     config.worker.maximum_cached_events = static_cast<std::size_t>(
         maximum_per_actor + options.micro_batch_rows + 1U);
     config.worker.maximum_pending_commits = 1'024U;
-    config.worker.maximum_acknowledged_raw_dependencies =
-        std::max<std::size_t>(options.micro_batch_rows * 2U, 65'536U);
     config.micro_batch_rows = options.micro_batch_rows;
     config.micro_batch_max_delay_ns = UINT64_C(50'000'000);
-    config.maximum_raw_ack_backlog_per_owner =
-        config.worker.maximum_acknowledged_raw_dependencies;
-    config.maximum_occurrence_join_entries_per_owner =
-        config.worker.maximum_acknowledged_raw_dependencies;
 
     InMemoryRevisionSink sink(options.actors);
     std::unique_ptr<EventRuntime> runtime =
@@ -540,8 +534,7 @@ int main(int argc, char** argv) {
     threads.reserve(options.actors);
     for (std::size_t actor = 0U; actor < options.actors; ++actor) {
         threads.emplace_back([&, actor] {
-            std::vector<CanonicalTick> acknowledgements;
-            acknowledgements.reserve(options.micro_batch_rows);
+
             std::uint64_t cut_oldest_origin_ns = 0U;
             std::size_t facts_in_cut = 0U;
             const auto publish_maximum = [](std::atomic<std::uint64_t>* target,
@@ -654,16 +647,6 @@ int main(int argc, char** argv) {
                     actor_dispatch_latencies[actor].push_back(
                         dispatch_latency);
                 }
-                acknowledgements.push_back(std::move(tick));
-                if (acknowledgements.size() ==
-                    options.micro_batch_rows) {
-                    if (!runtime->OnRawTickBatchAcknowledged(
-                            acknowledgements)) {
-                        abort.store(true, std::memory_order_release);
-                        break;
-                    }
-                    acknowledgements.clear();
-                }
                 if (facts_in_cut == options.micro_batch_rows) {
                     if (!service_until_pollable()) {
                         abort.store(true, std::memory_order_release);
@@ -675,10 +658,6 @@ int main(int argc, char** argv) {
                     abort.store(true, std::memory_order_release);
                     break;
                 }
-            }
-            if (!acknowledgements.empty() &&
-                !runtime->OnRawTickBatchAcknowledged(acknowledgements)) {
-                abort.store(true, std::memory_order_release);
             }
             if (!runtime->Flush(actor) || !service_until_pollable()) {
                 abort.store(true, std::memory_order_release);
@@ -794,15 +773,12 @@ int main(int argc, char** argv) {
         stats.ordered_dispositions_received == total &&
         stats.hole_fill_dispositions_received == 0U &&
         stats.rejected_dispositions_received == 0U &&
-        stats.occurrence_join_entries == 0U &&
-        stats.raw_tick_acks_received == total &&
         stats.source_conflicts == 0U && stats.invalid_inputs == 0U &&
         stats.workers.facts_journaled == total &&
         stats.workers.duplicate_facts == 0U &&
         stats.workers.source_conflicts == 0U &&
         stats.workers.revisions_created == total &&
         stats.workers.pending_raw_commits == 0U &&
-        stats.workers.acknowledged_raw_dependencies == 0U &&
         stats.workers.revision_batches_submitted == sink.batches() &&
         stats.workers.source_only_fast_path ==
             stats.micro_batches_applied &&
@@ -855,8 +831,6 @@ int main(int argc, char** argv) {
               << "event_state_result expected_facts=" << total
               << " ordered_dispositions_received="
               << stats.ordered_dispositions_received
-              << " raw_tick_acks_received="
-              << stats.raw_tick_acks_received
               << " facts_journaled=" << stats.workers.facts_journaled
               << " revisions_created=" << stats.workers.revisions_created
               << " micro_batches=" << stats.micro_batches_applied
@@ -878,9 +852,7 @@ int main(int argc, char** argv) {
               << revisions_per_persistence_group
               << " revision_rows_acked_in_memory=" << sink.rows()
               << " pending_raw_commits="
-              << stats.workers.pending_raw_commits
-              << " pending_raw_acks="
-              << stats.workers.acknowledged_raw_dependencies << '\n'
+              << stats.workers.pending_raw_commits << '\n'
               << "event_state_journal records=" << journal_stats.records
               << " consumer_new=" << journal_stats.consumer_new
               << " record_bytes=" << journal_stats.record_bytes

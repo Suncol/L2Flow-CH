@@ -433,22 +433,13 @@ TickDispatch RuntimeChannelSeal(const CanonicalTick& tick,
 }
 
 void Ack(EventWorker* worker, const CanonicalTick& tick) {
-    const RawTickDependency dependency{
-        tick.common.ingress_sequence, tick.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&dependency, 1U));
+    static_cast<void>(tick);
     CHECK(worker->FlushDurableCommits());
 }
 
 void AckAll(EventWorker* worker,
             std::span<const CanonicalTick> ticks) {
-    std::vector<RawTickDependency> dependencies;
-    dependencies.reserve(ticks.size());
-    for (const CanonicalTick& tick : ticks) {
-        dependencies.push_back(RawTickDependency{
-            tick.common.ingress_sequence, tick.common.kind});
-    }
-    worker->AcknowledgeRawTicks(dependencies);
+    static_cast<void>(ticks);
     CHECK(worker->FlushDurableCommits());
 }
 
@@ -566,10 +557,6 @@ void TestJournalFirstSameBatchDoesNotPublishUnknownIntermediate() {
     CHECK(applied.code == EventApplyCode::kApplied);
     CHECK(sink.batches.empty());
 
-    const std::array<RawTickDependency, 2U> dependencies{
-        RawTickDependency{trade.common.ingress_sequence, trade.common.kind},
-        RawTickDependency{add.common.ingress_sequence, add.common.kind}};
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
     CHECK(sink.batches.size() == 1U);
     CHECK(sink.batches[0U]->revisions.size() == 3U);
@@ -602,10 +589,6 @@ void TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo() {
 
     const CanonicalTick first = ShenzhenAdd(101U, 60U);
     const CanonicalTick second = ShenzhenAdd(102U, 61U);
-    const RawTickDependency second_dependency{
-        second.common.ingress_sequence, second.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&second_dependency, 1U));
 
     const EventInput first_input = Ordered(first);
     CHECK(worker->ApplyBatch(
@@ -617,29 +600,11 @@ void TestAckBeforeFactAndOutOfOrderAckPreserveCommitFifo() {
           EventApplyCode::kApplied);
     CHECK(sink.batches.empty());
     CHECK(worker->FlushDurableCommits());
-    CHECK(sink.batches.empty());
-
-    const RawTickDependency first_dependency{
-        first.common.ingress_sequence, first.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&first_dependency, 1U));
-    CHECK(worker->FlushDurableCommits());
     CHECK(sink.batches.size() == 2U);
     CHECK(sink.batches[0U]->batch_sequence == 1U);
     CHECK(sink.batches[1U]->batch_sequence == 2U);
     CHECK(sink.batches[0U]->revisions.front().version <
           sink.batches[1U]->revisions.front().version);
-
-    RecordingSink ack_first_sink;
-    worker = EventWorker::Create(Config(), &ack_first_sink, &error);
-    CHECK(worker != nullptr);
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&first_dependency, 1U));
-    CHECK(worker->ApplyBatch(
-              std::span<const EventInput>(&first_input, 1U)).code ==
-          EventApplyCode::kApplied);
-    CHECK(worker->FlushDurableCommits());
-    CHECK(ack_first_sink.batches.size() == 1U);
 }
 
 void TestUnresolvedLateCancelConvergesBeforeLaterTrade() {
@@ -687,12 +652,6 @@ void TestShanghaiEndAddsOnlyLateOrdersFinalizeFragment() {
     const EventApplyResult applied = worker->ApplyBatch(inputs);
     CHECK(applied.code == EventApplyCode::kApplied);
     DrainRepair(worker.get());
-    std::array<RawTickDependency, 3U> dependencies{};
-    for (std::size_t index = 0U; index < ticks.size(); ++index) {
-        dependencies[index] = {ticks[index].common.ingress_sequence,
-                               ticks[index].common.kind};
-    }
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
     const EventWorkerStats indexed_stats = worker->stats();
     CHECK(indexed_stats.ordered_batch_fast_path >= 1U);
@@ -776,12 +735,6 @@ void TestShanghaiEndSourceOnlyCutRetainsBarrierForLateOrder() {
         Ordered(statuses[0U]), Ordered(statuses[1U])};
     CHECK(worker->ApplyBatch(status_inputs).code ==
           EventApplyCode::kApplied);
-    std::array<RawTickDependency, 2U> status_dependencies{
-        RawTickDependency{statuses[0U].common.ingress_sequence,
-                          statuses[0U].common.kind},
-        RawTickDependency{statuses[1U].common.ingress_sequence,
-                          statuses[1U].common.kind}};
-    worker->AcknowledgeRawTicks(status_dependencies);
     CHECK(worker->FlushDurableCommits());
 
     const CanonicalTick late_add = ShanghaiAdd(2U, 41U, 300);
@@ -852,12 +805,6 @@ void TestShanghaiTerminalBeforeEndTombstonesOldFinalize() {
     std::array<EventInput, 3U> inputs{
         Ordered(ticks[0U]), Ordered(ticks[1U]), Ordered(ticks[2U])};
     CHECK(worker->ApplyBatch(inputs).code == EventApplyCode::kApplied);
-    std::array<RawTickDependency, 3U> dependencies{};
-    for (std::size_t index = 0U; index < ticks.size(); ++index) {
-        dependencies[index] = {ticks[index].common.ingress_sequence,
-                               ticks[index].common.kind};
-    }
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
 
     const CanonicalTick cancel = ShanghaiCancel(3U, 33U, 100, 10);
@@ -895,12 +842,6 @@ void TestLateShanghaiStatusRepairsOnlyUntilNextStatus() {
         Ordered(ticks[0U]), Ordered(ticks[1U]),
         Ordered(ticks[2U]), Ordered(ticks[3U])};
     CHECK(worker->ApplyBatch(inputs).code == EventApplyCode::kApplied);
-    std::array<RawTickDependency, 4U> dependencies{};
-    for (std::size_t index = 0U; index < ticks.size(); ++index) {
-        dependencies[index] = {ticks[index].common.ingress_sequence,
-                               ticks[index].common.kind};
-    }
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
 
     const EventWorkerStats before = worker->stats();
@@ -989,13 +930,8 @@ void TestSlicedShanghaiPhaseCutFencesAckAndMatchesReference() {
     CHECK(late_result.repair_pending);
     CHECK(sliced->projection_input_fenced());
 
-    const RawTickDependency late_dependency{
-        late_status.common.ingress_sequence, late_status.common.kind};
-    sliced->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&late_dependency, 1U));
     CHECK(sliced->FlushDurableCommits());
     CHECK(sliced_sink.batches.size() == 1U);
-    CHECK(sliced->stats().acknowledged_raw_dependencies == 1U);
 
     OrderSnapshot snapshot{};
     CHECK(sliced->CopyOrder(
@@ -1018,7 +954,6 @@ void TestSlicedShanghaiPhaseCutFencesAckAndMatchesReference() {
 
     DrainRepair(sliced.get());
     CHECK(sliced_sink.batches.size() == 2U);
-    CHECK(sliced->stats().acknowledged_raw_dependencies == 0U);
     CHECK(sliced->stats().pending_phase_bytes == 0U);
     CHECK(sliced->CopyOrder(
         OrderKey{20260807U, Market::kShanghai, 1U, 7U, 100},
@@ -1041,8 +976,6 @@ void TestSlicedShanghaiPhaseCutFencesAckAndMatchesReference() {
     CHECK(reference->ApplyBatch(
               std::span<const EventInput>(&late, 1U)).code ==
           EventApplyCode::kApplied);
-    reference->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&late_dependency, 1U));
     DrainRepair(reference.get());
     CHECK(reference_sink.batches.size() == 2U);
     CHECK(sliced_sink.batches[1U]->revisions ==
@@ -1080,11 +1013,6 @@ void TestInvalidShanghaiStatusKeepsSourcePhaseWithoutBecomingAnchor() {
               std::span<const EventInput>(&late, 1U)).code ==
           EventApplyCode::kApplied);
     CHECK(worker->projection_input_fenced());
-    const RawTickDependency dependency{
-        invalid_status.common.ingress_sequence,
-        invalid_status.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&dependency, 1U));
     DrainRepair(worker.get());
     CHECK(worker->stats().source_only_fast_path == source_only_before);
 
@@ -1128,12 +1056,6 @@ void TestSlicedRepairIsPrivateAndMatchesUnslicedProjection() {
     const std::array<EventInput, 2U> trade_inputs{
         Ordered(trades[0U]), Ordered(trades[1U])};
     CHECK(sliced->ApplyBatch(trade_inputs).code == EventApplyCode::kApplied);
-    const std::array<RawTickDependency, 2U> trade_dependencies{
-        RawTickDependency{trades[0U].common.ingress_sequence,
-                          trades[0U].common.kind},
-        RawTickDependency{trades[1U].common.ingress_sequence,
-                          trades[1U].common.kind}};
-    sliced->AcknowledgeRawTicks(trade_dependencies);
     CHECK(sliced->FlushDurableCommits());
     CHECK(sliced_sink.batches.size() == 1U);
 
@@ -1160,10 +1082,6 @@ void TestSlicedRepairIsPrivateAndMatchesUnslicedProjection() {
            ShenzhenEventQualityBit(
                ShenzhenEventQualityFlag::kUnknownBuyOrderReference)) != 0U);
 
-    const RawTickDependency add_dependency{
-        add.common.ingress_sequence, add.common.kind};
-    sliced->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&add_dependency, 1U));
     CHECK(sliced->FlushDurableCommits());
     CHECK(sliced_sink.batches.size() == 1U);
     DrainRepair(sliced.get());
@@ -1175,14 +1093,11 @@ void TestSlicedRepairIsPrivateAndMatchesUnslicedProjection() {
     CHECK(unsliced != nullptr);
     CHECK(unsliced->ApplyBatch(trade_inputs).code ==
           EventApplyCode::kApplied);
-    unsliced->AcknowledgeRawTicks(trade_dependencies);
     CHECK(unsliced->FlushDurableCommits());
     OpenGap(unsliced.get(), late_add, 101U, 101U);
     CHECK(unsliced->ApplyBatch(
               std::span<const EventInput>(&late_add, 1U)).code ==
           EventApplyCode::kApplied);
-    unsliced->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&add_dependency, 1U));
     DrainRepair(unsliced.get());
     CHECK(unsliced_sink.batches.size() == 2U);
     CHECK(sliced_sink.batches[1U]->revisions ==
@@ -1218,10 +1133,6 @@ void TestUnrelatedLiveOrderPublishesDuringRepair() {
     CHECK(worker->ApplyBatch(
               std::span<const EventInput>(&late_input, 1U))
               .repair_pending);
-    const RawTickDependency late_dependency{
-        late_add.common.ingress_sequence, late_add.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&late_dependency, 1U));
 
     const CanonicalTick unrelated = ShenzhenAdd(103U, 112U);
     const EventInput unrelated_input = Ordered(unrelated, 1U);
@@ -1229,10 +1140,6 @@ void TestUnrelatedLiveOrderPublishesDuringRepair() {
         std::span<const EventInput>(&unrelated_input, 1U));
     CHECK(unrelated_result.code == EventApplyCode::kApplied);
     CHECK(unrelated_result.repair_pending);
-    const RawTickDependency unrelated_dependency{
-        unrelated.common.ingress_sequence, unrelated.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&unrelated_dependency, 1U));
     CHECK(worker->FlushDurableCommits());
     CHECK(sink.batches.size() == 2U);
     CHECK(sink.batches[1U]->reason == RevisionReason::kLiveProjection);
@@ -1282,11 +1189,6 @@ void TestNewEarlierFactRestartsOnlyDirtyOrder() {
               .repair_pending);
     CHECK(sliced->stats().repair_order_restarts == 1U);
 
-    const std::array<RawTickDependency, 2U> late_dependencies{
-        RawTickDependency{add.common.ingress_sequence, add.common.kind},
-        RawTickDependency{cancel.common.ingress_sequence,
-                          cancel.common.kind}};
-    sliced->AcknowledgeRawTicks(late_dependencies);
     DrainRepair(sliced.get());
     CHECK(sliced_sink.batches.size() == 2U);
 
@@ -1305,7 +1207,6 @@ void TestNewEarlierFactRestartsOnlyDirtyOrder() {
         reference_cancel, reference_add};
     CHECK(reference->ApplyBatch(reference_late).code ==
           EventApplyCode::kApplied);
-    reference->AcknowledgeRawTicks(late_dependencies);
     DrainRepair(reference.get());
     CHECK(reference_sink.batches.size() == 2U);
     CHECK(sliced_sink.batches[1U]->revisions ==
@@ -1460,11 +1361,6 @@ void TestNewUseExtendsActiveRepairWorklist() {
     CHECK(!worker->CopyBundle(
         FactKey{20260807U, Market::kShenzhen, 7U, 103U}, &bundle));
 
-    const std::array<RawTickDependency, 2U> dependencies{
-        RawTickDependency{add.common.ingress_sequence, add.common.kind},
-        RawTickDependency{later_trade.common.ingress_sequence,
-                          later_trade.common.kind}};
-    worker->AcknowledgeRawTicks(dependencies);
     DrainRepair(worker.get());
     CHECK(worker->CopyBundle(
         FactKey{20260807U, Market::kShenzhen, 7U, 103U}, &bundle));
@@ -1498,10 +1394,6 @@ void TestMixedBatchPublishesOnlyDisjointComponent() {
     CHECK(worker->ApplyBatch(
               std::span<const EventInput>(&late_input, 1U))
               .repair_pending);
-    const RawTickDependency late_dependency{
-        late_add.common.ingress_sequence, late_add.common.kind};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&late_dependency, 1U));
 
     const CanonicalTick dirty_trade =
         ShenzhenTrade(103U, 152U, 101, 0);
@@ -1512,12 +1404,6 @@ void TestMixedBatchPublishesOnlyDisjointComponent() {
     CHECK(applied.code == EventApplyCode::kApplied);
     CHECK(applied.repair_pending);
 
-    const std::array<RawTickDependency, 2U> mixed_dependencies{
-        RawTickDependency{dirty_trade.common.ingress_sequence,
-                          dirty_trade.common.kind},
-        RawTickDependency{disjoint_add.common.ingress_sequence,
-                          disjoint_add.common.kind}};
-    worker->AcknowledgeRawTicks(mixed_dependencies);
     CHECK(worker->FlushDurableCommits());
     CHECK(sink.batches.size() == 2U);
     CHECK(sink.batches[1U]->reason == RevisionReason::kLiveProjection);
@@ -1550,7 +1436,6 @@ void TestShenzhenChannelZeroProjectsAndSettlesAck() {
           EventApplyCode::kApplied);
     Ack(worker.get(), tick);
     CHECK(sink.batches.size() == 1U);
-    CHECK(worker->stats().acknowledged_raw_dependencies == 0U);
     EventChannelState state{};
     CHECK(worker->CopyChannelState(
         Market::kShenzhen, 0U, &state));
@@ -1664,10 +1549,6 @@ void TestMultipleChannelEvictionTargetsSurviveSmallSlices() {
     const std::array<EventInput, 2U> inputs{
         Ordered(left), Ordered(right)};
     CHECK(worker->ApplyBatch(inputs).code == EventApplyCode::kApplied);
-    const std::array<RawTickDependency, 2U> dependencies{
-        RawTickDependency{left.common.ingress_sequence, left.common.kind},
-        RawTickDependency{right.common.ingress_sequence, right.common.kind}};
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
 
     Seal(worker.get(), Market::kShenzhen, 7U, 2U);
@@ -2132,12 +2013,6 @@ void TestShanghaiEndIsSlicedAndCapacityBounded() {
     CHECK(worker->CopyBundle(
         FactKey{20260807U, Market::kShanghai, 7U, 4U}, &bundle));
     CHECK(bundle.size() >= 2U);
-    std::array<RawTickDependency, 4U> dependencies{};
-    for (std::size_t index = 0U; index < ticks.size(); ++index) {
-        dependencies[index] = RawTickDependency{
-            ticks[index].common.ingress_sequence, ticks[index].common.kind};
-    }
-    worker->AcknowledgeRawTicks(dependencies);
     CHECK(worker->FlushDurableCommits());
     CHECK(!sink.batches.empty());
     CHECK(sink.batches.back()->reason == RevisionReason::kLiveProjection);
@@ -2812,8 +2687,6 @@ void TestRuntimeRoutesOwnersAndJoinsRawAcks() {
     config.worker.end_slice_max_cpu_ns = UINT64_C(1'000'000'000);
     config.micro_batch_rows = 8U;
     config.micro_batch_max_delay_ns = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 8U;
-    config.maximum_occurrence_join_entries_per_owner = 8U;
     std::string error;
     std::unique_ptr<EventRuntime> runtime =
         EventRuntime::Create(config, &sink, &error);
@@ -2828,12 +2701,8 @@ void TestRuntimeRoutesOwnersAndJoinsRawAcks() {
     owner1.common.instrument_ordinal = 1U;
     owner1.primary_order_id = 201;
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(owner0, 0U)));
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&owner1, 1U)));
     CHECK(runtime->AppendDispatch(1U, RuntimeOrdered(owner1, 1U)));
     CHECK(runtime->FlushAll());
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&owner0, 1U)));
     CHECK(runtime->DrainAll());
     CHECK(sink.batches.size() == 2U);
 
@@ -2844,8 +2713,6 @@ void TestRuntimeRoutesOwnersAndJoinsRawAcks() {
         1U, RuntimeGapOpen(fill, 1U, 202U, 202U, 1U)));
     CHECK(runtime->AppendDispatch(
         1U, RuntimeHoleFill(fill, 1U, 203U, 1U)));
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&fill, 1U)));
     CHECK(runtime->DrainAll());
     CHECK(sink.batches.size() == 3U);
 
@@ -2867,18 +2734,12 @@ void TestRuntimeRoutesOwnersAndJoinsRawAcks() {
     for (const CanonicalTick& tick : end_ticks) {
         CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(tick, 0U)));
     }
-    CHECK(runtime->OnRawTickBatchAcknowledged(end_ticks));
     CHECK(runtime->DrainAll());
 
     const EventRuntimeStats stats = runtime->stats();
     CHECK(stats.ordered_dispositions_received == 10U);
     CHECK(stats.hole_fill_dispositions_received == 1U);
     CHECK(stats.gap_open_controls_received == 1U);
-    CHECK(stats.raw_tick_acks_received == 11U);
-    CHECK(stats.occurrence_ack_first == 1U);
-    CHECK(stats.occurrence_disposition_first == 10U);
-    CHECK(stats.occurrence_projects_resolved == 11U);
-    CHECK(stats.occurrence_join_entries == 0U);
     const EventWorkerStats owner0_stats = runtime->worker(0U)->stats();
     const EventWorkerStats owner1_stats = runtime->worker(1U)->stats();
     CHECK(stats.workers.pending_revision_bytes ==
@@ -2928,8 +2789,6 @@ void TestRuntimeDrainAllFlushesFinalPartialBatch() {
 
     const CanonicalTick tick = ShenzhenAdd(101U, 170U);
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(tick, 0U)));
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&tick, 1U)));
     CHECK(runtime->DrainAll());
     CHECK(sink.batches.size() == 1U);
 
@@ -2954,8 +2813,6 @@ void TestPersistenceGroupingIsIndependentFromControlFences() {
     CHECK(runtime != nullptr);
 
     const CanonicalTick tick = ShenzhenAdd(101U, 7'001U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&tick, 1U)));
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(tick, 0U)));
     CHECK(runtime->AppendDispatch(
         0U, RuntimeGapOpen(tick, 0U, 102U, 102U, 1U)));
@@ -2997,12 +2854,6 @@ void TestOwnerPersistenceAggregatorClosesAtBatchBound() {
 
     const std::array<CanonicalTick, 2U> ticks{
         ShenzhenAdd(101U, 7'101U), ShenzhenAdd(102U, 7'102U)};
-    const std::array<RawTickDependency, 2U> dependencies{
-        RawTickDependency{ticks[0U].common.ingress_sequence,
-                          ticks[0U].common.kind},
-        RawTickDependency{ticks[1U].common.ingress_sequence,
-                          ticks[1U].common.kind}};
-    worker->AcknowledgeRawTicks(dependencies);
     const EventInput first = Ordered(ticks[0U]);
     CHECK(worker->ApplyBatch(
               std::span<const EventInput>(&first, 1U)).code ==
@@ -3041,12 +2892,6 @@ void TestOwnerPersistenceAggregatorClosesAtPendingCapacity() {
 
     const std::array<CanonicalTick, 2U> ticks{
         ShenzhenAdd(101U, 7'201U), ShenzhenAdd(102U, 7'202U)};
-    const std::array<RawTickDependency, 2U> dependencies{
-        RawTickDependency{ticks[0U].common.ingress_sequence,
-                          ticks[0U].common.kind},
-        RawTickDependency{ticks[1U].common.ingress_sequence,
-                          ticks[1U].common.kind}};
-    worker->AcknowledgeRawTicks(dependencies);
     for (const CanonicalTick& tick : ticks) {
         const EventInput input = Ordered(tick);
         CHECK(worker->ApplyBatch(
@@ -3066,10 +2911,6 @@ void TestRuntimeAckDrainIsBoundedAndSourceTimeDoesNotDriveTimer() {
     EventRuntimeConfig config = RuntimeConfig();
     config.micro_batch_rows = 8U;
     config.micro_batch_max_delay_ns = 1'000'000U;
-    config.maximum_raw_ack_backlog_per_owner = 8U;
-    config.maximum_occurrence_join_entries_per_owner = 8U;
-    config.raw_ack_drain_max_entries = 2U;
-    config.raw_ack_drain_max_cpu_ns = UINT64_C(1'000'000'000);
     std::string error;
     std::unique_ptr<EventRuntime> runtime = EventRuntime::Create(
         config, &sink, &error);
@@ -3081,25 +2922,16 @@ void TestRuntimeAckDrainIsBoundedAndSourceTimeDoesNotDriveTimer() {
         CHECK(runtime->AppendDispatch(
             0U, RuntimeOrdered(ticks[index], 0U)));
     }
-    CHECK(runtime->OnRawTickBatchAcknowledged(ticks));
-    CHECK(runtime->stats().raw_ack_inbox_backlog == ticks.size());
 
     // The synthetic source timestamps are far behind the current clock. A
     // zero scheduling time must not make the active batch timer-expired.
     CHECK(runtime->FlushDue(0U, 0U));
     const EventRuntimeStats sliced = runtime->stats();
-    CHECK(sliced.raw_ack_entries_drained == 2U);
-    CHECK(sliced.raw_ack_drain_slices == 1U);
-    CHECK(sliced.raw_ack_drain_entries_max == 2U);
-    CHECK(sliced.raw_ack_inbox_backlog == 2U);
     CHECK(sliced.micro_batches_applied == 0U);
     CHECK(sliced.timer_flushes == 0U);
 
     CHECK(runtime->DrainAll());
     const EventRuntimeStats drained = runtime->stats();
-    CHECK(drained.raw_ack_entries_drained == ticks.size());
-    CHECK(drained.raw_ack_drain_entries_max == 2U);
-    CHECK(drained.raw_ack_inbox_backlog == 0U);
     CHECK(drained.facts_in_micro_batches == ticks.size());
     CHECK(sink.batches.size() == 1U);
 }
@@ -3169,8 +3001,6 @@ void TestRuntimeChannelSealMailboxPreservesChannelOrder() {
     CHECK(runtime->stats().pending_channel_seals == 1U);
 
     const CanonicalTick following = ShenzhenAdd(2U, 7'402U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&following, 1U)));
     const TickDispatch fact = RuntimeOrdered(following, 0U, 1U);
     CHECK(runtime->AppendDispatch(0U, fact));
     const EventRuntimeStats after_fact = runtime->stats();
@@ -3261,8 +3091,6 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
 
     const auto project_and_flush = [&](const CanonicalTick& tick,
                                        std::uint64_t generation) {
-        CHECK(runtime->OnRawTickBatchAcknowledged(
-            std::span<const CanonicalTick>(&tick, 1U)));
         CHECK(runtime->AppendDispatch(
             0U, RuntimeOrdered(tick, 0U, generation)));
         CHECK(runtime->Flush(0U));
@@ -3291,8 +3119,6 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
 
     const CanonicalTick late =
         ShanghaiStatus(2U, 8'012U, TradingPhase::kOpeningCall);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&late, 1U)));
     CHECK(runtime->AppendDispatch(
         0U, RuntimeHoleFill(late, 0U, 12U, 1U)));
     CHECK(runtime->CanPollDispatch(0U));
@@ -3322,8 +3148,6 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
     for (std::uint64_t sequence = 12U; sequence <= 14U; ++sequence) {
         last = ShanghaiAdd(sequence, 8'100U + sequence,
                            static_cast<std::int64_t>(200U + sequence));
-        CHECK(runtime->OnRawTickBatchAcknowledged(
-            std::span<const CanonicalTick>(&last, 1U)));
         CHECK(runtime->AppendDispatch(
             0U, RuntimeOrdered(last, 0U, 1U)));
     }
@@ -3355,8 +3179,6 @@ void TestRuntimeDefersControlBehindEndExpansionFence() {
 
     const CanonicalTick opening =
         ShanghaiStatus(1U, 9'100U, TradingPhase::kContinuous);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&opening, 1U)));
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(opening, 0U)));
     CHECK(runtime->Flush(0U));
     CHECK(runtime->AppendDispatch(
@@ -3369,8 +3191,6 @@ void TestRuntimeDefersControlBehindEndExpansionFence() {
         ShanghaiAdd(6U, 9'106U, 400),
         ShanghaiStatus(7U, 9'107U, TradingPhase::kEnded)};
     for (const CanonicalTick& tick : suffix) {
-        CHECK(runtime->OnRawTickBatchAcknowledged(
-            std::span<const CanonicalTick>(&tick, 1U)));
         CHECK(runtime->AppendDispatch(
             0U, RuntimeOrdered(tick, 0U, 1U)));
     }
@@ -3400,8 +3220,6 @@ void TestRuntimeDefersControlBehindEndExpansionFence() {
     CHECK(runtime->stats().workers.end_candidates_processed == 4U);
 
     const CanonicalTick following = ShanghaiAdd(8U, 9'108U, 500);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&following, 1U)));
     CHECK(runtime->AppendDispatch(
         0U, RuntimeOrdered(following, 0U, 1U)));
     CHECK(runtime->Flush(0U));
@@ -3419,12 +3237,8 @@ void TestRuntimeDrainAndEpochIsolation() {
         EventRuntime::Create(config, &sink, &error);
     CHECK(runtime != nullptr);
     CHECK(runtime->AppendDispatch(0U, RuntimeReject(tick, 0U)));
-    CHECK(!runtime->DrainAll());
-    CHECK(!runtime->healthy());
-    CHECK(runtime->fatal_error().find(
-              "unresolved raw ACK/disposition dependencies") !=
-          std::string::npos);
-    CHECK(runtime->stats().occurrence_join_entries == 1U);
+    CHECK(runtime->DrainAll());
+    CHECK(runtime->healthy());
 
     runtime.reset();
     config = RuntimeConfig();
@@ -3432,14 +3246,10 @@ void TestRuntimeDrainAndEpochIsolation() {
     config.worker.feed_session_epoch = config.feed_session_epoch;
     runtime = EventRuntime::Create(config, &sink, &error);
     CHECK(runtime != nullptr);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&tick, 1U)));
     TickDispatch next_epoch = RuntimeReject(tick, 0U);
     next_epoch.feed_session_epoch = config.feed_session_epoch;
     CHECK(runtime->AppendDispatch(0U, next_epoch));
     CHECK(runtime->DrainAll());
-    CHECK(runtime->stats().occurrence_rejections_resolved == 1U);
-    CHECK(runtime->stats().occurrence_join_entries == 0U);
 }
 
 void TestRuntimeFailsClosedWhenRevisionSinkRejects() {
@@ -3453,130 +3263,11 @@ void TestRuntimeFailsClosedWhenRevisionSinkRejects() {
         EventRuntime::Create(config, &sink, &error);
     CHECK(runtime != nullptr);
     const CanonicalTick tick = ShenzhenAdd(101U, 90U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&tick, 1U)));
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(tick, 0U)));
     CHECK(!runtime->DrainAll());
     CHECK(!runtime->healthy());
     CHECK(runtime->fatal_error().find("revision sink rejected") !=
           std::string::npos);
-}
-
-void TestRuntimeCapacityBoundariesFailClosed() {
-    RecordingSink sink;
-    EventRuntimeConfig config = RuntimeConfig();
-    config.micro_batch_rows = 8U;
-    config.micro_batch_max_delay_ns = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 1U;
-    config.maximum_occurrence_join_entries_per_owner = 8U;
-    std::string error;
-    std::unique_ptr<EventRuntime> runtime =
-        EventRuntime::Create(config, &sink, &error);
-    CHECK(runtime != nullptr);
-
-    const CanonicalTick first = ShenzhenAdd(101U, 140U);
-    const CanonicalTick second = ShenzhenAdd(102U, 141U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&first, 1U)));
-    CHECK(!runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&second, 1U)));
-    CHECK(!runtime->healthy());
-    CHECK(runtime->fatal_error().find("raw ACK inbox capacity") !=
-          std::string::npos);
-
-    config.maximum_raw_ack_backlog_per_owner = 8U;
-    config.maximum_occurrence_join_entries_per_owner = 1U;
-    runtime = EventRuntime::Create(config, &sink, &error);
-    CHECK(runtime != nullptr);
-    CHECK(runtime->AppendDispatch(0U, RuntimeReject(first, 0U)));
-    CHECK(!runtime->AppendDispatch(0U, RuntimeReject(second, 0U)));
-    CHECK(!runtime->healthy());
-    CHECK(runtime->fatal_error().find("occurrence join capacity") !=
-          std::string::npos);
-}
-
-void TestRuntimeAckCapacityRelationshipValidation() {
-    RecordingSink sink;
-    std::string error;
-
-    EventRuntimeConfig config = RuntimeConfig();
-    config.micro_batch_rows = 7U;
-    config.maximum_raw_ack_backlog_per_owner = 5U;
-    config.maximum_occurrence_join_entries_per_owner = 6U;
-    config.worker.maximum_acknowledged_raw_dependencies = 6U;
-    CHECK(ValidateEventRuntimeConfig(config, &error));
-    CHECK(EventRuntime::Create(config, &sink, &error) != nullptr);
-
-    config.worker.maximum_acknowledged_raw_dependencies = 5U;
-    CHECK(!ValidateEventRuntimeConfig(config, &error));
-    CHECK(error.find("ACK forwarding cut") != std::string::npos);
-
-    config = RuntimeConfig();
-    config.micro_batch_rows = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 2U;
-    config.maximum_occurrence_join_entries_per_owner = 2U;
-    config.worker.maximum_acknowledged_raw_dependencies = 1U;
-    CHECK(EventRuntime::Create(config, &sink, &error) == nullptr);
-    CHECK(error.find("ACK forwarding cut") != std::string::npos);
-}
-
-void TestRuntimeRawAckInboxSupportsConcurrentProducers() {
-    constexpr std::size_t kProducerCount = 4U;
-    constexpr std::size_t kRowsPerProducer = 64U;
-    constexpr std::size_t kRows = kProducerCount * kRowsPerProducer;
-
-    RecordingSink sink;
-    EventRuntimeConfig config = RuntimeConfig();
-    config.maximum_raw_ack_backlog_per_owner = kRows;
-    config.maximum_occurrence_join_entries_per_owner = kRows;
-    std::string error;
-    std::unique_ptr<EventRuntime> runtime =
-        EventRuntime::Create(config, &sink, &error);
-    CHECK(runtime != nullptr);
-
-    std::vector<CanonicalTick> ticks;
-    ticks.reserve(kRows);
-    for (std::size_t index = 0U; index < kRows; ++index) {
-        ticks.push_back(ShenzhenAdd(
-            static_cast<std::uint64_t>(1'000U + index),
-            static_cast<std::uint64_t>(5'000U + index)));
-    }
-
-    std::atomic<bool> accepted{true};
-    std::array<std::thread, kProducerCount> producers;
-    for (std::size_t producer = 0U; producer < kProducerCount; ++producer) {
-        producers[producer] = std::thread([&, producer] {
-            const std::size_t first = producer * kRowsPerProducer;
-            for (std::size_t offset = 0U; offset < kRowsPerProducer;
-                 ++offset) {
-                const CanonicalTick& tick = ticks[first + offset];
-                if (!runtime->OnRawTickBatchAcknowledged(
-                        std::span<const CanonicalTick>(&tick, 1U))) {
-                    accepted.store(false, std::memory_order_relaxed);
-                    return;
-                }
-            }
-        });
-    }
-    for (std::thread& producer : producers) {
-        producer.join();
-    }
-    CHECK(accepted.load(std::memory_order_relaxed));
-    CHECK(runtime->stats().raw_ack_inbox_backlog == kRows);
-
-    for (const CanonicalTick& tick : ticks) {
-        CHECK(runtime->AppendDispatch(0U, RuntimeReject(tick, 0U)));
-    }
-    CHECK(runtime->DrainAll());
-    const EventRuntimeStats stats = runtime->stats();
-    CHECK(stats.raw_tick_acks_received == kRows);
-    CHECK(stats.occurrence_ack_first == kRows);
-    CHECK(stats.occurrence_rejections_resolved == kRows);
-    CHECK(stats.occurrence_join_high_water == kRows);
-    CHECK(stats.occurrence_join_entries == 0U);
-    CHECK(stats.raw_ack_inbox_backlog == 0U);
-    CHECK(stats.workers.facts_journaled == 0U);
-    CHECK(sink.batches.empty());
 }
 
 void TestRejectedOccurrenceNeverReplacesFirstWinner() {
@@ -3591,14 +3282,10 @@ void TestRejectedOccurrenceNeverReplacesFirstWinner() {
 
     const CanonicalTick retained = ShenzhenAdd(101U, 180U, 100);
     CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(retained, 0U)));
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&retained, 1U)));
     CHECK(runtime->DrainAll());
     CHECK(sink.batches.size() == 1U);
 
     const CanonicalTick conflicting = ShenzhenAdd(101U, 181U, 999);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&conflicting, 1U)));
     CHECK(runtime->AppendDispatch(0U, RuntimeReject(conflicting, 0U)));
     CHECK(runtime->DrainAll());
     CHECK(sink.batches.size() == 1U);
@@ -3611,37 +3298,8 @@ void TestRejectedOccurrenceNeverReplacesFirstWinner() {
     CHECK(projected.order.original_quantity == 100);
     const EventRuntimeStats stats = runtime->stats();
     CHECK(stats.rejected_dispositions_received == 1U);
-    CHECK(stats.occurrence_ack_first == 1U);
-    CHECK(stats.occurrence_rejections_resolved == 1U);
-    CHECK(stats.occurrence_join_entries == 0U);
     CHECK(stats.source_conflicts == 0U);
     CHECK(stats.workers.facts_journaled == 1U);
-    CHECK(stats.workers.acknowledged_raw_dependencies == 0U);
-}
-
-void TestWorkerBoundsAcknowledgedRawIndex() {
-    RecordingSink sink;
-    EventWorkerConfig config = Config();
-    config.maximum_acknowledged_raw_dependencies = 1U;
-    std::string error;
-    std::unique_ptr<EventWorker> worker =
-        EventWorker::Create(config, &sink, &error);
-    CHECK(worker != nullptr);
-
-    const RawTickDependency first{
-        1'000U, CanonicalKind::kShenzhenOrder};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&first, 1U));
-    CHECK(worker->healthy());
-    CHECK(worker->stats().acknowledged_raw_dependencies == 1U);
-
-    const RawTickDependency second{
-        1'001U, CanonicalKind::kShenzhenOrder};
-    worker->AcknowledgeRawTicks(
-        std::span<const RawTickDependency>(&second, 1U));
-    CHECK(!worker->healthy());
-    CHECK(worker->fatal_error().find("raw ACK index capacity") !=
-          std::string::npos);
 }
 
 void TestDuplicateAndConflictClassification() {
@@ -3850,11 +3508,10 @@ int main() {
     TestRuntimeDefersControlBehindEndExpansionFence();
     TestRuntimeDrainAndEpochIsolation();
     TestRuntimeFailsClosedWhenRevisionSinkRejects();
-    TestRuntimeCapacityBoundariesFailClosed();
-    TestRuntimeAckCapacityRelationshipValidation();
-    TestRuntimeRawAckInboxSupportsConcurrentProducers();
+
+
     TestRejectedOccurrenceNeverReplacesFirstWinner();
-    TestWorkerBoundsAcknowledgedRawIndex();
+
     TestDuplicateAndConflictClassification();
     TestSharedJournalUsesAuthoritativeFirstWinner();
     TestWorkerRequiresExplicitFactJournal();

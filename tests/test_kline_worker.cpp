@@ -131,7 +131,6 @@ KLineWorkerConfig Config(std::vector<std::uint32_t> intervals = {5U}) {
     config.fact_journal = TestJournal();
     config.maximum_bars = 1'024U;
     config.maximum_pending_commits = 64U;
-    config.maximum_acknowledged_raw_dependencies = 1'024U;
     return config;
 }
 
@@ -230,20 +229,11 @@ KLineRuntimeConfig RuntimeConfig() {
     config.worker = Config({1U});
     config.feed_session_epoch = kFeedSessionEpoch;
     config.micro_batch_rows = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 8U;
-    config.maximum_occurrence_join_entries_per_owner = 8U;
-    config.worker.maximum_acknowledged_raw_dependencies = 8U;
     return config;
 }
 
 void Ack(KLineWorker* worker, std::span<const CanonicalTick> ticks) {
-    std::vector<RawTickDependency> dependencies;
-    dependencies.reserve(ticks.size());
-    for (const CanonicalTick& tick : ticks) {
-        dependencies.push_back(RawTickDependency{
-            tick.common.ingress_sequence, tick.common.kind});
-    }
-    worker->AcknowledgeRawTicks(dependencies);
+    static_cast<void>(ticks);
     CHECK(worker->DrainDurableCommits());
 }
 
@@ -267,8 +257,6 @@ void TestSdkExchangeTimeDefinesWindowAndOhlc() {
         OrderedInput(later_exchange), OrderedInput(earlier_exchange)};
     const KLineApplyResult result = worker->ApplyBatch(inputs);
     CHECK(result.code == KLineApplyCode::kApplied);
-    CHECK(sink.batches.empty());
-    Ack(worker.get(), std::array{later_exchange, earlier_exchange});
     CHECK(sink.batches.size() == 1U);
     CHECK(sink.batches[0U]->revisions.size() == 1U);
 
@@ -461,8 +449,6 @@ void TestRuntimeProjectJoinBothArrivalOrders() {
 
     const CanonicalTick ack_first = Trade(
         1U, 40U, base + 1U, 100U, 10'000'000, 1);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&ack_first, 1U)));
     CHECK(runtime->AppendDispatch(0U, OrderedDispatch(ack_first)));
     CHECK(runtime->FlushAll());
     CHECK(sink.batches.size() == 1U);
@@ -471,22 +457,12 @@ void TestRuntimeProjectJoinBothArrivalOrders() {
         2U, 41U, base + 2U, 101U, 11'000'000, 2);
     CHECK(runtime->AppendDispatch(
         0U, HoleFillDispatch(disposition_first, 3U, 2U, 1U)));
-    CHECK(sink.batches.size() == 1U);
-    CHECK(runtime->stats().occurrence_join_entries == 1U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&disposition_first, 1U)));
     CHECK(runtime->FlushAll());
     CHECK(sink.batches.size() == 2U);
 
     const KLineRuntimeStats stats = runtime->stats();
-    CHECK(stats.raw_tick_acks_received == 2U);
     CHECK(stats.ordered_dispositions_received == 1U);
     CHECK(stats.hole_fill_dispositions_received == 1U);
-    CHECK(stats.occurrence_ack_first == 1U);
-    CHECK(stats.occurrence_disposition_first == 1U);
-    CHECK(stats.occurrence_projects_resolved == 2U);
-    CHECK(stats.occurrence_rejections_resolved == 0U);
-    CHECK(stats.occurrence_join_entries == 0U);
     CHECK(runtime->DrainAll());
 }
 
@@ -501,140 +477,17 @@ void TestRuntimeRejectJoinBothArrivalOrders() {
     const CanonicalTick disposition_first = Trade(
         10U, 50U, base + 1U, 100U, 10'000'000, 1);
     CHECK(runtime->AppendDispatch(0U, RejectDispatch(disposition_first)));
-    CHECK(runtime->stats().occurrence_join_entries == 1U);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&disposition_first, 1U)));
     CHECK(runtime->Flush(0U));
 
     const CanonicalTick ack_first = Trade(
         11U, 51U, base + 2U, 101U, 10'000'000, 1);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&ack_first, 1U)));
     CHECK(runtime->AppendDispatch(0U, RejectDispatch(ack_first)));
 
     const KLineRuntimeStats stats = runtime->stats();
     CHECK(stats.rejected_dispositions_received == 2U);
-    CHECK(stats.occurrence_ack_first == 1U);
-    CHECK(stats.occurrence_disposition_first == 1U);
-    CHECK(stats.occurrence_projects_resolved == 0U);
-    CHECK(stats.occurrence_rejections_resolved == 2U);
-    CHECK(stats.occurrence_join_entries == 0U);
     CHECK(stats.workers.facts_journaled == 0U);
     CHECK(sink.batches.empty());
     CHECK(runtime->DrainAll());
-}
-
-void TestRuntimeDuplicateSidesFailClosedWhilePairActive() {
-    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
-    std::string error;
-
-    RecordingSink disposition_sink;
-    std::unique_ptr<KLineRuntime> duplicate_disposition =
-        KLineRuntime::Create(RuntimeConfig(), &disposition_sink, &error);
-    CHECK(duplicate_disposition != nullptr);
-    const CanonicalTick disposition = Trade(
-        20U, 60U, base + 1U, 100U, 10'000'000, 1);
-    const TickDispatch rejected = RejectDispatch(disposition);
-    CHECK(duplicate_disposition->AppendDispatch(0U, rejected));
-    CHECK(!duplicate_disposition->AppendDispatch(0U, rejected));
-    CHECK(!duplicate_disposition->healthy());
-    CHECK(duplicate_disposition->stats().occurrence_duplicate_sides == 1U);
-    CHECK(duplicate_disposition->fatal_error().find("duplicate side") !=
-          std::string::npos);
-
-    RecordingSink ack_sink;
-    std::unique_ptr<KLineRuntime> duplicate_ack =
-        KLineRuntime::Create(RuntimeConfig(), &ack_sink, &error);
-    CHECK(duplicate_ack != nullptr);
-    const CanonicalTick acknowledged = Trade(
-        21U, 61U, base + 2U, 101U, 10'000'000, 1);
-    CHECK(duplicate_ack->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&acknowledged, 1U)));
-    CHECK(duplicate_ack->Flush(0U));
-    CHECK(duplicate_ack->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&acknowledged, 1U)));
-    CHECK(!duplicate_ack->Flush(0U));
-    CHECK(!duplicate_ack->healthy());
-    CHECK(duplicate_ack->stats().occurrence_duplicate_sides == 1U);
-}
-
-void TestRuntimeDrainFailsClosedWithUnresolvedJoin() {
-    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
-    RecordingSink sink;
-    std::string error;
-    std::unique_ptr<KLineRuntime> runtime =
-        KLineRuntime::Create(RuntimeConfig(), &sink, &error);
-    CHECK(runtime != nullptr);
-
-    const CanonicalTick rejected = Trade(
-        22U, 62U, base + 3U, 102U, 10'000'000, 1);
-    CHECK(runtime->AppendDispatch(0U, RejectDispatch(rejected)));
-    CHECK(!runtime->DrainAll());
-    CHECK(!runtime->healthy());
-    CHECK(runtime->fatal_error().find(
-              "unresolved raw ACK/disposition dependencies") !=
-          std::string::npos);
-    CHECK(runtime->stats().occurrence_join_entries == 1U);
-}
-
-void TestRuntimeJoinAndAckInboxCapacityFailClosed() {
-    constexpr std::uint64_t base = UINT64_C(34'200'000'000'000);
-    std::string error;
-
-    RecordingSink join_sink;
-    KLineRuntimeConfig join_config = RuntimeConfig();
-    join_config.maximum_occurrence_join_entries_per_owner = 1U;
-    std::unique_ptr<KLineRuntime> join = KLineRuntime::Create(
-        std::move(join_config), &join_sink, &error);
-    CHECK(join != nullptr);
-    const CanonicalTick first = Trade(
-        30U, 70U, base + 1U, 100U, 10'000'000, 1);
-    const CanonicalTick second = Trade(
-        31U, 71U, base + 2U, 101U, 10'000'000, 1);
-    CHECK(join->AppendDispatch(0U, RejectDispatch(first)));
-    CHECK(!join->AppendDispatch(0U, RejectDispatch(second)));
-    CHECK(!join->healthy());
-    CHECK(join->stats().occurrence_join_entries == 1U);
-    CHECK(join->fatal_error().find("join capacity") != std::string::npos);
-
-    RecordingSink inbox_sink;
-    KLineRuntimeConfig inbox_config = RuntimeConfig();
-    inbox_config.maximum_raw_ack_backlog_per_owner = 1U;
-    std::unique_ptr<KLineRuntime> inbox = KLineRuntime::Create(
-        std::move(inbox_config), &inbox_sink, &error);
-    CHECK(inbox != nullptr);
-    const std::array<CanonicalTick, 2U> acknowledgements{first, second};
-    CHECK(!inbox->OnRawTickBatchAcknowledged(acknowledgements));
-    CHECK(!inbox->healthy());
-    CHECK(inbox->stats().raw_tick_acks_received == 1U);
-    CHECK(inbox->stats().raw_ack_inbox_backlog == 1U);
-    CHECK(inbox->fatal_error().find("ACK inbox capacity") !=
-          std::string::npos);
-}
-
-void TestRuntimeAckCapacityRelationshipValidation() {
-    RecordingSink sink;
-    std::string error;
-
-    KLineRuntimeConfig config = RuntimeConfig();
-    config.micro_batch_rows = 7U;
-    config.maximum_raw_ack_backlog_per_owner = 5U;
-    config.maximum_occurrence_join_entries_per_owner = 6U;
-    config.worker.maximum_acknowledged_raw_dependencies = 6U;
-    CHECK(ValidateKLineRuntimeConfig(config, &error));
-    CHECK(KLineRuntime::Create(config, &sink, &error) != nullptr);
-
-    config.worker.maximum_acknowledged_raw_dependencies = 5U;
-    CHECK(!ValidateKLineRuntimeConfig(config, &error));
-    CHECK(error.find("ACK forwarding cut") != std::string::npos);
-
-    config = RuntimeConfig();
-    config.micro_batch_rows = 1U;
-    config.maximum_raw_ack_backlog_per_owner = 2U;
-    config.maximum_occurrence_join_entries_per_owner = 2U;
-    config.worker.maximum_acknowledged_raw_dependencies = 1U;
-    CHECK(KLineRuntime::Create(config, &sink, &error) == nullptr);
-    CHECK(error.find("ACK forwarding cut") != std::string::npos);
 }
 
 void TestRuntimeRejectsInvalidEpochOwnerAndFence() {
@@ -686,8 +539,6 @@ void TestRuntimeGapAndSealControlsAreNoOps() {
     const KLineRuntimeStats stats = runtime->stats();
     CHECK(stats.gap_open_controls_received == 1U);
     CHECK(stats.channel_seal_controls_received == 1U);
-    CHECK(stats.occurrence_join_entries == 0U);
-    CHECK(stats.raw_tick_acks_received == 0U);
     CHECK(stats.micro_batches_applied == 0U);
     CHECK(stats.workers.facts_journaled == 0U);
     CHECK(sink.batches.empty());
@@ -800,21 +651,13 @@ void TestPendingRevisionRowsAndOwnedBytesAccounting() {
     CHECK(applied.revisions_created == 2U);
 
     KLineWorkerStats stats = worker->stats();
-    CHECK(stats.pending_raw_commits == 1U);
-    CHECK(stats.pending_revision_rows == 2U);
-    CHECK(stats.pending_revision_rows_high_watermark == 2U);
-    CHECK(stats.pending_revision_bytes >= 2U * sizeof(KLineRevision));
-    CHECK(stats.pending_revision_bytes_high_watermark ==
-          stats.pending_revision_bytes);
-    CHECK(sink.batches.empty());
-
-    Ack(worker.get(), std::span<const CanonicalTick>(&trade, 1U));
-    stats = worker->stats();
     CHECK(stats.pending_raw_commits == 0U);
     CHECK(stats.pending_revision_rows == 0U);
     CHECK(stats.pending_revision_bytes == 0U);
     CHECK(stats.pending_revision_rows_high_watermark == 2U);
-    CHECK(stats.pending_revision_bytes_high_watermark > 0U);
+    CHECK(stats.pending_revision_bytes_high_watermark >=
+          2U * sizeof(KLineRevision));
+    CHECK(sink.batches.size() == 1U);
     CHECK(sink.batches.size() == 1U);
 }
 
@@ -836,10 +679,6 @@ void TestRuntimeMicroBatchFlushMetrics() {
     const CanonicalTick row1 = Trade(
         601U, 601U, exchange + 2U, row_now - 5'000U,
         11'000'000, 1);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&row0, 1U)));
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&row1, 1U)));
     CHECK(runtime->AppendDispatch(0U, OrderedDispatch(row0)));
     CHECK(runtime->AppendDispatch(0U, OrderedDispatch(row1)));
 
@@ -847,15 +686,11 @@ void TestRuntimeMicroBatchFlushMetrics() {
     const CanonicalTick timer = Trade(
         602U, 602U, exchange + 3U,
         timer_now - config.micro_batch_max_delay_ns, 12'000'000, 1);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&timer, 1U)));
     CHECK(runtime->AppendDispatch(0U, OrderedDispatch(timer)));
     CHECK(runtime->FlushDue(0U, timer_now));
 
     const CanonicalTick explicit_tick = Trade(
         603U, 603U, exchange + 4U, MonotonicNowNs(), 13'000'000, 1);
-    CHECK(runtime->OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick>(&explicit_tick, 1U)));
     CHECK(runtime->AppendDispatch(0U, OrderedDispatch(explicit_tick)));
     CHECK(runtime->Flush(0U));
     CHECK(runtime->Flush(0U));
@@ -884,10 +719,6 @@ int main() {
     TestDuplicateConflictAndMultipleIntervals();
     TestRuntimeProjectJoinBothArrivalOrders();
     TestRuntimeRejectJoinBothArrivalOrders();
-    TestRuntimeDuplicateSidesFailClosedWhilePairActive();
-    TestRuntimeDrainFailsClosedWithUnresolvedJoin();
-    TestRuntimeJoinAndAckInboxCapacityFailClosed();
-    TestRuntimeAckCapacityRelationshipValidation();
     TestRuntimeRejectsInvalidEpochOwnerAndFence();
     TestRuntimeGapAndSealControlsAreNoOps();
     TestAdmissionTokenHalfOpenBoundary();

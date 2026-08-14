@@ -1,6 +1,5 @@
 #pragma once
 
-#include "l2flow/ingest/raw_tap.h"
 #include "l2flow/kline/worker.h"
 
 #include <cstddef>
@@ -15,10 +14,6 @@ struct KLineRuntimeConfig final {
     std::uint64_t feed_session_epoch = 0U;
     std::size_t micro_batch_rows = 256U;
     std::uint64_t micro_batch_max_delay_ns = 1'000'000U;
-    // The worker raw-ACK index must cover the largest forwarding cut formed
-    // by the inbox, occurrence join, and micro-batch limits.
-    std::size_t maximum_raw_ack_backlog_per_owner = 65'536U;
-    std::size_t maximum_occurrence_join_entries_per_owner = 65'536U;
 };
 
 struct KLineRuntimeStats final {
@@ -27,15 +22,6 @@ struct KLineRuntimeStats final {
     std::uint64_t rejected_dispositions_received = 0U;
     std::uint64_t gap_open_controls_received = 0U;
     std::uint64_t channel_seal_controls_received = 0U;
-    std::uint64_t raw_tick_acks_received = 0U;
-    std::uint64_t raw_ack_inbox_backlog = 0U;
-    std::uint64_t occurrence_join_entries = 0U;
-    std::uint64_t occurrence_join_high_water = 0U;
-    std::uint64_t occurrence_ack_first = 0U;
-    std::uint64_t occurrence_disposition_first = 0U;
-    std::uint64_t occurrence_projects_resolved = 0U;
-    std::uint64_t occurrence_rejections_resolved = 0U;
-    std::uint64_t occurrence_duplicate_sides = 0U;
     std::uint64_t micro_batches_applied = 0U;
     std::uint64_t facts_in_micro_batches = 0U;
     std::uint64_t micro_batch_rows_max = 0U;
@@ -52,9 +38,9 @@ struct KLineRuntimeStats final {
     const KLineRuntimeConfig& config,
     std::string* error) noexcept;
 
-class KLineRuntime final : public ingest::RawTickBatchAckListener {
+class KLineRuntime final {
 public:
-    ~KLineRuntime() override;
+    ~KLineRuntime();
     KLineRuntime(const KLineRuntime&) = delete;
     KLineRuntime& operator=(const KLineRuntime&) = delete;
 
@@ -72,9 +58,6 @@ public:
     [[nodiscard]] bool Flush(std::size_t owner) noexcept;
     [[nodiscard]] bool FlushAll() noexcept;
     [[nodiscard]] bool DrainAll() noexcept;
-
-    [[nodiscard]] bool OnRawTickBatchAcknowledged(
-        std::span<const ingest::CanonicalTick> ticks) noexcept override;
 
     [[nodiscard]] bool healthy() const noexcept;
     [[nodiscard]] std::string fatal_error() const;

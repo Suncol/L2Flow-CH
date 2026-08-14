@@ -9,15 +9,15 @@ MDL SDK callback
   -> decode-complete raw tap -> preallocated canonical batches
        -> ClickHouse writer threads -> raw_tick/raw_snapshot MergeTree
   -> first-wins channel sequence recovery + exact hole ledger
-  -> per-owner FIFO of fixed-width TickDispatch records
-       -> ordered/hole-fill projection or rejected-occurrence settlement
-       -> GapOpen/ChannelSeal owner fences
-       -> bounded raw-ACK/disposition join
+  -> per-lane disposition outbox of fixed-width TickDispatch records
+       -> independent Event / KLine / Arrow cursors
+            -> ordered/hole-fill projection or rejected-occurrence discard
+            -> GapOpen/ChannelSeal owner fences
             -> gap-driven Event retention + order baseline compaction
             -> Event revision log/current ClickHouse tables
             -> owner-local exchange-time KLine projection
             -> KLine revision log/current ClickHouse tables
-       -> projectable ticks in per-owner Arrow rings
+            -> projectable ticks in per-owner Arrow rings
   -> snapshot owner queues -> per-owner Arrow snapshot rings
 ```
 
@@ -26,15 +26,14 @@ repository. The raw tap runs after complete decode/normalization and before
 SequenceRecovery, duplicate/conflict handling, and catalog-miss suppression.
 The shared-memory Arrow branch remains an independent bounded volatile hot
 path. `SequenceRecovery` classifies every catalog-resolved occurrence exactly
-once as ordered, an accepted hole fill, or rejected. It sends that disposition
-and `GapOpen`/`ChannelSeal` controls through the same decoder-lane-to-owner FIFO;
-there is no second recovery queue. The Event and KLine runtimes join each
-disposition with its independently arriving `raw_tick` ACK. Event applies the
+once as ordered, an accepted hole fill, or rejected. It appends that
+disposition and `GapOpen`/`ChannelSeal` controls to a process-lifetime
+per-lane outbox; Event, KLine, and Arrow each have an independent cursor.
+There is no second recovery queue and no raw-ACK join. Event applies the
 gap/seal controls as retention fences; KLine validates the controls but does
-not reclaim bar state from them. Rejected occurrences settle in the bounded
-joins and never enter either worker or the FactJournal. Projectable occurrences
-may be calculated before raw durability, but immutable revision batches cannot
-enter a derived sink until their raw dependencies are acknowledged.
+not reclaim bar state from them. Rejected occurrences never enter either
+worker or the FactJournal. Projectable occurrences are calculated and
+submitted without waiting for a raw ClickHouse ACK.
 
 Event retains only the suffix required by open holes, compacts closed order
 uses into full private-state baselines, and processes repair, Shanghai END
@@ -368,7 +367,6 @@ Enable the Event projection on top of that durable raw path with:
 --event-maximum-repair-bytes <per-owner hard cap>
 --event-maximum-pending-revision-bytes <per-owner hard cap>
 --event-maximum-end-staging-bytes <per-owner hard cap>
---event-maximum-occurrence-join <per-owner hard cap>
 --event-maximum-pending-channel-seals <per-owner mailbox cap>
 --event-phase-slice-max-nodes <per-owner slice budget>
 --event-phase-slice-max-bytes <per-owner slice budget>
@@ -378,7 +376,7 @@ Enable the Event projection on top of that durable raw path with:
 The revision epoch occupies the high 32 bits of each Event version and must be
 strictly larger than every epoch previously used for the same logical Event
 key space. `mdl_ingestd` validates that it is nonzero but does not allocate or
-persist it. The detailed ordering, repair, raw-ACK, ClickHouse current-table,
+persist it. The detailed ordering, repair, ClickHouse current-table,
 and restart boundaries are documented in
 [docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
 
@@ -403,7 +401,7 @@ keys and OHLC order use the valid SDK `TickTime`/`TransactTime` normalized to
 nanoseconds from exchange midnight; host wall time, receive time, and SDK
 header `LocalTime` never substitute for it. An accepted hole fill emits a
 higher-version update to the same logical bar. The exact eligibility,
-ordering, provisional, raw-ACK, and restart contracts are documented in
+ordering, provisional, and restart contracts are documented in
 [docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
 The KLine sink transport benchmark and the limits of its 800k-1M revision/s
 loopback result are recorded in

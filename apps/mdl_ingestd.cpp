@@ -68,6 +68,11 @@ using l2flow::ingest::StartMode;
 using l2flow::ingest::StreamMask;
 using l2flow::ingest::TickDispatch;
 using l2flow::ingest::TickDispatchKind;
+using l2flow::ingest::ContinuityInputs;
+using l2flow::ingest::ContinuityModeName;
+using l2flow::ingest::DispositionOutbox;
+using l2flow::ingest::FreshnessFrontier;
+using l2flow::ingest::MonotonicNowNs;
 
 volatile std::sig_atomic_t g_stop_requested = 0;
 
@@ -110,34 +115,6 @@ struct Options final {
     bool kline_enabled = false;
 #endif
 };
-
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-class RawTickBatchAckFanout final
-    : public l2flow::ingest::RawTickBatchAckListener {
-public:
-    void Configure(l2flow::ingest::RawTickBatchAckListener* first,
-                   l2flow::ingest::RawTickBatchAckListener* second) noexcept {
-        first_ = first;
-        second_ = second;
-    }
-
-    [[nodiscard]] bool OnRawTickBatchAcknowledged(
-        std::span<const CanonicalTick> ticks) noexcept override {
-        bool result = true;
-        if (first_ != nullptr) {
-            result = first_->OnRawTickBatchAcknowledged(ticks) && result;
-        }
-        if (second_ != nullptr) {
-            result = second_->OnRawTickBatchAcknowledged(ticks) && result;
-        }
-        return result;
-    }
-
-private:
-    l2flow::ingest::RawTickBatchAckListener* first_ = nullptr;
-    l2flow::ingest::RawTickBatchAckListener* second_ = nullptr;
-};
-#endif
 
 inline constexpr std::uint64_t kLatencySampleEvery = 64U;
 inline constexpr std::size_t kLatencyRingCapacity = 4'096U;
@@ -315,8 +292,8 @@ void PrintUsage() {
         << "  --fact-journal-hot-cache N decoded winners retained; default 65536\n"
         << "  --fact-journal-maximum-records N global first-winner cap; default 600000000\n"
         << "  --fact-journal-maximum-directory-pages N sparse 64KiB page cap; default 262144\n"
-        << "  --event-enable             enable Event projection; enqueue "
-           "derived batches after raw ACK\n"
+        << "  --event-enable             enable Event projection from the "
+           "disposition outbox\n"
         << "  --event-revision-epoch N   required nonzero monotone writer epoch\n"
         << "  --event-calculation-run-id HEX32 required calculation identity\n"
         << "  --event-logic-version N    default 1\n"
@@ -352,15 +329,11 @@ void PrintUsage() {
         << "  --event-phase-slice-max-nodes N default 4096\n"
         << "  --event-phase-slice-max-bytes N default 4194304\n"
         << "  --event-phase-slice-max-cpu-ns N default 500000\n"
-        << "  --event-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
-        << "  --event-maximum-occurrence-join N default 65536 per owner\n"
         << "  --event-maximum-pending-channel-seals N default 4096 per owner\n"
-        << "  --event-raw-ack-drain-max-entries N default 1024 per service\n"
-        << "  --event-raw-ack-drain-max-cpu-ns N default 150000\n"
         << "  --event-eviction-slice-max-nodes N default 4096\n"
         << "  --event-eviction-slice-max-bytes N default 4194304\n"
         << "  --kline-enable             enable exchange-time KLine "
-           "projection; enqueue derived batches after raw ACK\n"
+           "projection from the disposition outbox\n"
         << "  --kline-interval-seconds N repeatable; default 1; range 1..86400\n"
         << "  --kline-revision-epoch N   required nonzero monotone writer epoch\n"
         << "  --kline-calculation-run-id HEX32 required calculation identity\n"
@@ -376,8 +349,6 @@ void PrintUsage() {
         << "  --kline-queue-revision-rows N default 1048576\n"
         << "  --kline-maximum-bars N     default 4194304 per owner\n"
         << "  --kline-maximum-pending-commits N default 1024 per owner\n"
-        << "  --kline-maximum-raw-ack-backlog N default 65536 per owner; inbox/index\n"
-        << "  --kline-maximum-occurrence-join N default 65536 per owner\n"
 #endif
         << "  --run-seconds N            test mode only; 0 means until signal, "
            "max 86400\n"
@@ -1453,24 +1424,6 @@ struct CpuSelection final {
                 return false;
             }
             event_option_seen = true;
-        } else if (argument == "--event-maximum-raw-ack-backlog") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.maximum_raw_ack_backlog_per_owner)) {
-                *error = "invalid --event-maximum-raw-ack-backlog";
-                return false;
-            }
-            parsed.event.worker.maximum_acknowledged_raw_dependencies =
-                parsed.event.maximum_raw_ack_backlog_per_owner;
-            event_option_seen = true;
-        } else if (argument == "--event-maximum-occurrence-join") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.maximum_occurrence_join_entries_per_owner)) {
-                *error = "invalid --event-maximum-occurrence-join";
-                return false;
-            }
-            event_option_seen = true;
         } else if (argument ==
                    "--event-maximum-pending-channel-seals") {
             if (!ParseInteger(
@@ -1479,22 +1432,6 @@ struct CpuSelection final {
                          .maximum_pending_channel_seals_per_owner)) {
                 *error =
                     "invalid --event-maximum-pending-channel-seals";
-                return false;
-            }
-            event_option_seen = true;
-        } else if (argument == "--event-raw-ack-drain-max-entries") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.raw_ack_drain_max_entries)) {
-                *error = "invalid --event-raw-ack-drain-max-entries";
-                return false;
-            }
-            event_option_seen = true;
-        } else if (argument == "--event-raw-ack-drain-max-cpu-ns") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.event.raw_ack_drain_max_cpu_ns)) {
-                *error = "invalid --event-raw-ack-drain-max-cpu-ns";
                 return false;
             }
             event_option_seen = true;
@@ -1635,24 +1572,6 @@ struct CpuSelection final {
                     next(argument),
                     &parsed.kline.worker.maximum_pending_commits)) {
                 *error = "invalid --kline-maximum-pending-commits";
-                return false;
-            }
-            kline_option_seen = true;
-        } else if (argument == "--kline-maximum-raw-ack-backlog") {
-            std::size_t capacity = 0U;
-            if (!ParseInteger(next(argument), &capacity)) {
-                *error = "invalid --kline-maximum-raw-ack-backlog";
-                return false;
-            }
-            parsed.kline.maximum_raw_ack_backlog_per_owner = capacity;
-            parsed.kline.worker.maximum_acknowledged_raw_dependencies =
-                capacity;
-            kline_option_seen = true;
-        } else if (argument == "--kline-maximum-occurrence-join") {
-            if (!ParseInteger(
-                    next(argument),
-                    &parsed.kline.maximum_occurrence_join_entries_per_owner)) {
-                *error = "invalid --kline-maximum-occurrence-join";
                 return false;
             }
             kline_option_seen = true;
@@ -2025,6 +1944,38 @@ void PrintStats(const EngineStats& stats) {
               << " lane_full=" << stats.lane_full << '\n';
 }
 
+void PrintFreshness(const IngestEngine& engine,
+                    bool event_enabled,
+                    bool kline_enabled,
+                    bool event_healthy,
+                    bool kline_healthy,
+                    bool event_pending,
+                    bool kline_pending,
+                    bool fatal) {
+    const DispositionOutbox* const outbox = engine.tick_outbox();
+    if (outbox == nullptr) {
+        return;
+    }
+    ContinuityInputs inputs{};
+    inputs.fatal = fatal;
+    inputs.event_enabled = event_enabled;
+    inputs.kline_enabled = kline_enabled;
+    inputs.event_healthy = event_healthy;
+    inputs.kline_healthy = kline_healthy;
+    inputs.event_pending = event_pending;
+    inputs.kline_pending = kline_pending;
+    inputs.now_monotonic_ns = MonotonicNowNs();
+    const FreshnessFrontier frontier = outbox->EvaluateFreshness(inputs);
+    std::cout << "continuity_mode="
+              << ContinuityModeName(frontier.mode)
+              << " event_authoritative="
+              << (frontier.event_authoritative ? 1 : 0)
+              << " kline_authoritative="
+              << (frontier.kline_authoritative ? 1 : 0)
+              << " outbox_max_lag_lsn=" << frontier.max_lag_lsn
+              << '\n';
+}
+
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
 void PrintClickHouseStats(
     const l2flow::clickhouse::RawClickHouseStats& stats) {
@@ -2079,15 +2030,6 @@ void PrintEventStats(
               << runtime.pending_channel_seals
               << " event_pending_channel_seals_hwm="
               << runtime.pending_channel_seals_high_water
-              << " event_raw_acks=" << runtime.raw_tick_acks_received
-              << " event_raw_ack_backlog="
-              << runtime.raw_ack_inbox_backlog
-              << " event_occurrence_join="
-              << runtime.occurrence_join_entries
-              << " event_occurrence_join_hwm="
-              << runtime.occurrence_join_high_water
-              << " event_rejections_resolved="
-              << runtime.occurrence_rejections_resolved
               << " event_micro_batches=" << runtime.micro_batches_applied
               << " event_facts_in_micro_batches="
               << runtime.facts_in_micro_batches
@@ -2103,14 +2045,6 @@ void PrintEventStats(
               << " event_empty_control_flushes="
               << runtime.empty_control_flushes
               << " event_explicit_flushes=" << runtime.explicit_flushes
-              << " event_raw_ack_drain_slices="
-              << runtime.raw_ack_drain_slices
-              << " event_raw_ack_entries_drained="
-              << runtime.raw_ack_entries_drained
-              << " event_raw_ack_drain_entries_max="
-              << runtime.raw_ack_drain_entries_max
-              << " event_raw_ack_drain_cpu_ns_max="
-              << runtime.raw_ack_drain_cpu_ns_max
               << " event_facts=" << runtime.workers.facts_journaled
               << " event_repaired_uses="
               << runtime.workers.repaired_order_uses
@@ -2172,8 +2106,6 @@ void PrintEventStats(
               << " event_revisions=" << runtime.workers.revisions_created
               << " event_pending_raw="
               << runtime.workers.pending_raw_commits
-              << " event_ack_index="
-              << runtime.workers.acknowledged_raw_dependencies
               << " event_persistence_groups_submitted="
               << runtime.workers.persistence_groups_submitted
               << " event_persistence_group_batches_max="
@@ -2241,15 +2173,6 @@ void PrintKLineStats(
               << runtime.hole_fill_dispositions_received
               << " kline_rejected_dispositions="
               << runtime.rejected_dispositions_received
-              << " kline_raw_acks=" << runtime.raw_tick_acks_received
-              << " kline_raw_ack_backlog="
-              << runtime.raw_ack_inbox_backlog
-              << " kline_occurrence_join="
-              << runtime.occurrence_join_entries
-              << " kline_occurrence_join_hwm="
-              << runtime.occurrence_join_high_water
-              << " kline_rejections_resolved="
-              << runtime.occurrence_rejections_resolved
               << " kline_micro_batches=" << runtime.micro_batches_applied
               << " kline_facts_in_micro_batches="
               << runtime.facts_in_micro_batches
@@ -2277,8 +2200,6 @@ void PrintKLineStats(
               << runtime.workers.pending_revision_bytes
               << " kline_pending_revision_bytes_owner_hwm_max="
               << runtime.workers.pending_revision_bytes_high_watermark
-              << " kline_ack_index="
-              << runtime.workers.acknowledged_raw_dependencies
               << " kline_sink_batches_queued="
               << sink.revision_batches_queued
               << " kline_sink_batches_acked="
@@ -2641,7 +2562,6 @@ int main(int argc, char** argv) {
         return 2;
     }
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-    RawTickBatchAckFanout raw_ack_fanout;
     std::shared_ptr<l2flow::journal::CanonicalFactJournal> fact_journal;
     std::unique_ptr<l2flow::clickhouse::EventClickHouseSink> clickhouse_event;
     std::unique_ptr<l2flow::event::EventRuntime> event_runtime;
@@ -2694,10 +2614,6 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (event_runtime != nullptr || kline_runtime != nullptr) {
-        raw_ack_fanout.Configure(event_runtime.get(), kline_runtime.get());
-        options.clickhouse.tick_ack_listener = &raw_ack_fanout;
-    }
     if (options.clickhouse_enabled && !options.validate_only) {
         clickhouse_raw = l2flow::clickhouse::RawClickHouseSink::Create(
             options.clickhouse, &error);
@@ -2709,6 +2625,24 @@ int main(int argc, char** argv) {
         options.engine.raw_record_tap = clickhouse_raw.get();
     }
 #endif
+    {
+        std::size_t tick_consumers = 0U;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        if (options.event_enabled) {
+            ++tick_consumers;
+        }
+        if (options.kline_enabled) {
+            ++tick_consumers;
+        }
+#endif
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+        if (options.arrow_enabled) {
+            ++tick_consumers;
+        }
+#endif
+        options.engine.tick_consumer_count =
+            tick_consumers == 0U ? 1U : tick_consumers;
+    }
     std::unique_ptr<IngestEngine> engine = IngestEngine::Create(
         options.engine, std::move(catalog), &error);
     if (engine == nullptr) {
@@ -2900,24 +2834,29 @@ int main(int argc, char** argv) {
             CanonicalSnapshot snapshot{};
             ChannelGap gap{};
             ChannelFault fault{};
-            const auto can_poll_tick_dispatch = [&] {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-                return event_runtime == nullptr ||
-                    event_runtime->CanPollDispatch(owner);
-#else
-                return true;
+            const std::size_t event_consumer = 0U;
+            const std::size_t kline_consumer =
+                options.event_enabled ? 1U : 0U;
 #endif
-            };
-            for (;;) {
-                const bool stopping =
-                    drain_after_stop.load(std::memory_order_acquire);
-                bool progress = false;
-                const bool dispatch_poll_blocked =
-                    !can_poll_tick_dispatch();
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+            std::size_t arrow_consumer = 0U;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+            if (options.event_enabled) {
+                ++arrow_consumer;
+            }
+            if (options.kline_enabled) {
+                ++arrow_consumer;
+            }
+#endif
+#endif
+            const auto consume_dispatch = [&](std::size_t consumer,
+                                              auto&& deliver) {
+                bool consumed = false;
                 for (std::size_t drained = 0U;
                      drained < kDrainBurstMessages &&
-                     can_poll_tick_dispatch() &&
-                     engine->TryPollTickDispatch(owner, &dispatch);
+                     engine->TryPollTickDispatch(
+                         consumer, owner, &dispatch);
                      ++drained) {
                     const bool projectable =
                         dispatch.kind == TickDispatchKind::kProjectOrdered ||
@@ -2928,27 +2867,87 @@ int main(int argc, char** argv) {
                             dispatch.tick.common.receive_monotonic_ns,
                             &latency_samplers[owner]);
                     }
-#if defined(L2FLOW_CH_HAS_ARROW_RING)
-                    if (projectable && arrow_egress != nullptr) {
-                        static_cast<void>(
-                            arrow_egress->AppendTickDispatch(
-                                owner, dispatch));
-                    }
-#endif
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-                    if (event_runtime != nullptr) {
-                        static_cast<void>(
-                            event_runtime->AppendDispatch(owner, dispatch));
-                    }
-                    if (kline_runtime != nullptr) {
-                        static_cast<void>(
-                            kline_runtime->AppendDispatch(owner, dispatch));
-                    }
-#endif
+                    deliver(dispatch);
                     consumed_dispatches.fetch_add(
                         1U, std::memory_order_relaxed);
-                    progress = true;
+                    consumed = true;
                 }
+                return consumed;
+            };
+            for (;;) {
+                const bool stopping =
+                    drain_after_stop.load(std::memory_order_acquire);
+                bool progress = false;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                const bool event_poll_blocked =
+                    event_runtime != nullptr &&
+                    !event_runtime->CanPollDispatch(owner);
+                if (event_runtime != nullptr && !event_poll_blocked) {
+                    progress = consume_dispatch(
+                                   event_consumer,
+                                   [&](const TickDispatch& value) {
+                                       static_cast<void>(
+                                           event_runtime->AppendDispatch(
+                                               owner, value));
+                                   }) ||
+                        progress;
+                }
+                if (kline_runtime != nullptr) {
+                    progress = consume_dispatch(
+                                   kline_consumer,
+                                   [&](const TickDispatch& value) {
+                                       static_cast<void>(
+                                           kline_runtime->AppendDispatch(
+                                               owner, value));
+                                   }) ||
+                        progress;
+                }
+#endif
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                if (arrow_egress != nullptr) {
+                    progress = consume_dispatch(
+                                   arrow_consumer,
+                                   [&](const TickDispatch& value) {
+                                       const bool projectable =
+                                           value.kind ==
+                                               TickDispatchKind::
+                                                   kProjectOrdered ||
+                                           value.kind ==
+                                               TickDispatchKind::
+                                                   kProjectHoleFill;
+                                       if (projectable) {
+                                           static_cast<void>(
+                                               arrow_egress->
+                                                   AppendTickDispatch(
+                                                       owner, value));
+                                       }
+                                   }) ||
+                        progress;
+                }
+#endif
+#if !defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW) && \
+    !defined(L2FLOW_CH_HAS_ARROW_RING)
+                progress = consume_dispatch(
+                               0U, [&](const TickDispatch&) {}) ||
+                    progress;
+#endif
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                if (event_runtime == nullptr && kline_runtime == nullptr
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+                    && arrow_egress == nullptr
+#endif
+                ) {
+                    progress = consume_dispatch(
+                                   0U, [&](const TickDispatch&) {}) ||
+                        progress;
+                }
+#elif defined(L2FLOW_CH_HAS_ARROW_RING)
+                if (arrow_egress == nullptr) {
+                    progress = consume_dispatch(
+                                   0U, [&](const TickDispatch&) {}) ||
+                        progress;
+                }
+#endif
                 for (std::size_t drained = 0U;
                      drained < kDrainBurstMessages &&
                      engine->TryPollSnapshot(owner, &snapshot);
@@ -3019,8 +3018,7 @@ int main(int argc, char** argv) {
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
                         if (event_runtime != nullptr &&
                             event_runtime->healthy() &&
-                            (dispatch_poll_blocked ||
-                             !event_runtime->CanPollDispatch(owner))) {
+                            !event_runtime->CanPollDispatch(owner)) {
                             // A fence cleared by this iteration's FlushDue
                             // still requires one producer-quiesced poll pass.
                             std::this_thread::yield();
@@ -3185,6 +3183,22 @@ int main(int argc, char** argv) {
                arrow_healthy() && clickhouse_healthy()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             PrintStats(engine->stats());
+            PrintFreshness(
+                *engine,
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+                options.event_enabled, options.kline_enabled,
+                event_runtime == nullptr || event_runtime->healthy(),
+                kline_runtime == nullptr || kline_runtime->healthy(),
+                event_runtime != nullptr &&
+                    event_runtime->stats().workers.pending_raw_commits !=
+                        0U,
+                kline_runtime != nullptr &&
+                    kline_runtime->stats().workers.pending_raw_commits !=
+                        0U,
+#else
+                false, false, true, true, false, false,
+#endif
+                !engine->healthy());
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
             if (clickhouse_raw != nullptr) {
                 PrintClickHouseStats(clickhouse_raw->stats());
@@ -3310,6 +3324,20 @@ int main(int argc, char** argv) {
 #endif
     const EngineStats final_stats = engine->stats();
     PrintStats(final_stats);
+    PrintFreshness(
+        *engine,
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        options.event_enabled, options.kline_enabled,
+        event_runtime == nullptr || event_runtime->healthy(),
+        kline_runtime == nullptr || kline_runtime->healthy(),
+        event_runtime != nullptr &&
+            event_runtime->stats().workers.pending_raw_commits != 0U,
+        kline_runtime != nullptr &&
+            kline_runtime->stats().workers.pending_raw_commits != 0U,
+#else
+        false, false, true, true, false, false,
+#endif
+        !engine->healthy());
     if (options.operation_mode == OperationMode::kTest) {
         LatencyWindow final_latency_window = CollectLatency(
             latency_samplers.get(), options.engine.instrument_workers,

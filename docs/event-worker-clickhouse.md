@@ -7,24 +7,16 @@ that follows `SequenceRecovery`:
 
 ```text
 decoder lane
-  -> per-owner SPSC FIFO
-       -> GapOpen / ChannelSeal -> owner fence / retention request
-       -> REJECT_LATE_FACT ------+
-       |                         +--> ACK/disposition join -> reject + ACK: settle
-       |                         |
-       -> PROJECT_* -------------+--> project + ACK: durable dependency
-                  |
-                  +-> computation micro-batch -> journal first-wins fact
+  -> per-lane disposition outbox (LSN)
+       -> independent Event / KLine / Arrow cursors
+            -> GapOpen / ChannelSeal -> owner fence / retention request
+            -> REJECT_LATE_FACT -> discard; do not journal
+            -> PROJECT_* -> computation micro-batch -> journal first-wins fact
                                             -> append/minimal-closure repair
                                             -> logical recovery commit
-                                                              |
-                                          raw dependency ACK --+
-                                                              v
-                                         owner persistence group
-                                                              |
-                                                              v
-                                         lane FIFO -> physical revision INSERTs
-                                                   -> independent marker rows
+                                            -> owner persistence group
+                                            -> lane FIFO -> physical revision INSERTs
+                                                         -> independent marker rows
 ```
 
 Every disposition and channel control for one decoder-lane-to-owner edge uses
@@ -64,14 +56,14 @@ bound closes a durable prefix. This is the boundary that prevents control
 broadcasts from becoming one HTTP transaction per empty or tiny computation
 cut.
 
-The worker may compute against the shared local disk-backed canonical journal
-and owner-local projection indexes before the raw ACK. It does not submit a
-revision batch to the Event sink until every raw occurrence on which that
-projection cut depends has been acknowledged by the raw ClickHouse sink. A
-rejected occurrence never enters the worker or FactJournal: the bounded runtime
-join settles it directly when its raw ACK is also present. The raw, runtime,
-and Event queues are volatile; none is a WAL. The local FactJournal is also not
-a restart boundary; its exact capacity and recovery contract are in
+The worker computes against the shared local disk-backed canonical journal
+and owner-local projection indexes and submits revision batches without
+waiting for a raw ClickHouse ACK. SequenceRecovery output is appended to a
+process-lifetime per-lane disposition outbox; Event, KLine, and Arrow each
+have independent cursors. A rejected occurrence never enters the worker or
+FactJournal. The outbox, runtime, and Event queues are volatile; none is a
+crash-restart boundary. The local FactJournal is also not a restart
+boundary; its exact capacity and recovery contract are in
 [fact-journal.md](fact-journal.md).
 
 This implementation is intraday and process-local. It does not bootstrap
@@ -216,9 +208,7 @@ array/deque/tree representations:
 | Active END index | the active-order ExactLists exclude orders whose finalization has already emitted |
 | BundleCache | complete current EventKey-to-payload set for each retained FactKey |
 | EventHead | latest revision ID, payload hash, and tombstone state for each retained EventKey |
-| Pending raw commit FIFO | immutable revision batches, exact raw dependencies, and conservative owned-byte accounting |
-| Runtime occurrence join | bounded owner-local two-sided join keyed by `(feed_session_epoch, ingress_sequence, canonical_kind)` |
-| Worker acknowledged-raw index | bounded dependencies already joined to projectable facts but still waiting at a pending FIFO head |
+| Pending commit FIFO | immutable revision batches and conservative owned-byte accounting |
 
 The RoleEval cache key does not store a separate role byte because validated
 input forbids one order ID from occupying two roles in the same fact. Ambiguous
@@ -228,8 +218,8 @@ neither order role and carry an explicit ambiguous-reference quality flag.
 For an ordered batch containing only projectable Shanghai status facts while
 the owner has no order histories, the worker skips order-use and phase-repair
 walks.  It still journals every fact, builds the same source bundle, allocates
-the same monotonically increasing Event versions, and applies the same raw-ACK
-gate.  This is a semantics-preserving source-only fast path, not a shortcut
+the same monotonically increasing Event versions.  This is a
+semantics-preserving source-only fast path, not a shortcut
 for Add/Trade/Cancel or hole-fill repair batches. `ordered_batch_fast_path`,
 `unordered_batch_sorts`, `source_only_fast_path`, and
 `barrier_index_orders_visited` are exported so a benchmark can verify which
@@ -373,8 +363,7 @@ The pending cut's conservative owned bytes and the existing
 cap. `pending_phase_bytes` and its high-water mark report the cut portion; they
 are not an additional allowance. While the cut exists, later owner dispatch is
 fenced, the older active repair does not advance, and eviction does not run.
-Raw ACK ingestion and the bounded ACK/disposition join continue; dependencies
-resolved for this cut remain held until its final projection/repair commit.
+Later outbox records for this owner stay unread until the cut clears.
 
 ## 6. Journal-first micro-batches and the live path
 
@@ -484,64 +473,32 @@ role list is a deque, so appending a large END fanout does not trigger a single
 whole-vector relocation. Exceeding any END cap fails the worker closed before
 unbounded staging is admitted.
 
-## 8. Raw durability gate
+## 8. Disposition outbox and derived persistence
 
-The raw sink captures canonical facts before `SequenceRecovery`. After one
-exact `raw_tick` RowBinary INSERT is acknowledged, it calls the configured
-`RawTickBatchAckListener` with the immutable batch rows. An unknown HTTP
-outcome is retried with the same raw batch before this callback; the callback
-is made once after success. Listener rejection is a fatal raw-sink continuity
-failure.
+The raw sink still captures canonical facts before `SequenceRecovery`. Its
+ClickHouse ACK is no longer a derived persist gate and no longer calls Event
+or KLine.
 
-`EventRuntime` groups ACK occurrences by instrument owner and places them in a
-preallocated bounded concurrent ring. The single owner consumer joins ACKs and
-SequenceRecovery dispositions by:
+After classification, each decoder lane appends one sequenced `TickDispatch`
+to a process-lifetime outbox and stamps `dispatch_fence = outbox_lsn`.
+Controls occupy one LSN and are broadcast to every owner cursor. Event, KLine,
+and Arrow consume with independent cursors, so one plane can lag without
+stopping the others. Outbox exhaustion is `FATAL_CONTINUITY`. Derived
+ClickHouse or runtime failure does not stop raw ingest; the process publishes
+`DERIVED_CATCHUP` or `RAW_ONLY_STALE` and `event_authoritative=0`.
 
-```text
-(feed_session_epoch, ingress_sequence, canonical_kind)
-```
+`REJECT_LATE_FACT` is counted and discarded. It never journals, repairs, or
+enqueues a revision.
 
-Either side may arrive first. While a key has an unmatched live slot, the
-preallocated bounded join records exactly one ACK side and one disposition
-side; a duplicate side or capacity exhaustion is fatal. A resolved slot is
-removed immediately. The join deliberately keeps no unbounded history of
-resolved occurrence keys, so callback-once in the raw sink and occurrence-once
-dispatch from SequenceRecovery remain producer contracts rather than being
-re-proved forever by this ledger. Resolution is disposition-specific:
-
-```text
-PROJECT_ORDERED / PROJECT_HOLE_FILL + raw ACK
-    -> pass (ingress_sequence, canonical_kind) durability dependency to worker
-
-REJECT_LATE_FACT + raw ACK
-    -> erase join slot; do not journal, repair, or enqueue a revision
-```
-
-This direct reject settlement is necessary because the raw tap precedes
-SequenceRecovery and ClickHouse can ACK an occurrence that admission later
-rejects. Such an ACK cannot be left indefinitely in the worker's
-ACK-before-fact index.
-
-An Event projection commit can update live in-memory caches before its raw
-dependencies are durable, but its immutable `EventRevisionBatch` remains in the
-pending FIFO. ACKs may arrive out of order, while FIFO submission prevents a
-later durable batch from passing an earlier batch with an unacknowledged raw
-dependency.
-
-After all dependencies of the FIFO head are acknowledged, the worker selects a
-consecutive durable prefix without crossing an unresolved commit. Controls do
-not close this prefix. `AppendRevisionGroup` receives the immutable logical
-batches in owner FIFO order; every batch keeps its calculation/recovery IDs,
-owner batch sequence, reason, revisions, and independent marker identity. A
-sink rejection is sticky and fails the Event runtime closed. Acceptance means
-only that the bounded volatile sink queue retained the immutable objects.
-Derived durability requires successful ClickHouse responses for all physical
+An Event projection commit updates live in-memory caches and then waits only
+on its own persist-group bounds before `AppendRevisionGroup`. FIFO submission
+still prevents a later logical batch from passing an earlier one. A sink
+rejection is sticky and fails the Event runtime closed. Acceptance means only
+that the bounded volatile sink queue retained the immutable objects. Derived
+durability still requires successful ClickHouse responses for all physical
 revision requests followed by the marker request that contains one marker row
-per logical batch.
-The runtime ACK inbox, occurrence join, worker acknowledged-raw index, pending
-commit count, and pending immutable-revision bytes are separately bounded.
-Exhausting any bound is a continuity failure and stops the runtime instead of
-dropping an occurrence or dependency.
+per logical batch. Pending commit count and pending immutable-revision bytes
+remain bounded; exhausting either bound stops the Event plane, not raw.
 
 ## 9. Revision and version semantics
 
@@ -687,8 +644,8 @@ The shared journal has one global physical-record bound for the trading date.
 Event carry-order count, conservative order-history owned bytes, hot fact count,
 conservative hot-fact owned bytes, cached Event rows, combined active-repair and
 pending-phase-cut bytes, pending commit count, pending immutable revision
-bytes, Shanghai END candidates/rows/staging bytes, runtime occurrence join,
-raw-ACK inbox/index, and Event sink batch/row queues have configured hard
+bytes, Shanghai END candidates/rows/staging bytes, and Event sink batch/row
+queues have configured hard
 bounds. The pending phase cut and active repair specifically share
 `maximum_repair_bytes`; they do not each receive that allowance. Exhaustion
 fails the relevant journal/worker/runtime/sink closed rather than dropping a
