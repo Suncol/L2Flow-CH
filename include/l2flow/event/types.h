@@ -2,6 +2,7 @@
 
 #include "l2flow/common/identifier.h"
 #include "l2flow/ingest/canonical.h"
+#include "l2flow/outbox/types.h"
 
 #include <compare>
 #include <cstdint>
@@ -287,6 +288,9 @@ struct EventRevisionBatch final {
     std::uint32_t owner = 0U;
     std::uint64_t batch_sequence = 0U;
     RevisionReason reason = RevisionReason::kLiveProjection;
+    // Exact durable inputs whose Event cursor advances only after this
+    // batch's recovery marker is acknowledged.
+    std::vector<outbox::WalPosition> input_positions;
     std::vector<EventRevision> revisions;
 };
 
@@ -301,16 +305,6 @@ public:
     [[nodiscard]] virtual bool AppendRevisionGroup(
         std::vector<std::shared_ptr<const EventRevisionBatch>> batches)
         noexcept = 0;
-};
-
-struct RawTickDependency final {
-    std::uint64_t ingress_sequence = 0U;
-    CanonicalKind kind = CanonicalKind::kShanghaiTick;
-
-    friend constexpr bool operator==(const RawTickDependency&,
-                                     const RawTickDependency&) = default;
-    friend constexpr auto operator<=>(const RawTickDependency&,
-                                      const RawTickDependency&) = default;
 };
 
 }  // namespace l2flow::event

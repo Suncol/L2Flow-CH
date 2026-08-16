@@ -2,6 +2,13 @@
 
 Test date: 2026-08-11 (Asia/Shanghai)
 
+> Historical pre-outbox evidence. This report describes the former KLine sink
+> protocol (including its 120-byte marker) before request-spool admission,
+> exact WAL input positions, and causal freshness gating were introduced. The
+> benchmark has since been replaced; these numbers are retained only as the
+> record of that older implementation. See
+> [`kline-worker-clickhouse.md`](kline-worker-clickhouse.md).
+
 ## 1. Scope and result
 
 The KLine sink physical-grouping path passed paced 800k and 1M revision-row/s

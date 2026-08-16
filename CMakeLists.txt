@@ -77,8 +77,11 @@ endfunction()
 
 add_library(l2flow_ch_ingest STATIC
     src/catalog.cpp
+    src/continuity.cpp
     src/decoder.cpp
     src/engine.cpp
+    src/outbox_wal.cpp
+    src/request_spool.cpp
     src/stream_config.cpp
     src/sdk_runtime.cpp)
 add_library(L2FlowCH::ingest ALIAS l2flow_ch_ingest)
@@ -120,12 +123,14 @@ if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
     add_library(l2flow_ch_clickhouse STATIC
         src/blake3.cpp
         src/clickhouse_event_sink.cpp
+        src/clickhouse_freshness.cpp
         src/clickhouse_kline_sink.cpp
         src/clickhouse_raw_sink.cpp
         src/event_runtime.cpp
         src/event_worker.cpp
         src/kline_runtime.cpp
-        src/kline_worker.cpp)
+        src/kline_worker.cpp
+        src/outbox_consumers.cpp)
     add_library(L2FlowCH::clickhouse ALIAS l2flow_ch_clickhouse)
     l2flow_ch_configure(l2flow_ch_clickhouse)
     target_link_libraries(l2flow_ch_clickhouse
@@ -152,10 +157,15 @@ endif()
 
 if(L2FLOW_CH_BUILD_TESTS)
     enable_testing()
-    add_executable(test_mdl_ingest tests/test_mdl_ingest.cpp)
-    l2flow_ch_configure(test_mdl_ingest)
-    target_link_libraries(test_mdl_ingest PRIVATE L2FlowCH::ingest)
-    add_test(NAME mdl_ingest_core COMMAND test_mdl_ingest)
+    add_executable(test_outbox tests/test_outbox.cpp)
+    l2flow_ch_configure(test_outbox)
+    target_link_libraries(test_outbox PRIVATE L2FlowCH::ingest)
+    add_test(NAME canonical_outbox COMMAND test_outbox)
+
+    add_executable(test_engine_fence tests/test_engine_fence.cpp)
+    l2flow_ch_configure(test_engine_fence)
+    target_link_libraries(test_engine_fence PRIVATE L2FlowCH::ingest)
+    add_test(NAME engine_fence COMMAND test_engine_fence)
 
     add_executable(test_fact_journal tests/test_fact_journal.cpp)
     l2flow_ch_configure(test_fact_journal)
@@ -208,35 +218,18 @@ if(L2FLOW_CH_BUILD_TESTS)
         endif()
     endif()
     if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
-        add_executable(test_event_worker tests/test_event_worker.cpp)
-        l2flow_ch_configure(test_event_worker)
-        target_link_libraries(test_event_worker PRIVATE
+        add_executable(test_consumer_contracts
+            tests/test_consumer_contracts.cpp)
+        l2flow_ch_configure(test_consumer_contracts)
+        target_link_libraries(test_consumer_contracts PRIVATE
             L2FlowCH::clickhouse)
-        add_test(NAME event_worker COMMAND test_event_worker)
-
-        add_executable(test_kline_worker tests/test_kline_worker.cpp)
-        l2flow_ch_configure(test_kline_worker)
-        target_link_libraries(test_kline_worker PRIVATE
+        add_test(NAME consumer_contracts COMMAND test_consumer_contracts)
+        add_executable(test_event_sink_protocol
+            tests/test_event_sink_protocol.cpp)
+        l2flow_ch_configure(test_event_sink_protocol)
+        target_link_libraries(test_event_sink_protocol PRIVATE
             L2FlowCH::clickhouse)
-        add_test(NAME kline_worker COMMAND test_kline_worker)
-
-        add_executable(test_clickhouse_event tests/test_clickhouse_event.cpp)
-        l2flow_ch_configure(test_clickhouse_event)
-        target_link_libraries(test_clickhouse_event PRIVATE
-            L2FlowCH::clickhouse)
-        add_test(NAME clickhouse_event COMMAND test_clickhouse_event)
-
-        add_executable(test_clickhouse_kline tests/test_clickhouse_kline.cpp)
-        l2flow_ch_configure(test_clickhouse_kline)
-        target_link_libraries(test_clickhouse_kline PRIVATE
-            L2FlowCH::clickhouse)
-        add_test(NAME clickhouse_kline COMMAND test_clickhouse_kline)
-
-        add_executable(test_clickhouse_raw tests/test_clickhouse_raw.cpp)
-        l2flow_ch_configure(test_clickhouse_raw)
-        target_link_libraries(test_clickhouse_raw PRIVATE
-            L2FlowCH::clickhouse)
-        add_test(NAME clickhouse_raw COMMAND test_clickhouse_raw)
+        add_test(NAME event_sink_protocol COMMAND test_event_sink_protocol)
         add_test(
             NAME mdl_ingest_clickhouse_config
             COMMAND mdl_ingestd
@@ -246,7 +239,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --clickhouse-source-instance-id
                     000102030405060708090a0b0c0d0e0f
                 --clickhouse-queue-batches-per-lane 2
@@ -272,7 +265,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --event-enable
                 --fact-journal-path /tmp/l2flow-event-config.fjn
                 --fact-journal-maximum-directory-pages 16
@@ -290,7 +283,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --event-enable
                 --event-calculation-run-id
                     000102030405060708090a0b0c0d0e0f
@@ -315,7 +308,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --kline-enable
                 --fact-journal-path /tmp/l2flow-kline-config.fjn
                 --kline-interval-seconds 5
@@ -335,7 +328,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --kline-enable
                 --kline-interval-seconds 5
                 --kline-calculation-run-id
@@ -366,6 +359,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --validate-only)
     add_test(
@@ -373,6 +367,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --operation-mode test
             --run-seconds 1
@@ -382,22 +377,25 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --sdk-ready-timeout-seconds 1
             --validate-only)
     add_test(
-        NAME mdl_ingest_dispatch_queue_capacity
+        NAME mdl_ingest_outbox_queue_capacity
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
-            --dispatch-queue-capacity 65536
+            --outbox-producer-queue-records 65536
             --validate-only)
     add_test(
         NAME mdl_ingest_reorder_window_boundary
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --reorder-entries-per-channel 8
             --maximum-reorder-span 8
@@ -407,6 +405,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --reorder-entries-per-channel 8
             --maximum-reorder-span 9
@@ -416,6 +415,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --reorder-entries-per-channel 7
             --maximum-reorder-span 7
@@ -425,6 +425,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --sdk-ready-timeout-seconds 0
             --validate-only)
@@ -434,9 +435,9 @@ if(L2FLOW_CH_BUILD_TESTS)
             COMMAND mdl_ingestd
                 --mode partial
                 --trade-date 20260806
+                --feed-epoch 0
                 --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
                 --arrow-ring-dir /tmp/l2flow-arrow-validate-only
-                --arrow-feed-epoch 0
                 --validate-only)
         set_tests_properties(
             mdl_ingest_rejects_zero_arrow_epoch PROPERTIES WILL_FAIL TRUE)
@@ -446,6 +447,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260806
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --run-seconds 1
             --validate-only)
@@ -490,6 +492,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260808
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --process-cpus 0-1,3
             --validate-only)
@@ -498,6 +501,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260808
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --process-cpus 3-1
             --validate-only)
@@ -506,6 +510,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         COMMAND mdl_ingestd
             --mode partial
             --trade-date 20260808
+            --feed-epoch 42
             --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
             --tick-lanes 2
             --snapshot-lanes 1
@@ -523,8 +528,9 @@ if(L2FLOW_CH_BUILD_TESTS)
                 L2FLOW_CLICKHOUSE_USER=default
                 L2FLOW_CLICKHOUSE_PASSWORD=
                 L2FLOW_FACT_JOURNAL_PATH=/tmp/l2flow-production-config.fjn
+                L2FLOW_OUTBOX_PATH=/tmp/l2flow-production-outbox
                 L2FLOW_SOURCE_INSTANCE_HEX32=000102030405060708090a0b0c0d0e0f
-                L2FLOW_RAW_FEED_EPOCH=42
+                L2FLOW_FEED_EPOCH=42
                 L2FLOW_EVENT_REVISION_EPOCH=9
                 L2FLOW_EVENT_RUN_HEX32=101112131415161718191a1b1c1d1e1f
                 L2FLOW_KLINE_INTERVAL_SECONDS=5
@@ -551,7 +557,7 @@ if(L2FLOW_CH_BUILD_TESTS)
         mdl_ingest_default_config
         mdl_ingest_test_operation_mode
         mdl_ingest_custom_ready_timeout
-        mdl_ingest_dispatch_queue_capacity
+        mdl_ingest_outbox_queue_capacity
         mdl_ingest_reorder_window_boundary
         mdl_ingest_rejects_reorder_span_over_capacity
         mdl_ingest_rejects_non_power_of_two_reorder_capacity
@@ -575,48 +581,12 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
         add_test(
             NAME fact_journal_benchmark_smoke
             COMMAND benchmark_fact_journal
-                --rate 10000 --seconds 1 --batch-rows 128 --owners 4
+                --rate 10000 --seconds 2 --batch-rows 128 --owners 4
                 --journal-dir /tmp --hot-cache 4096 --probe-samples 64
                 --mixed-read-rate 100 --seed-records 16)
     endif()
 
-    add_executable(benchmark_mdl_ingest benchmarks/benchmark_mdl_ingest.cpp)
-    l2flow_ch_configure(benchmark_mdl_ingest)
-    target_link_libraries(benchmark_mdl_ingest PRIVATE L2FlowCH::ingest)
-    if(L2FLOW_CH_ENABLE_ARROW_RING)
-        target_link_libraries(benchmark_mdl_ingest PRIVATE L2FlowCH::arrow)
-        target_compile_definitions(benchmark_mdl_ingest PRIVATE
-            L2FLOW_CH_HAS_ARROW_RING=1)
-    endif()
     if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
-        target_link_libraries(benchmark_mdl_ingest PRIVATE
-            L2FlowCH::clickhouse)
-        target_compile_definitions(benchmark_mdl_ingest PRIVATE
-            L2FLOW_CH_HAS_CLICKHOUSE_RAW=1)
-        if(L2FLOW_CH_BUILD_TESTS)
-            add_test(
-                NAME mdl_ingest_event_benchmark_construction_smoke
-                COMMAND benchmark_mdl_ingest
-                    --rate 1 --seconds 1 --warmup-seconds 0
-                    --channels 1 --tick-lanes 1 --owners 1
-                    --producer-cpu 0 --first-consumer-cpu 1
-                    --first-decoder-cpu 2
-                    --clickhouse-url http://127.0.0.1:8123
-                    --clickhouse-feed-epoch 1 --event-enable --kline-enable
-                    --event-journal-dir /tmp
-                    --event-construction-smoke)
-        endif()
-    endif()
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        target_compile_definitions(benchmark_mdl_ingest PRIVATE _GNU_SOURCE)
-    endif()
-    if(L2FLOW_CH_ENABLE_CLICKHOUSE_RAW)
-        add_executable(benchmark_event_state
-            benchmarks/benchmark_event_state.cpp)
-        l2flow_ch_configure(benchmark_event_state)
-        target_link_libraries(benchmark_event_state PRIVATE
-            L2FlowCH::clickhouse)
-
         add_executable(benchmark_event_sink
             benchmarks/benchmark_event_sink.cpp)
         l2flow_ch_configure(benchmark_event_sink)
@@ -630,10 +600,16 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
             L2FlowCH::clickhouse)
         if(L2FLOW_CH_BUILD_TESTS)
             add_test(
-                NAME event_state_benchmark_smoke
-                COMMAND benchmark_event_state
-                    --rate 1000 --seconds 1 --actors 1
-                    --micro-batch-rows 32)
+                NAME event_sink_benchmark_smoke
+                COMMAND benchmark_event_sink
+                    --rate 16384 --seconds 1 --owners 1 --writer-lanes 1
+                    --logical-batch-rows 512 --submission-batches 32
+                    --insert-request-rows 4096
+                    --insert-request-bytes 4194304
+                    --physical-group-batches 256
+                    --physical-group-rows 16384
+                    --physical-group-bytes 16777216
+                    --physical-group-delay-ns 50000000)
             add_test(
                 NAME kline_sink_benchmark_smoke
                 COMMAND benchmark_kline_sink

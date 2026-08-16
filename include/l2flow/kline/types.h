@@ -2,6 +2,7 @@
 
 #include "l2flow/common/identifier.h"
 #include "l2flow/ingest/canonical.h"
+#include "l2flow/outbox/types.h"
 
 #include <compare>
 #include <cstdint>
@@ -117,6 +118,7 @@ struct KLineRevisionBatch final {
     std::uint32_t owner = 0U;
     std::uint64_t batch_sequence = 0U;
     RevisionReason reason = RevisionReason::kLiveProjection;
+    std::vector<outbox::WalPosition> input_positions;
     std::vector<KLineRevision> revisions;
 };
 
@@ -126,16 +128,6 @@ public:
 
     [[nodiscard]] virtual bool AppendRevisionBatch(
         std::shared_ptr<const KLineRevisionBatch> batch) noexcept = 0;
-};
-
-struct RawTickDependency final {
-    std::uint64_t ingress_sequence = 0U;
-    CanonicalKind kind = CanonicalKind::kShanghaiTick;
-
-    friend constexpr bool operator==(const RawTickDependency&,
-                                     const RawTickDependency&) = default;
-    friend constexpr auto operator<=>(const RawTickDependency&,
-                                      const RawTickDependency&) = default;
 };
 
 }  // namespace l2flow::kline

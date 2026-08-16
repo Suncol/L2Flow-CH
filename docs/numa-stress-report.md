@@ -2,11 +2,11 @@
 
 测试日期：2026-08-06
 
-> 历史报告说明：本报告记录的是当日已经被替换的独立
-> `LateRecovery` 队列架构及其指标名称。当前实现使用统一
-> `TickDispatch`、strict first-wins、精确 hole ledger 和 owner FIFO
-> controls；以下旧术语与数字仅用于保留原始测试证据，不构成当前接口或
-> 正确性契约。当前契约见
+> 历史报告说明：本报告记录的是 durable outbox 引入前、现已被整体替换的
+> callback/decoder/dispatch 热路径及其指标名称。当前实现以本地 canonical /
+> disposition WAL 为接管边界，并使用 raw、Event、KLine 三个独立精确 cursor；
+> 以下旧术语与数字仅用于保留原始测试证据，不构成当前接口、性能或正确性
+> 契约。原 benchmark target 也已删除。当前契约见
 > [`mdl-ingestd-design.md`](mdl-ingestd-design.md)。
 >
 > 默认值变更说明：本报告所测 2026-08-06 版本的 FROM_OPEN/PARTIAL gap

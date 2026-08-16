@@ -1,5 +1,7 @@
 #include "l2flow/journal/fact_journal.h"
 
+#include "l2flow/checksum/crc32c.h"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -37,7 +39,6 @@ constexpr std::uint64_t kEventSeen = UINT64_C(1) << 0U;
 constexpr std::uint64_t kKLineSeen = UINT64_C(1) << 1U;
 constexpr std::uint64_t kWriting = UINT64_C(1) << 2U;
 constexpr std::uint64_t kOffsetMask = ~UINT64_C(7);
-constexpr std::uint32_t kCrc32cPolynomial = UINT32_C(0x82f63b78);
 
 static_assert(kFactJournalFileHeaderBytes % 8U == 0U);
 static_assert(kFactJournalRecordBytes % 8U == 0U);
@@ -159,67 +160,6 @@ private:
     std::size_t position_ = 0U;
     bool good_ = true;
 };
-
-[[nodiscard]] constexpr auto MakeCrc32cTables() noexcept {
-    std::array<std::array<std::uint32_t, 256U>, 8U> tables{};
-    for (std::size_t index = 0U; index < tables[0U].size(); ++index) {
-        std::uint32_t value = static_cast<std::uint32_t>(index);
-        for (std::size_t bit = 0U; bit < 8U; ++bit) {
-            value = (value >> 1U) ^
-                    ((value & 1U) != 0U ? kCrc32cPolynomial : 0U);
-        }
-        tables[0U][index] = value;
-    }
-    for (std::size_t table = 1U; table < tables.size(); ++table) {
-        for (std::size_t index = 0U; index < tables[table].size(); ++index) {
-            const std::uint32_t previous = tables[table - 1U][index];
-            tables[table][index] =
-                tables[0U][previous & UINT32_C(0xff)] ^ (previous >> 8U);
-        }
-    }
-    return tables;
-}
-
-constexpr auto kCrc32cTables = MakeCrc32cTables();
-
-[[nodiscard]] std::uint32_t LoadLittleEndian32(
-    const std::byte* input) noexcept {
-    return static_cast<std::uint32_t>(
-               std::to_integer<std::uint8_t>(input[0U])) |
-           (static_cast<std::uint32_t>(
-                std::to_integer<std::uint8_t>(input[1U]))
-            << 8U) |
-           (static_cast<std::uint32_t>(
-                std::to_integer<std::uint8_t>(input[2U]))
-            << 16U) |
-           (static_cast<std::uint32_t>(
-                std::to_integer<std::uint8_t>(input[3U]))
-            << 24U);
-}
-
-[[nodiscard]] std::uint32_t Crc32c(
-    std::span<const std::byte> input) noexcept {
-    std::uint32_t crc = UINT32_MAX;
-    while (input.size() >= 8U) {
-        const std::uint32_t first = LoadLittleEndian32(input.data()) ^ crc;
-        crc = kCrc32cTables[7U][first & UINT32_C(0xff)] ^
-              kCrc32cTables[6U][(first >> 8U) & UINT32_C(0xff)] ^
-              kCrc32cTables[5U][(first >> 16U) & UINT32_C(0xff)] ^
-              kCrc32cTables[4U][first >> 24U] ^
-              kCrc32cTables[3U][std::to_integer<std::uint8_t>(input[4U])] ^
-              kCrc32cTables[2U][std::to_integer<std::uint8_t>(input[5U])] ^
-              kCrc32cTables[1U][std::to_integer<std::uint8_t>(input[6U])] ^
-              kCrc32cTables[0U][std::to_integer<std::uint8_t>(input[7U])];
-        input = input.subspan(8U);
-    }
-    for (const std::byte value : input) {
-        crc = kCrc32cTables[0U][
-                  (crc ^ std::to_integer<std::uint8_t>(value)) &
-                  UINT32_C(0xff)] ^
-              (crc >> 8U);
-    }
-    return ~crc;
-}
 
 class FingerprintBuilder final {
 public:
@@ -432,7 +372,7 @@ void DecodeDecimal(LittleEndianReader* reader,
     header.U16(static_cast<std::uint16_t>(kFactJournalRecordHeaderBytes));
     header.U32(static_cast<std::uint32_t>(kCanonicalTickEncodedBytes));
     header.U32(static_cast<std::uint32_t>(kFactJournalRecordBytes));
-    header.U32(Crc32c(payload));
+    header.U32(checksum::Crc32c(payload));
     header.U32(0U);
     return header.complete();
 }
@@ -463,7 +403,7 @@ void DecodeDecimal(LittleEndianReader* reader,
     }
     const auto payload = input.subspan(kFactJournalRecordHeaderBytes,
                                        kCanonicalTickEncodedBytes);
-    if (Crc32c(payload) != expected_crc) {
+    if (checksum::Crc32c(payload) != expected_crc) {
         *error = "FactJournal record CRC32C mismatch";
         return false;
     }

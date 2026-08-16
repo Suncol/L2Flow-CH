@@ -30,6 +30,7 @@ struct KLineAdmissionToken final {
 struct KLineInput final {
     ingest::CanonicalTick tick{};
     KLineAdmissionToken admission{};
+    outbox::WalPosition outbox_position{};
     bool catalog_match = true;
 };
 
@@ -48,10 +49,10 @@ struct KLineWorkerConfig final {
     // Shared across every Event/KLine owner for one trade date. Fact identity
     // is channel-global, while mutable projection state remains owner-local.
     std::shared_ptr<journal::CanonicalFactJournal> fact_journal;
+    outbox::ConsumerCompletionSink* completion_sink = nullptr;
 
     std::size_t maximum_bars = 4U * 1'024U * 1'024U;
     std::size_t maximum_pending_commits = 1'024U;
-    std::size_t maximum_acknowledged_raw_dependencies = 65'536U;
 };
 
 enum class KLineApplyCode : std::uint8_t {
@@ -83,7 +84,7 @@ struct KLineWorkerStats final {
     std::uint64_t bars_created = 0U;
     std::uint64_t bars_updated = 0U;
     std::uint64_t revisions_created = 0U;
-    std::uint64_t pending_raw_commits = 0U;
+    std::uint64_t pending_revision_commits = 0U;
     // Conservative logical-owned bytes for immutable revision batches,
     // revision vector capacity, and raw-dependency nodes. This excludes the
     // deque's implementation storage and is not allocator RSS.
@@ -91,7 +92,6 @@ struct KLineWorkerStats final {
     std::uint64_t pending_revision_rows_high_watermark = 0U;
     std::uint64_t pending_revision_bytes = 0U;
     std::uint64_t pending_revision_bytes_high_watermark = 0U;
-    std::uint64_t acknowledged_raw_dependencies = 0U;
     std::uint64_t revision_batches_submitted = 0U;
 };
 
@@ -112,9 +112,7 @@ public:
 
     [[nodiscard]] KLineApplyResult ApplyBatch(
         std::span<const KLineInput> inputs) noexcept;
-    void AcknowledgeRawTicks(
-        std::span<const RawTickDependency> dependencies) noexcept;
-    [[nodiscard]] bool DrainDurableCommits() noexcept;
+    [[nodiscard]] bool DrainRevisionCommits() noexcept;
 
     [[nodiscard]] bool CopyBar(const KLineKey& key,
                                KLinePayload* output) const noexcept;

@@ -1,4 +1,4 @@
-#include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/clickhouse/raw_consumer.h"
 
 #include "l2flow/arrow/schemas.h"
 #include "l2flow/ingest/engine.h"
@@ -192,8 +192,6 @@ private:
 struct RawBatchMetadata final {
     std::uint32_t trade_date = 0U;
     std::uint64_t created_monotonic_ns = 0U;
-    std::uint64_t minimum_ingress_sequence = 0U;
-    std::uint64_t maximum_ingress_sequence = 0U;
     std::size_t row_count = 0U;
     std::size_t byte_count = 0U;
 };
@@ -224,6 +222,7 @@ template <typename Record>
 struct RawCanonicalBatch final {
     RawBatchMetadata metadata{};
     RecordStorage<Record> rows;
+    std::unique_ptr<outbox::WalPosition[]> positions;
 };
 
 enum class LaneAppendCode : std::uint8_t {
@@ -255,6 +254,9 @@ public:
         for (std::size_t index = 0U; index < pool_size; ++index) {
             RawCanonicalBatch<Record> slot{};
             slot.rows = AllocateRecordStorage<Record>(rows_per_batch_);
+            slot.positions =
+                std::make_unique_for_overwrite<outbox::WalPosition[]>(
+                    rows_per_batch_);
             slots_.push_back(std::move(slot));
             free_.push_back(static_cast<std::uint32_t>(index));
         }
@@ -266,8 +268,12 @@ public:
     RawBatchLane& operator=(const RawBatchLane&) = delete;
 
     template <typename Published>
-    [[nodiscard]] LaneAppendCode Append(const Record& record,
+    [[nodiscard]] LaneAppendCode Append(outbox::WalPosition position,
+                                        const Record& record,
                                         Published&& published) noexcept {
+        if (position.lsn == 0U || position.batch_sequence == 0U) {
+            return LaneAppendCode::kInvalidRecord;
+        }
         RawCanonicalBatch<Record>& active = slots_[active_index_];
         if (active.metadata.row_count != 0U &&
             active.metadata.trade_date != record.common.trade_date) {
@@ -288,22 +294,12 @@ public:
         std::memcpy(static_cast<void*>(destination.rows.get() + row),
                     static_cast<const void*>(std::addressof(record)),
                     sizeof(Record));
+        destination.positions[row] = position;
         if (row == 0U) {
             destination.metadata.trade_date = record.common.trade_date;
             destination.metadata.created_monotonic_ns =
                 record.common.receive_monotonic_ns;
-            destination.metadata.minimum_ingress_sequence =
-                record.common.ingress_sequence;
-            destination.metadata.maximum_ingress_sequence =
-                record.common.ingress_sequence;
             active_batch_.store(true, std::memory_order_release);
-        } else {
-            destination.metadata.minimum_ingress_sequence = std::min(
-                destination.metadata.minimum_ingress_sequence,
-                record.common.ingress_sequence);
-            destination.metadata.maximum_ingress_sequence = std::max(
-                destination.metadata.maximum_ingress_sequence,
-                record.common.ingress_sequence);
         }
         ++destination.metadata.row_count;
         destination.metadata.byte_count += sizeof(Record);
@@ -360,10 +356,29 @@ public:
         return active_batch_.load(std::memory_order_acquire);
     }
 
+    // Single-producer preflight. It prevents queue saturation from becoming
+    // an ambiguous Append result after the row has already entered the active
+    // batch.
+    [[nodiscard]] bool CanAppendNext() noexcept {
+        DrainRecycled();
+        const RawBatchMetadata& metadata = slots_[active_index_].metadata;
+        const bool publishes =
+            metadata.row_count + 1U >= rows_per_batch_ ||
+            metadata.byte_count + sizeof(Record) >= bytes_per_batch_;
+        return !publishes || !free_.empty();
+    }
+
+    [[nodiscard]] bool CanPublishActive() noexcept {
+        DrainRecycled();
+        return slots_[active_index_].metadata.row_count == 0U ||
+               !free_.empty();
+    }
+
     [[nodiscard]] std::uint64_t preallocated_bytes() const noexcept {
         return static_cast<std::uint64_t>(slots_.size()) *
                static_cast<std::uint64_t>(rows_per_batch_) *
-               static_cast<std::uint64_t>(sizeof(Record));
+               static_cast<std::uint64_t>(
+                   sizeof(Record) + sizeof(outbox::WalPosition));
     }
 
 private:
@@ -1314,14 +1329,14 @@ bool ValidateRawClickHouseConfig(const RawClickHouseConfig& config,
         config.tick_batch_max_delay_ns == 0U ||
         config.snapshot_batch_max_delay_ns == 0U ||
         config.tick_queue_batches_per_lane == 0U ||
-        config.snapshot_queue_batches_per_lane == 0U) {
+        config.snapshot_queue_batches_per_lane == 0U ||
+        config.completion_sink == nullptr) {
         return fail("invalid ClickHouse raw batch or lane configuration");
     }
     if (config.connect_timeout_ms == 0U ||
         config.request_timeout_ms == 0U ||
         config.retry_initial_backoff_ms == 0U ||
         config.retry_max_backoff_ms < config.retry_initial_backoff_ms ||
-        config.maximum_retry_elapsed_ms == 0U ||
         config.shutdown_timeout_ms < config.request_timeout_ms) {
         return fail("invalid ClickHouse timeout/retry configuration");
     }
@@ -1359,7 +1374,7 @@ bool ValidateRawClickHouseConfig(const RawClickHouseConfig& config,
     return true;
 }
 
-class RawClickHouseSink::Impl final {
+class RawClickHouseConsumer::Impl final {
 public:
     Impl(RawClickHouseConfig config,
          Identifier128 writer_instance_id,
@@ -1538,12 +1553,13 @@ public:
     }
 
     [[nodiscard]] bool AppendTick(std::size_t decoder_lane,
+                                  outbox::WalPosition position,
                                   const CanonicalTick& tick) noexcept {
         if (!CanAppend() || decoder_lane >= tick_lanes_.size()) {
             return false;
         }
         const LaneAppendCode code = tick_lanes_[decoder_lane]->Append(
-            tick, [this](std::size_t rows) {
+            position, tick, [this](std::size_t rows) {
                 BatchPublished(RawTableId::kRawTick, rows);
             });
         return HandleLaneCode(code, RawTableId::kRawTick, decoder_lane);
@@ -1551,16 +1567,39 @@ public:
 
     [[nodiscard]] bool AppendSnapshot(
         std::size_t decoder_lane,
+        outbox::WalPosition position,
         const CanonicalSnapshot& snapshot) noexcept {
         if (!CanAppend() || decoder_lane >= snapshot_lanes_.size()) {
             return false;
         }
         const LaneAppendCode code = snapshot_lanes_[decoder_lane]->Append(
-            snapshot, [this](std::size_t rows) {
+            position, snapshot, [this](std::size_t rows) {
                 BatchPublished(RawTableId::kRawSnapshot, rows);
             });
         return HandleLaneCode(
             code, RawTableId::kRawSnapshot, decoder_lane);
+    }
+
+    [[nodiscard]] bool CanAppendTick(std::size_t decoder_lane) noexcept {
+        return CanAppend() && decoder_lane < tick_lanes_.size() &&
+               tick_lanes_[decoder_lane]->CanAppendNext();
+    }
+
+    [[nodiscard]] bool CanAppendSnapshot(
+        std::size_t decoder_lane) noexcept {
+        return CanAppend() && decoder_lane < snapshot_lanes_.size() &&
+               snapshot_lanes_[decoder_lane]->CanAppendNext();
+    }
+
+    [[nodiscard]] bool CanFlushTick(std::size_t decoder_lane) noexcept {
+        return CanAppend() && decoder_lane < tick_lanes_.size() &&
+               tick_lanes_[decoder_lane]->CanPublishActive();
+    }
+
+    [[nodiscard]] bool CanFlushSnapshot(
+        std::size_t decoder_lane) noexcept {
+        return CanAppend() && decoder_lane < snapshot_lanes_.size() &&
+               snapshot_lanes_[decoder_lane]->CanPublishActive();
     }
 
     [[nodiscard]] bool PollTick(std::size_t decoder_lane,
@@ -1964,7 +2003,6 @@ private:
             return false;
         }
 
-        std::uint64_t retry_started_ns = 0U;
         std::uint32_t backoff_ms = config_.retry_initial_backoff_ms;
         const std::string writer_id = IdentifierString(writer_instance_id_);
         for (;;) {
@@ -1985,18 +2023,14 @@ private:
                 stats_.rows_acked.fetch_add(
                     static_cast<std::uint64_t>(batch.metadata.row_count),
                     std::memory_order_relaxed);
-                if constexpr (std::is_same_v<Record, CanonicalTick>) {
-                    if (config_.tick_ack_listener != nullptr &&
-                        !config_.tick_ack_listener->
-                            OnRawTickBatchAcknowledged(
-                                std::span<const CanonicalTick>(
-                                    batch.rows.get(),
-                                    batch.metadata.row_count))) {
-                        SetFatal(
-                            "raw_tick ACK listener rejected a durable batch",
-                            true);
-                        return false;
-                    }
+                if (!config_.completion_sink->Complete(
+                        outbox::ConsumerKind::kRaw,
+                        std::span<const outbox::WalPosition>(
+                            batch.positions.get(),
+                            batch.metadata.row_count))) {
+                    SetFatal("raw consumer cursor rejected a durable batch",
+                             true);
+                    return false;
                 }
                 wake_.notify_all();
                 return true;
@@ -2011,20 +2045,11 @@ private:
             stats_.unknown_outcomes.fetch_add(1U,
                                               std::memory_order_relaxed);
             const std::uint64_t now = ingest::MonotonicNowNs();
-            if (retry_started_ns == 0U) {
-                retry_started_ns = now;
-            }
-            const std::uint64_t retry_limit_ns =
-                static_cast<std::uint64_t>(
-                    config_.maximum_retry_elapsed_ms) *
-                UINT64_C(1'000'000);
             const std::uint64_t shutdown_deadline =
                 shutdown_deadline_ns_.load(std::memory_order_acquire);
-            if ((now >= retry_started_ns &&
-                 now - retry_started_ns >= retry_limit_ns) ||
-                (stopping_.load(std::memory_order_acquire) &&
-                 now >= shutdown_deadline)) {
-                SetFatal("ClickHouse INSERT retry budget exhausted for batch " +
+            if (stopping_.load(std::memory_order_acquire) &&
+                now >= shutdown_deadline) {
+                SetFatal("ClickHouse INSERT shutdown deadline reached for batch " +
                              IdentifierString(metadata.batch_id) + ": " +
                              HttpErrorText(result),
                          true);
@@ -2159,7 +2184,7 @@ private:
     std::condition_variable wake_;
 };
 
-std::unique_ptr<RawClickHouseSink> RawClickHouseSink::Create(
+std::unique_ptr<RawClickHouseConsumer> RawClickHouseConsumer::Create(
     RawClickHouseConfig config,
     std::string* error) {
     if (!ValidateRawClickHouseConfig(config, error)) {
@@ -2179,8 +2204,8 @@ std::unique_ptr<RawClickHouseSink> RawClickHouseSink::Create(
         if (!impl->Initialize(error)) {
             return nullptr;
         }
-        return std::unique_ptr<RawClickHouseSink>(
-            new RawClickHouseSink(std::move(impl)));
+        return std::unique_ptr<RawClickHouseConsumer>(
+            new RawClickHouseConsumer(std::move(impl)));
     } catch (const std::exception& exception) {
         if (error != nullptr) {
             *error = std::string("ClickHouse raw sink creation failed: ") +
@@ -2190,79 +2215,104 @@ std::unique_ptr<RawClickHouseSink> RawClickHouseSink::Create(
     }
 }
 
-RawClickHouseSink::RawClickHouseSink(std::unique_ptr<Impl> impl) noexcept
+RawClickHouseConsumer::RawClickHouseConsumer(
+    std::unique_ptr<Impl> impl) noexcept
     : impl_(std::move(impl)) {}
 
-RawClickHouseSink::~RawClickHouseSink() {
+RawClickHouseConsumer::~RawClickHouseConsumer() {
     std::string ignored;
     static_cast<void>(impl_->Stop(&ignored));
 }
 
-bool RawClickHouseSink::Start(std::string* error) {
+bool RawClickHouseConsumer::Start(std::string* error) {
     return impl_->Start(error);
 }
 
-bool RawClickHouseSink::Stop(std::string* error) noexcept {
+bool RawClickHouseConsumer::Stop(std::string* error) noexcept {
     return impl_->Stop(error);
 }
 
-bool RawClickHouseSink::AppendTick(
+bool RawClickHouseConsumer::AppendTick(
     std::size_t decoder_lane,
+    outbox::WalPosition position,
     const CanonicalTick& tick) noexcept {
-    return impl_->AppendTick(decoder_lane, tick);
+    return impl_->AppendTick(decoder_lane, position, tick);
 }
 
-bool RawClickHouseSink::AppendSnapshot(
+bool RawClickHouseConsumer::AppendSnapshot(
     std::size_t decoder_lane,
+    outbox::WalPosition position,
     const CanonicalSnapshot& snapshot) noexcept {
-    return impl_->AppendSnapshot(decoder_lane, snapshot);
+    return impl_->AppendSnapshot(decoder_lane, position, snapshot);
 }
 
-bool RawClickHouseSink::PollTick(std::size_t decoder_lane,
+bool RawClickHouseConsumer::CanAppendTick(
+    std::size_t decoder_lane) noexcept {
+    return impl_->CanAppendTick(decoder_lane);
+}
+
+bool RawClickHouseConsumer::CanAppendSnapshot(
+    std::size_t decoder_lane) noexcept {
+    return impl_->CanAppendSnapshot(decoder_lane);
+}
+
+bool RawClickHouseConsumer::CanFlushTick(
+    std::size_t decoder_lane) noexcept {
+    return impl_->CanFlushTick(decoder_lane);
+}
+
+bool RawClickHouseConsumer::CanFlushSnapshot(
+    std::size_t decoder_lane) noexcept {
+    return impl_->CanFlushSnapshot(decoder_lane);
+}
+
+bool RawClickHouseConsumer::PollTick(std::size_t decoder_lane,
                                  std::uint64_t monotonic_ns) noexcept {
     return impl_->PollTick(decoder_lane, monotonic_ns);
 }
 
-bool RawClickHouseSink::PollSnapshot(std::size_t decoder_lane,
+bool RawClickHouseConsumer::PollSnapshot(std::size_t decoder_lane,
                                      std::uint64_t monotonic_ns) noexcept {
     return impl_->PollSnapshot(decoder_lane, monotonic_ns);
 }
 
-bool RawClickHouseSink::FlushTick(std::size_t decoder_lane) noexcept {
+bool RawClickHouseConsumer::FlushTick(std::size_t decoder_lane) noexcept {
     return impl_->FlushTick(decoder_lane);
 }
 
-bool RawClickHouseSink::FlushSnapshot(std::size_t decoder_lane) noexcept {
+bool RawClickHouseConsumer::FlushSnapshot(std::size_t decoder_lane) noexcept {
     return impl_->FlushSnapshot(decoder_lane);
 }
 
-bool RawClickHouseSink::healthy() const noexcept { return impl_->healthy(); }
+bool RawClickHouseConsumer::healthy() const noexcept {
+    return impl_->healthy();
+}
 
-std::string RawClickHouseSink::fatal_error() const {
+std::string RawClickHouseConsumer::fatal_error() const {
     return impl_->fatal_error();
 }
 
-RawClickHouseStats RawClickHouseSink::stats() const noexcept {
+RawClickHouseStats RawClickHouseConsumer::stats() const noexcept {
     return impl_->Stats();
 }
 
-Identifier128 RawClickHouseSink::writer_instance_id() const noexcept {
+Identifier128 RawClickHouseConsumer::writer_instance_id() const noexcept {
     return impl_->writer_instance_id();
 }
 
-Identifier128 RawClickHouseSink::source_instance_id() const noexcept {
+Identifier128 RawClickHouseConsumer::source_instance_id() const noexcept {
     return impl_->source_instance_id();
 }
 
-std::uint64_t RawClickHouseSink::run_started_monotonic_ns() const noexcept {
+std::uint64_t RawClickHouseConsumer::run_started_monotonic_ns() const noexcept {
     return impl_->run_started_monotonic_ns();
 }
 
-std::uint64_t RawClickHouseSink::run_started_utc_ns() const noexcept {
+std::uint64_t RawClickHouseConsumer::run_started_utc_ns() const noexcept {
     return impl_->run_started_utc_ns();
 }
 
-const RawClickHouseConfig& RawClickHouseSink::config() const noexcept {
+const RawClickHouseConfig& RawClickHouseConsumer::config() const noexcept {
     return impl_->config();
 }
 

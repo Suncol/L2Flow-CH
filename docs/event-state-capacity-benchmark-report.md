@@ -2,6 +2,12 @@
 
 Test date: 2026-08-09 (Asia/Shanghai)
 
+> Historical pre-outbox evidence. This report measured the former synchronous
+> raw-ACK/Event dependency and a benchmark target that has since been removed.
+> Its results are retained for traceability only; they are not a performance or
+> correctness claim for the durable canonical/disposition outbox. See
+> [`mdl-ingestd-design.md`](mdl-ingestd-design.md) for the current contract.
+
 ## Outcome
 
 The current file-backed Event path did not qualify at the lower 800,000 fact/s

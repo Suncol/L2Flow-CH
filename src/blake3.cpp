@@ -1,4 +1,4 @@
-#include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/clickhouse/raw_consumer.h"
 
 #include <algorithm>
 #include <array>

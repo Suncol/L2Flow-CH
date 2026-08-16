@@ -2,6 +2,13 @@
 
 Date: 2026-08-07 (Asia/Shanghai)
 
+> Historical pre-outbox evidence. This report measured the former synchronous
+> raw-ACK/dispatch architecture and a benchmark executable that has since been
+> removed. It does not exercise independent WAL cursors, request spooling,
+> derived catch-up, or freshness gating, and therefore is not a current
+> capacity or correctness claim. See
+> [`mdl-ingestd-design.md`](mdl-ingestd-design.md).
+
 ## Outcome
 
 The combined synthetic MDL callback, ingest, shared-memory Arrow reader, and

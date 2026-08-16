@@ -1,304 +1,81 @@
-# ClickHouse raw persistence path
+# Raw ClickHouse WAL consumer
 
-## Scope
+## Boundary
 
-This milestone persists every successfully decoded and normalized Tick or
-Snapshot occurrence in ClickHouse:
-
-```text
-MDL callback
-  -> existing receive_monotonic_ns
-  -> bounded admission and body copy
-  -> decoder lane
-       -> CanonicalTick / CanonicalSnapshot
-       -> preallocated RawCanonicalBatch (AoS)
-       -> SPSC ready queue
-  -> ClickHouse writer thread
-       -> Arrow columnization
-       -> provenance IDs
-       -> ArrowStream serialization
-       -> synchronous INSERT / exact retry
-  -> raw_tick / raw_snapshot
-```
-
-The tap is after complete decode/normalization and before SequenceRecovery,
-duplicate/conflict/late classification, or catalog-miss suppression. It
-therefore records normal arrivals, retransmissions, conflicting canonical
-payloads, late gap members, and catalog misses. A packet that cannot be
-decoded into a canonical record is counted as a decode error and is not in
-these raw tables.
-
-Event/KLine revisions and historical reconciliation are separate milestones.
-The shared-memory Arrow path is optional and does not participate in the raw
-INSERT acknowledgement.
-
-## Hot-path boundary
-
-The callback does not read a UTC wall clock for each message. The decoder does
-not use an Arrow builder, hash a row, serialize IPC, call libcurl, allocate
-memory, or wait for ClickHouse.
-
-Each decoder lane owns one active fixed-capacity canonical batch. Its steady
-state work is a fixed-memory record copy plus updates to batch-local metadata:
-
-- row and byte count;
-- trade date;
-- first creation monotonic time;
-- minimum and maximum ingress sequence.
-
-When the row, byte, or delay threshold is reached, the lane publishes one
-batch index to its SPSC queue and switches to another preallocated slot. Raw
-statistics are updated once per published batch, not with a contended global
-atomic operation for every row. Snapshot idle-loop delay checks are throttled;
-message-path checks reuse the callback's existing monotonic timestamp.
-
-The writer alone constructs Arrow columns and nested Snapshot levels. The
-serialized payload stays alive until ClickHouse acknowledges the INSERT or the
-retry budget is exhausted.
-
-## Durability and failure semantics
-
-The only durable boundary is a successful synchronous ClickHouse response. In
-a replicated deployment, configure `insert_quorum` so that this response is a
-quorum acknowledgement.
-
-| State | Durable |
-| --- | --- |
-| Active canonical batch | No |
-| Published in-memory SPSC batch | No |
-| HTTP INSERT in flight | Unknown |
-| Successful ClickHouse response | Yes |
-| Timeout or lost response | Unknown; retry the exact batch |
-
-There is no Kafka/Redpanda dependency and no local WAL in this path. A process
-or host failure before ClickHouse acknowledges a batch can lose that active or
-queued data. If host-power-loss recovery before ACK is required, add a local
-WAL as a separate durability layer rather than treating the in-memory queue as
-one.
-
-Queue exhaustion is fatal. `RawRecordTap::Append*` returns false, the ingest
-engine closes admission, and `mdl_ingestd` exits nonzero after attempting to
-drain already-published batches. Rows are never silently discarded to keep the
-process alive. A permanent ClickHouse error or an exhausted retry interval has
-the same fail-closed behavior.
-
-## Batch and retry identity
-
-The writer creates one random `writer_instance_id` per process. A deployment
-may pass a stable `source_instance_id`; otherwise the writer ID is also used as
-the source ID. A supervisor must allocate a nonzero `feed_session_epoch` for
-every physical feed run and must not reuse the same source/epoch pair.
-
-`batch_sequence` is process-local and strictly increasing. The 16-byte batch
-ID is the first 128 bits of BLAKE3 over fixed-width little-endian input:
+Raw ClickHouse is an independent consumer of the canonical WAL. It is no
+longer the component that synchronously dispatches Event/KLine callbacks.
 
 ```text
-writer_instance_id
-|| table_id
-|| trade_date
-|| batch_sequence
-|| schema_version
+durable canonical WAL -> RawOutboxConsumer -> RawClickHouseConsumer
+                                      ACK -> raw cursor completion
 ```
 
-Each raw occurrence ID is the first 128 bits of BLAKE3 over:
+Only an ACK for the exact ClickHouse batch advances the raw cursor positions
+carried by that batch. Event and KLine have separate cursors and cannot make a
+raw batch succeed or fail.
 
-```text
-source_instance_id
-|| feed_session_epoch
-|| ingress_sequence
-|| canonical_kind
-```
+## Input semantics
 
-A retry reuses the same in-memory canonical rows, ArrowStream bytes, row order,
-batch ID, sequence, query ID, and ClickHouse deduplication token:
+The WAL Tick record contains the original decoded tick and a separate recovery
+disposition. Raw storage always uses the original tick. Therefore duplicates,
+late rejects, accepted hole fills, and catalog misses remain observable in
+`raw_tick`; SequenceRecovery never rewrites their raw fields. Snapshots use the
+original decoded snapshot.
 
-```text
-query_id = l2flow/<table>/<writer_instance_id>/<batch_sequence>
+`GapOpen`, `ChannelSeal`, diagnostics, faults, and freshness barriers do not
+create raw table rows. The follower completes ordinary control/diagnostic
+positions directly. A barrier flushes every partial Tick/Snapshot lane first,
+so crossing it proves all earlier raw rows have ACKed.
 
-insert_deduplication_token =
-    l2flow/<table>/<trade_date>/<batch_id>/<schema_version>
-```
+## Batching and exact positions
 
-It never rebuilds or regroups a timed-out batch. This handles the case where
-ClickHouse committed an INSERT but its response did not reach the writer.
-The retry elapsed-time budget begins when the first unknown outcome returns, so
-an initial request timeout cannot consume the budget before the first exact
-retry is attempted.
-Local `MergeTree` tables set `non_replicated_deduplication_window=10000`.
-Replicated deployments must size `replicated_deduplication_window` for their
-block rate and maximum retry interval.
+Each decoder lane has preallocated active and queued batches. A row carries its
+full `(lsn, batch_sequence, row_index)` position beside the canonical payload.
+The consumer performs a capacity preflight before append or flush, avoiding an
+ambiguous result after a row has entered an active batch.
 
-Every request uses ArrowStream with synchronous settings equivalent to:
+Writer threads may ACK batches out of order. The WAL validates every supplied
+position and advances the raw cursor only over the contiguous completed prefix.
 
-```text
-async_insert=0
-wait_end_of_query=1
-insert_deduplicate=1
-insert_quorum=<configured value>
-insert_quorum_parallel=1
-```
+Raw ClickHouse provenance remains distinct:
 
-## Schema and ordering
+- source instance ID and feed epoch identify the logical source run;
+- writer instance ID and raw batch sequence identify one physical writer run;
+- batch ID/query ID/deduplication token identify a retryable INSERT; and
+- occurrence ID identifies the raw fact independently of batching.
 
-Both raw tables use `PARTITION BY trade_date`. Local development uses
-`MergeTree`; production uses `ReplicatedMergeTree` with the same columns,
-partition expression, and business sorting key.
+## Retry and continuity
 
-- Local DDL: [`../clickhouse/schema/raw_tables.sql`](../clickhouse/schema/raw_tables.sql)
-- Replicated DDL: [`../clickhouse/schema/raw_tables_replicated.sql`](../clickhouse/schema/raw_tables_replicated.sql)
+Transport errors and explicitly retryable ClickHouse responses retry with the
+same query ID and deduplication token. Retry continues during the live run;
+there is no finite elapsed-time policy that converts a temporary ClickHouse
+outage directly into process death.
 
-The replicated file uses ClickHouse macros for the Keeper root, shard, and
-replica. Set those macros in deployment configuration and apply schema changes
-through the cluster's normal orchestration. The daemon's auto-create mode is
-intended only for local `MergeTree` tables.
+A nonretryable schema/authentication/request error stops this consumer and
+pins the raw cursor. Continuity becomes `RAW_CATCHUP` while the canonical WAL
+is still writable. Only when that durable reservoir itself can no longer admit
+or sync new records does the process enter `FATAL_CONTINUITY`.
 
-Transport provenance columns are:
+## Schema and deployment
 
-```text
-source_instance_id FixedString(16)
-writer_instance_id FixedString(16)
-batch_id FixedString(16)
-batch_sequence UInt64
-row_index UInt32
-occurrence_id FixedString(16)
-schema_version UInt32
-```
+Single-node and replicated definitions are in:
 
-`catalog_match` is also persisted. A source retransmission has a different
-ingress sequence and occurrence ID and remains a separate fact. A transport
-retry has the same batch token and does not create another ClickHouse block.
+- [raw_tables.sql](../clickhouse/schema/raw_tables.sql)
+- [raw_tables_replicated.sql](../clickhouse/schema/raw_tables_replicated.sql)
 
-MergeTree sorting keys organize parts; they do not guarantee implicit SELECT
-order. Channel replay must use an explicit order:
+With `--clickhouse-no-auto-create`, startup still probes table engine,
+partitioning, and column contracts. A mismatch fails this consumer without
+silently changing external production schema.
 
-```sql
-SELECT *
-FROM l2flow.raw_tick
-WHERE trade_date = {trade_date:Date}
-  AND market = {market:UInt8}
-  AND channel = {channel:UInt32}
-ORDER BY
-    native_sequence,
-    source_instance_id,
-    feed_session_epoch,
-    ingress_sequence;
-```
+The primary tuning controls are batch rows/bytes/delay, queue batches per
+decoder lane, writer count, HTTP timeouts, and insert quorum. Larger batches
+improve transport density but extend the interval between WAL visibility and
+raw cursor ACK.
 
-For a source-run occurrence timeline, including Snapshots that have no native
-sequence, use:
+## Recovery scope
 
-```sql
-ORDER BY source_instance_id, feed_session_epoch, ingress_sequence
-```
-
-Do not use implicit part order, wall-clock time, or batch sequence as replay
-correctness order.
-
-## Time model
-
-Rows preserve these source and receive clocks:
-
-- exchange time and raw exchange time;
-- vendor `LocalTime` and its normalized nanoseconds from midnight;
-- callback `receive_monotonic_ns`.
-
-The sink captures `run_started_utc_ns` and `run_started_monotonic_ns` once at
-startup and prints both. They provide an operational estimate:
-
-```text
-estimated_receive_utc_ns =
-    run_started_utc_ns
-    + receive_monotonic_ns
-    - run_started_monotonic_ns
-```
-
-The estimate is not used for correctness ordering and does not model later NTP
-steps. If accurate UTC correlation across long runs is required, add periodic
-non-hot-path `(utc, monotonic)` calibration control rows. Do not restore a
-wall-clock read to every callback.
-
-## Capacity
-
-The queue is sized in batches per decoder lane. A starting estimate is:
-
-```text
-required_batches =
-    ceil(peak_rows_per_second
-         * tolerated_clickhouse_stall_seconds
-         / rows_per_batch)
-    * safety_factor
-```
-
-Preallocated canonical payload memory is approximately:
-
-```text
-decoder_lanes
-* (rounded_queue_capacity + 1 active slot)
-* rows_per_batch
-* sizeof(CanonicalRecord)
-```
-
-`clickhouse_preallocated_canonical_bytes` prints the actual configured Tick
-plus Snapshot payload allocation. It excludes Arrow builder memory, serialized
-in-flight payloads, libcurl buffers, and container metadata. Queue capacity
-should cover seconds of measured ClickHouse jitter, not minutes of outage.
-
-## Daemon configuration
-
-`--clickhouse-url` enables this sink. Required and commonly used options are:
-
-```text
---clickhouse-url <http-or-https-base-url>
---clickhouse-feed-epoch <nonzero run epoch>
---clickhouse-source-instance-id <optional stable 32-hex ID>
---clickhouse-database <database>
---clickhouse-user <user>
---clickhouse-password-env <environment-variable-name>
---clickhouse-writers <count>
---clickhouse-queue-batches-per-lane <count>
---clickhouse-insert-quorum <count>
---clickhouse-no-auto-create
-```
-
-The password value is never accepted as a command-line value or printed.
-Direct connections are the default (`no_proxy=*`) so machine-wide proxy
-variables cannot intercept persistence traffic; `--clickhouse-no-proxy` can
-provide a narrower libcurl exclusion list. `--clickhouse-no-tls-verify` is an
-explicit development escape hatch and should not be used in production.
-
-## Shutdown
-
-Normal shutdown follows this order:
-
-1. Stop SDK callbacks.
-2. Stop admission and wait for an active callback.
-3. Drain decoder lanes and flush every partial raw batch.
-4. Join decoder threads.
-5. Drain ClickHouse ready queues and wait for every INSERT ACK.
-6. Stop writer threads and report final ACK/release counts.
-7. Seal the independent Arrow hot path, if enabled.
-
-If the ClickHouse shutdown deadline expires, the daemon prints the sink error,
-the remaining batch count, and exits nonzero. A successful exit requires no
-active or unreleased raw batch.
-
-## Verification
-
-The deterministic ingest test proves that the raw tap sees retransmissions and
-catalog misses before recovery/suppression and that a tap failure closes
-admission. The ClickHouse test covers BLAKE3 vectors, preallocation, Arrow
-mapping, nested Snapshot levels, occurrence uniqueness, row indices, Date
-partitioning, and explicit replay order. Its lost-ACK fixture accepts the full
-first ArrowStream request and drops the response, then verifies that the retry
-uses a byte-identical request target and payload before returning success.
-Another fixture holds the first INSERT open until a two-slot canonical pool is
-exhausted; it verifies fail-closed admission and that shutdown still drains and
-acknowledges both already-copied rows before returning the fatal status.
-
-```bash
-ctest --test-dir build --output-on-failure
-
-./clickhouse-test/start.sh
-L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
-  ./build/test_clickhouse_raw
-```
+The local canonical WAL is run-scoped and is not reopened after a process
+crash. Raw INSERT retry and cursor tracking protect a live process from
+transient ClickHouse failures. Process-crash recovery must replay from the
+external source with a new feed epoch; it must not infer progress from a
+maximum ingress sequence.

@@ -1,7 +1,5 @@
 #include "l2flow/ingest/engine.h"
 
-#include "l2flow/ingest/raw_tap.h"
-
 #include "decoder_internal.h"
 
 #include <algorithm>
@@ -9,6 +7,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -335,7 +334,7 @@ struct alignas(64) TickLaneStats final {
     std::atomic<std::uint64_t> gaps_skipped{0U};
     std::atomic<std::uint64_t> from_open_channels_frozen{0U};
     std::atomic<std::uint64_t> channel_faults_dispatched{0U};
-    std::atomic<std::uint64_t> dispatch_overflows{0U};
+    std::atomic<std::uint64_t> outbox_overflows{0U};
 };
 
 struct alignas(64) SnapshotLaneStats final {
@@ -343,338 +342,7 @@ struct alignas(64) SnapshotLaneStats final {
     std::atomic<std::uint64_t> decode_errors{0U};
     std::atomic<std::uint64_t> catalog_misses{0U};
     std::atomic<std::uint64_t> dispatched_snapshots{0U};
-    std::atomic<std::uint64_t> dispatch_overflows{0U};
-};
-
-class GapMailboxSlot final {
-public:
-    enum class SnapshotResult : std::uint8_t {
-        kReady,
-        kNoChange,
-        kBusy,
-    };
-
-    void Publish(const ChannelGap& gap) noexcept {
-        // Three immutable-at-publication buffers let the single producer
-        // avoid both waiting and overwriting a buffer held by a preempted
-        // consumer. The versioned token prevents an index ABA during the
-        // consumer's claim/recheck handshake.
-        const std::uint64_t current_token =
-            published_token_.load(std::memory_order_seq_cst);
-        const std::size_t current_index =
-            static_cast<std::size_t>(current_token & UINT64_C(3));
-        const std::size_t reader_index = static_cast<std::size_t>(
-            reader_index_.load(std::memory_order_seq_cst));
-        std::size_t target = (current_index + 1U) % buffers_.size();
-        if (target == reader_index) {
-            target = (target + 1U) % buffers_.size();
-        }
-        buffers_[target] = gap;
-        ++producer_generation_;
-        const std::uint64_t token =
-            (producer_generation_ << 2U) |
-            static_cast<std::uint64_t>(target);
-        published_token_.store(token, std::memory_order_seq_cst);
-    }
-
-    [[nodiscard]] SnapshotResult TrySnapshot(
-        ChannelGap* output) noexcept {
-        if (output == nullptr) {
-            return SnapshotResult::kNoChange;
-        }
-        constexpr std::size_t kMaximumAttempts = 8U;
-        for (std::size_t attempt = 0U; attempt < kMaximumAttempts;
-             ++attempt) {
-            const std::uint64_t before =
-                published_token_.load(std::memory_order_seq_cst);
-            const std::uint8_t index = static_cast<std::uint8_t>(
-                before & UINT64_C(3));
-            if (index >= buffers_.size()) {
-                return SnapshotResult::kNoChange;
-            }
-            reader_index_.store(index, std::memory_order_seq_cst);
-            const std::uint64_t after =
-                published_token_.load(std::memory_order_seq_cst);
-            if (before != after) {
-                reader_index_.store(kNoReader,
-                                    std::memory_order_seq_cst);
-                CpuRelax();
-                continue;
-            }
-            const ChannelGap snapshot = buffers_[index];
-            reader_index_.store(kNoReader, std::memory_order_seq_cst);
-            if (delivered_token_ == before) {
-                return SnapshotResult::kNoChange;
-            }
-            delivered_token_ = before;
-            *output = snapshot;
-            return SnapshotResult::kReady;
-        }
-        return SnapshotResult::kBusy;
-    }
-
-private:
-    static constexpr std::uint8_t kNoReader = 3U;
-    std::array<ChannelGap, 3U> buffers_{};
-    std::atomic<std::uint64_t> published_token_{UINT64_C(3)};
-    std::atomic<std::uint8_t> reader_index_{kNoReader};
-    std::uint64_t producer_generation_ = 0U;
-    std::uint64_t delivered_token_ = UINT64_C(3);
-};
-
-class Dispatcher final {
-public:
-    Dispatcher(std::size_t tick_producers,
-               std::size_t snapshot_producers,
-               std::size_t owners,
-               std::size_t queue_capacity,
-               std::size_t fault_capacity,
-               std::size_t maximum_channels_per_tick_producer)
-        : tick_producers_(tick_producers),
-          snapshot_producers_(snapshot_producers),
-          owners_(owners),
-          gap_channels_per_producer_(maximum_channels_per_tick_producer),
-          gap_words_per_producer_(
-              (maximum_channels_per_tick_producer + 63U) / 64U),
-          gap_slots_(std::make_unique<GapMailboxSlot[]>(
-              tick_producers * maximum_channels_per_tick_producer)),
-          gap_dirty_words_(std::make_unique<std::atomic<std::uint64_t>[]>(
-              tick_producers * gap_words_per_producer_)),
-          gap_consumer_pending_(
-              tick_producers * gap_words_per_producer_, 0U),
-          tick_dispatch_fences_(tick_producers * owners, 0U),
-          tick_consumer_cursor_(owners, 0U),
-          snapshot_consumer_cursor_(owners, 0U) {
-        tick_dispatch_queues_.reserve(tick_producers * owners);
-        for (std::size_t index = 0U; index < tick_producers * owners;
-             ++index) {
-            tick_dispatch_queues_.push_back(
-                std::make_unique<SpscRing<TickDispatch>>(queue_capacity));
-        }
-        snapshot_queues_.reserve(snapshot_producers * owners);
-        for (std::size_t index = 0U; index < snapshot_producers * owners;
-             ++index) {
-            snapshot_queues_.push_back(
-                std::make_unique<SpscRing<CanonicalSnapshot>>(
-                    queue_capacity));
-        }
-        fault_queues_.reserve(tick_producers);
-        for (std::size_t index = 0U; index < tick_producers; ++index) {
-            fault_queues_.push_back(
-                std::make_unique<SpscRing<ChannelFault>>(fault_capacity));
-        }
-        const std::size_t dirty_word_count =
-            tick_producers * gap_words_per_producer_;
-        for (std::size_t index = 0U; index < dirty_word_count; ++index) {
-            gap_dirty_words_[index].store(0U, std::memory_order_relaxed);
-        }
-    }
-
-    [[nodiscard]] bool PublishTickDispatch(
-        std::size_t producer,
-        std::size_t owner,
-        const TickDispatch& dispatch) noexcept {
-        if (producer >= tick_producers_ || owner >= owners_) {
-            return false;
-        }
-        const std::size_t index = producer * owners_ + owner;
-        std::uint64_t& fence = tick_dispatch_fences_[index];
-        if (fence == std::numeric_limits<std::uint64_t>::max()) {
-            return false;
-        }
-        TickDispatch published = dispatch;
-        published.owner = static_cast<std::uint32_t>(owner);
-        published.dispatch_fence = fence + 1U;
-        if (!tick_dispatch_queues_[index]->TryPush(published)) {
-            return false;
-        }
-        ++fence;
-        return true;
-    }
-
-    [[nodiscard]] bool PublishTickControl(
-        std::size_t producer,
-        const TickDispatch& control) noexcept {
-        if (producer >= tick_producers_) {
-            return false;
-        }
-        const std::size_t first = producer * owners_;
-        for (std::size_t owner = 0U; owner < owners_; ++owner) {
-            const std::size_t index = first + owner;
-            if (tick_dispatch_fences_[index] ==
-                    std::numeric_limits<std::uint64_t>::max() ||
-                !tick_dispatch_queues_[index]->CanPush()) {
-                return false;
-            }
-        }
-        for (std::size_t owner = 0U; owner < owners_; ++owner) {
-            const std::size_t index = first + owner;
-            TickDispatch published = control;
-            published.owner = static_cast<std::uint32_t>(owner);
-            published.dispatch_fence = ++tick_dispatch_fences_[index];
-            if (!tick_dispatch_queues_[index]->TryPush(published)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool PublishSnapshot(
-        std::size_t producer,
-        std::size_t owner,
-        const CanonicalSnapshot& snapshot) noexcept {
-        if (producer >= snapshot_producers_ || owner >= owners_) {
-            return false;
-        }
-        return snapshot_queues_[producer * owners_ + owner]->TryPush(
-            snapshot);
-    }
-
-    [[nodiscard]] bool PublishGap(std::size_t producer,
-                                  std::size_t channel_slot,
-                                  const ChannelGap& gap) noexcept {
-        if (producer >= tick_producers_ ||
-            channel_slot >= gap_channels_per_producer_) {
-            return false;
-        }
-        const std::size_t slot_index =
-            producer * gap_channels_per_producer_ + channel_slot;
-        gap_slots_[slot_index].Publish(gap);
-        const std::size_t word_index =
-            producer * gap_words_per_producer_ + channel_slot / 64U;
-        const std::uint64_t bit =
-            UINT64_C(1) << static_cast<unsigned int>(channel_slot % 64U);
-        gap_dirty_words_[word_index].fetch_or(
-            bit, std::memory_order_release);
-        return true;
-    }
-
-    [[nodiscard]] bool PublishFault(std::size_t producer,
-                                    const ChannelFault& fault) noexcept {
-        return producer < fault_queues_.size() &&
-               fault_queues_[producer]->TryPush(fault);
-    }
-
-    [[nodiscard]] bool TryPollTickDispatch(
-        std::size_t owner,
-        TickDispatch* output) noexcept {
-        if (owner >= owners_ || output == nullptr) {
-            return false;
-        }
-        std::size_t& cursor = tick_consumer_cursor_[owner];
-        for (std::size_t count = 0U; count < tick_producers_; ++count) {
-            const std::size_t producer = (cursor + count) % tick_producers_;
-            if (tick_dispatch_queues_[producer * owners_ + owner]->TryPop(
-                    output)) {
-                cursor = (producer + 1U) % tick_producers_;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool TryPollSnapshot(
-        std::size_t owner,
-        CanonicalSnapshot* output) noexcept {
-        if (owner >= owners_ || output == nullptr) {
-            return false;
-        }
-        std::size_t& cursor = snapshot_consumer_cursor_[owner];
-        for (std::size_t count = 0U; count < snapshot_producers_; ++count) {
-            const std::size_t producer =
-                (cursor + count) % snapshot_producers_;
-            if (snapshot_queues_[producer * owners_ + owner]->TryPop(
-                    output)) {
-                cursor = (producer + 1U) % snapshot_producers_;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool TryPollGap(ChannelGap* output) noexcept {
-        if (output == nullptr || gap_consumer_pending_.empty()) {
-            return false;
-        }
-        const std::size_t word_count = gap_consumer_pending_.size();
-        for (std::size_t count = 0U; count < word_count; ++count) {
-            const std::size_t word_index =
-                (gap_consumer_word_cursor_ + count) % word_count;
-            std::uint64_t& pending = gap_consumer_pending_[word_index];
-            if (pending == 0U) {
-                pending = gap_dirty_words_[word_index].exchange(
-                    0U, std::memory_order_acq_rel);
-            }
-            while (pending != 0U) {
-                const unsigned int bit_index =
-                    std::countr_zero(pending);
-                const std::uint64_t bit = UINT64_C(1) << bit_index;
-                pending &= ~bit;
-                const std::size_t producer =
-                    word_index / gap_words_per_producer_;
-                const std::size_t local_word =
-                    word_index % gap_words_per_producer_;
-                const std::size_t channel_slot =
-                    local_word * 64U + bit_index;
-                if (channel_slot >= gap_channels_per_producer_) {
-                    continue;
-                }
-                GapMailboxSlot& slot = gap_slots_[
-                    producer * gap_channels_per_producer_ + channel_slot];
-                ChannelGap snapshot{};
-                const GapMailboxSlot::SnapshotResult result =
-                    slot.TrySnapshot(&snapshot);
-                if (result == GapMailboxSlot::SnapshotResult::kBusy) {
-                    pending |= bit;
-                    return false;
-                }
-                if (result == GapMailboxSlot::SnapshotResult::kNoChange) {
-                    continue;
-                }
-                *output = snapshot;
-                gap_consumer_word_cursor_ =
-                    (word_index + 1U) % word_count;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool TryPollFault(ChannelFault* output) noexcept {
-        if (output == nullptr || fault_queues_.empty()) {
-            return false;
-        }
-        for (std::size_t count = 0U; count < fault_queues_.size(); ++count) {
-            const std::size_t producer =
-                (fault_consumer_cursor_ + count) % fault_queues_.size();
-            if (fault_queues_[producer]->TryPop(output)) {
-                fault_consumer_cursor_ =
-                    (producer + 1U) % fault_queues_.size();
-                return true;
-            }
-        }
-        return false;
-    }
-
-private:
-    std::size_t tick_producers_ = 0U;
-    std::size_t snapshot_producers_ = 0U;
-    std::size_t owners_ = 0U;
-    std::vector<std::unique_ptr<SpscRing<TickDispatch>>>
-        tick_dispatch_queues_;
-    std::vector<std::unique_ptr<SpscRing<CanonicalSnapshot>>>
-        snapshot_queues_;
-    std::vector<std::unique_ptr<SpscRing<ChannelFault>>> fault_queues_;
-    std::size_t gap_channels_per_producer_ = 0U;
-    std::size_t gap_words_per_producer_ = 0U;
-    std::unique_ptr<GapMailboxSlot[]> gap_slots_;
-    std::unique_ptr<std::atomic<std::uint64_t>[]> gap_dirty_words_;
-    std::vector<std::uint64_t> gap_consumer_pending_;
-    std::vector<std::uint64_t> tick_dispatch_fences_;
-    std::vector<std::size_t> tick_consumer_cursor_;
-    std::vector<std::size_t> snapshot_consumer_cursor_;
-    std::size_t gap_consumer_word_cursor_ = 0U;
-    std::size_t fault_consumer_cursor_ = 0U;
+    std::atomic<std::uint64_t> outbox_overflows{0U};
 };
 
 class SequenceRecovery final {
@@ -828,6 +496,29 @@ public:
         }
     }
 
+    [[nodiscard]] std::uint64_t MinimumPendingIngress() const noexcept {
+        std::uint64_t minimum = std::numeric_limits<std::uint64_t>::max();
+        for (std::size_t channel = 0U; channel < channel_count_; ++channel) {
+            const ChannelState& state = channels_[channel];
+            if (state.pending_count == 0U) {
+                continue;
+            }
+            for (std::size_t index = 0U; index < entries_per_channel_;
+                 ++index) {
+                const PendingSlot& slot = state.pending[index];
+                if (slot.occupied) {
+                    minimum = std::min(
+                        minimum, slot.tick.common.ingress_sequence);
+                }
+            }
+        }
+        return minimum;
+    }
+
+    [[nodiscard]] std::uint64_t pending_revision() const noexcept {
+        return pending_revision_;
+    }
+
     template <typename EmitOccurrence, typename EmitControl,
               typename EmitFault, typename Fatal>
     void FreezeDecodeFailure(Market market,
@@ -857,7 +548,7 @@ private:
         std::uint64_t arrival_expected = 0U;
         std::uint64_t arrival_floor = 0U;
         bool occupied = false;
-        bool emit = false;
+        bool catalog_match = false;
     };
 
     struct HoleInterval final {
@@ -1041,9 +732,10 @@ private:
         slot.tick = decoded.tick;
         slot.arrival_expected = arrival_expected;
         slot.arrival_floor = arrival_floor;
-        slot.emit = decoded.catalog_match;
+        slot.catalog_match = decoded.catalog_match;
         slot.occupied = true;
         ++state.pending_count;
+        ++pending_revision_;
         return InsertResult::kInserted;
     }
 
@@ -1099,14 +791,12 @@ private:
                 Fatal&& fatal) noexcept {
         stats_->rejected_late_facts.fetch_add(1U,
                                              std::memory_order_relaxed);
-        if (!decoded.catalog_match) {
-            return;
-        }
         const TickDispatch dispatch = MakeOccurrence(
-            state, decoded.tick, true, TickDispatchKind::kRejectLateFact,
+            state, decoded.tick, decoded.catalog_match,
+            TickDispatchKind::kRejectLateFact,
             expected_at_arrival, floor_at_arrival, state.gap_epoch);
-        if (!emit_occurrence(dispatch)) {
-            fatal("rejected-fact dispatch queue overflow");
+        if (!emit_occurrence(decoded.tick, dispatch)) {
+            fatal("canonical outbox rejected a late-fact occurrence");
         }
     }
 
@@ -1122,7 +812,7 @@ private:
                 return false;
             }
             CanonicalTick tick = slot->tick;
-            const bool should_emit = slot->emit;
+            const bool catalog_match = slot->catalog_match;
             const std::uint64_t expected_at_arrival =
                 slot->arrival_expected != 0U
                     ? slot->arrival_expected
@@ -1134,17 +824,16 @@ private:
                     : RejectionFloor(state, expected_at_arrival);
             slot->occupied = false;
             --state.pending_count;
+            ++pending_revision_;
             stats_->rejected_late_facts.fetch_add(
                 1U, std::memory_order_relaxed);
-            if (!should_emit) {
-                continue;
-            }
             TickDispatch dispatch = MakeOccurrence(
-                state, tick, true, TickDispatchKind::kRejectLateFact,
+                state, tick, catalog_match,
+                TickDispatchKind::kRejectLateFact,
                 expected_at_arrival, floor_at_arrival, state.gap_epoch);
             dispatch.evict_before = RetentionFrontier(state);
-            if (!emit_occurrence(dispatch)) {
-                fatal("pending rejected-fact dispatch queue overflow");
+            if (!emit_occurrence(tick, dispatch)) {
+                fatal("canonical outbox rejected a pending late fact");
                 return false;
             }
         }
@@ -1155,43 +844,46 @@ private:
     template <typename EmitOccurrence, typename Fatal>
     [[nodiscard]] bool EmitOne(ChannelState& state,
                                PendingSlot& slot,
+                               bool tracked_pending,
                                EmitOccurrence&& emit_occurrence,
                                Fatal&& fatal) noexcept {
         CanonicalTick tick = slot.tick;
-        const bool should_emit = slot.emit;
+        const CanonicalTick original_tick = slot.tick;
+        const bool catalog_match = slot.catalog_match;
         const std::uint64_t expected_at_arrival = slot.arrival_expected;
         const std::uint64_t floor_at_arrival = slot.arrival_floor;
         slot.occupied = false;
         --state.pending_count;
+        if (tracked_pending) {
+            ++pending_revision_;
+        }
         if (state.expired_loss || state.hole_count != 0U) {
             tick.validity &= ~kTickChannelHistoryValid;
             tick.common.quality_flags |= kQualityChannelHistoryIncomplete;
         }
-        if (should_emit && state.gap_metadata_pending) {
+        if (catalog_match && state.gap_metadata_pending) {
             tick.common.quality_flags |= kQualitySequenceGapBefore;
             tick.common.gap_epoch = state.gap_epoch;
             tick.common.gap_before_first = state.pending_gap_first;
             tick.common.gap_before_last = state.pending_gap_last;
             state.gap_metadata_pending = false;
         }
-        if (should_emit) {
-            if (expected_at_arrival == 0U || floor_at_arrival == 0U ||
-                floor_at_arrival > expected_at_arrival) {
-                fatal("ordered arrival token is not initialized");
-                return false;
-            }
-            const std::uint64_t projected_expected =
-                tick.common.native_sequence + 1U;
-            TickDispatch dispatch = MakeOccurrence(
-                state, tick, true, TickDispatchKind::kProjectOrdered,
-                expected_at_arrival, floor_at_arrival,
-                state.gap_epoch);
-            dispatch.evict_before =
-                ProjectedRetentionFrontier(state, projected_expected);
-            if (!emit_occurrence(dispatch)) {
-                fatal("instrument TickDispatch queue overflow");
-                return false;
-            }
+        if (expected_at_arrival == 0U || floor_at_arrival == 0U ||
+            floor_at_arrival > expected_at_arrival) {
+            fatal("ordered arrival token is not initialized");
+            return false;
+        }
+        const std::uint64_t projected_expected =
+            tick.common.native_sequence + 1U;
+        TickDispatch dispatch = MakeOccurrence(
+            state, tick, catalog_match, TickDispatchKind::kProjectOrdered,
+            expected_at_arrival, floor_at_arrival,
+            state.gap_epoch);
+        dispatch.evict_before =
+            ProjectedRetentionFrontier(state, projected_expected);
+        if (!emit_occurrence(original_tick, dispatch)) {
+            fatal("canonical outbox occurrence queue overflow");
+            return false;
         }
         return true;
     }
@@ -1206,7 +898,7 @@ private:
             if (slot == nullptr) {
                 break;
             }
-            if (!EmitOne(state, *slot, emit_occurrence, fatal)) {
+            if (!EmitOne(state, *slot, true, emit_occurrence, fatal)) {
                 return;
             }
             ++state.expected;
@@ -1319,7 +1011,7 @@ private:
         seal.market = state.market;
         seal.kind = TickDispatchKind::kChannelSeal;
         if (!emit_control(seal)) {
-            fatal("ChannelSeal dispatch queue overflow");
+            fatal("canonical outbox rejected ChannelSeal");
             return false;
         }
         return true;
@@ -1385,7 +1077,7 @@ private:
         opened.market = state.market;
         opened.kind = TickDispatchKind::kGapOpen;
         if (!emit_control(opened)) {
-            fatal("GapOpen dispatch queue overflow");
+            fatal("canonical outbox rejected GapOpen");
             return false;
         }
 
@@ -1440,7 +1132,7 @@ private:
             return;
         }
         if (!emit_fault(fault)) {
-            fatal("channel fault dispatch queue overflow");
+            fatal("canonical outbox rejected channel fault");
         }
     }
 
@@ -1540,23 +1232,21 @@ private:
                     return;
                 }
 
-                if (decoded.catalog_match) {
-                    CanonicalTick tick = decoded.tick;
-                    tick.validity &= ~kTickChannelHistoryValid;
-                    tick.common.quality_flags |=
-                        kQualityChannelHistoryIncomplete |
-                        kQualityHoleFill;
-                    tick.common.gap_epoch = state.gap_epoch;
-                    const TickDispatch dispatch = MakeOccurrence(
-                        state, tick, true,
-                        TickDispatchKind::kProjectHoleFill,
-                        arrival_expected, arrival_floor, hole_generation);
-                    TickDispatch pinned = dispatch;
-                    pinned.evict_before = RetentionFrontier(state);
-                    if (!emit_occurrence(pinned)) {
-                        fatal("hole-fill TickDispatch queue overflow");
-                        return;
-                    }
+                CanonicalTick tick = decoded.tick;
+                tick.validity &= ~kTickChannelHistoryValid;
+                tick.common.quality_flags |=
+                    kQualityChannelHistoryIncomplete |
+                    kQualityHoleFill;
+                tick.common.gap_epoch = state.gap_epoch;
+                const TickDispatch dispatch = MakeOccurrence(
+                    state, tick, decoded.catalog_match,
+                    TickDispatchKind::kProjectHoleFill,
+                    arrival_expected, arrival_floor, hole_generation);
+                TickDispatch pinned = dispatch;
+                pinned.evict_before = RetentionFrontier(state);
+                if (!emit_occurrence(decoded.tick, pinned)) {
+                    fatal("hole-fill canonical outbox queue overflow");
+                    return;
                 }
                 if (RetentionFrontier(state) > previous_retention) {
                     static_cast<void>(EmitSeal(state, emit_control, fatal));
@@ -1571,10 +1261,11 @@ private:
                 temporary.tick = decoded.tick;
                 temporary.arrival_expected = arrival_expected;
                 temporary.arrival_floor = arrival_floor;
-                temporary.emit = decoded.catalog_match;
+                temporary.catalog_match = decoded.catalog_match;
                 temporary.occupied = true;
                 ++state.pending_count;
-                if (!EmitOne(state, temporary, emit_occurrence, fatal)) {
+                if (!EmitOne(state, temporary, false, emit_occurrence,
+                             fatal)) {
                     return;
                 }
                 ++state.expected;
@@ -1638,6 +1329,7 @@ private:
     std::size_t channel_table_mask_ = 0U;
     std::size_t channel_count_ = 0U;
     std::uint64_t next_deadline_ns_ = 0U;
+    std::uint64_t pending_revision_ = 0U;
     TickLaneStats* stats_ = nullptr;
 };
 
@@ -1670,10 +1362,15 @@ private:
     if (config.tick_slots_per_lane < 2U ||
         config.snapshot_slots_per_lane < 2U ||
         config.maximum_tick_body_bytes < 70U ||
-        config.maximum_snapshot_body_bytes < 248U ||
-        config.dispatch_queue_capacity < 2U ||
-        config.diagnostic_queue_capacity < 2U) {
-        return fail("slot, body, or dispatch capacity is too small");
+        config.maximum_snapshot_body_bytes < 248U) {
+        return fail("slot or body capacity is too small");
+    }
+    if (config.outbox == nullptr || !config.outbox->healthy()) {
+        return fail("a healthy durable canonical outbox is required");
+    }
+    if (config.outbox->config().feed_session_epoch !=
+        config.feed_session_epoch) {
+        return fail("engine and canonical outbox feed epochs differ");
     }
     if (config.maximum_channels_per_tick_lane == 0U) {
         return fail("maximum_channels_per_tick_lane must be positive");
@@ -1747,12 +1444,46 @@ public:
               IsPowerOfTwo(config.instrument_workers)
                   ? config.instrument_workers - 1U
                   : 0U),
-          dispatcher_(config.tick_decoder_lanes,
-                      config.snapshot_decoder_lanes,
-                      config.instrument_workers,
-                      config.dispatch_queue_capacity,
-                      config.diagnostic_queue_capacity,
-                      config.maximum_channels_per_tick_lane) {
+          tick_dispatch_fences_(
+              config.tick_decoder_lanes * config.instrument_workers, 0U),
+          tick_admitted_through_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.tick_decoder_lanes)),
+          snapshot_admitted_through_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.snapshot_decoder_lanes)),
+          tick_fence_targets_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.tick_decoder_lanes)),
+          snapshot_fence_targets_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.snapshot_decoder_lanes)),
+          tick_fence_completed_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.tick_decoder_lanes)),
+          snapshot_fence_completed_(
+              std::make_unique<std::atomic<std::uint64_t>[]>(
+                  config.snapshot_decoder_lanes)),
+          tick_fence_capture_(config.tick_decoder_lanes, 0U),
+          snapshot_fence_capture_(config.snapshot_decoder_lanes, 0U) {
+        for (std::size_t index = 0U; index < config_.tick_decoder_lanes;
+             ++index) {
+            tick_admitted_through_[index].store(0U,
+                                                 std::memory_order_relaxed);
+            tick_fence_targets_[index].store(0U,
+                                             std::memory_order_relaxed);
+            tick_fence_completed_[index].store(0U,
+                                               std::memory_order_relaxed);
+        }
+        for (std::size_t index = 0U;
+             index < config_.snapshot_decoder_lanes; ++index) {
+            snapshot_admitted_through_[index].store(
+                0U, std::memory_order_relaxed);
+            snapshot_fence_targets_[index].store(
+                0U, std::memory_order_relaxed);
+            snapshot_fence_completed_[index].store(
+                0U, std::memory_order_relaxed);
+        }
         tick_lanes_.reserve(config_.tick_decoder_lanes);
         tick_recovery_.reserve(config_.tick_decoder_lanes);
         for (std::size_t index = 0U; index < config_.tick_decoder_lanes;
@@ -1876,6 +1607,7 @@ public:
             std::this_thread::yield();
         }
         running_.store(false, std::memory_order_release);
+        fence_wake_.notify_all();
         for (std::thread& thread : threads_) {
             if (thread.joinable()) {
                 thread.join();
@@ -1897,10 +1629,15 @@ public:
                      "admission contract");
             return AdmissionResult::kConcurrentCallback;
         }
+        admission_epoch_.fetch_add(1U, std::memory_order_acq_rel);
         struct CallbackGuard final {
             std::atomic_flag* flag;
-            ~CallbackGuard() { flag->clear(std::memory_order_release); }
-        } guard{&callback_active_};
+            std::atomic<std::uint64_t>* epoch;
+            ~CallbackGuard() {
+                epoch->fetch_add(1U, std::memory_order_release);
+                flag->clear(std::memory_order_release);
+            }
+        } guard{&callback_active_, &admission_epoch_};
 
         const auto reject = [this](AdmissionResult result) {
             admission_stats_.rejected.fetch_add(
@@ -1995,31 +1732,160 @@ public:
                      "silently overwritten");
             return reject(AdmissionResult::kLaneFull);
         }
+        if (is_tick) {
+            tick_admitted_through_[lane_index].store(
+                ingress_sequence, std::memory_order_release);
+        } else {
+            snapshot_admitted_through_[lane_index].store(
+                ingress_sequence, std::memory_order_release);
+        }
         next_ingress_sequence_ = ingress_sequence;
         admission_stats_.admitted.fetch_add(
             1U, std::memory_order_relaxed);
         return AdmissionResult::kAccepted;
     }
 
-    [[nodiscard]] bool TryPollTickDispatch(
-        std::size_t owner,
-        TickDispatch* output) noexcept {
-        return dispatcher_.TryPollTickDispatch(owner, output);
-    }
+    [[nodiscard]] bool FenceAcceptedInputs(
+        std::uint64_t timeout_ns,
+        std::string* error) noexcept {
+        const auto fail = [error](std::string message) noexcept {
+            if (error != nullptr) {
+                try {
+                    *error = std::move(message);
+                } catch (...) {
+                }
+            }
+            return false;
+        };
+        if (timeout_ns == 0U) {
+            return fail("decoder fence timeout must be positive");
+        }
+        if (!running_.load(std::memory_order_acquire) || !healthy()) {
+            return fail("decoder fence requires a healthy running engine");
+        }
+        const std::uint64_t started_ns = MonotonicNowNs();
+        const std::uint64_t deadline_ns =
+            timeout_ns > std::numeric_limits<std::uint64_t>::max() -
+                             started_ns
+            ? std::numeric_limits<std::uint64_t>::max()
+            : started_ns + timeout_ns;
 
-    [[nodiscard]] bool TryPollSnapshot(
-        std::size_t owner,
-        CanonicalSnapshot* output) noexcept {
-        return dispatcher_.TryPollSnapshot(owner, output);
-    }
+        try {
+            std::unique_lock<std::mutex> issue_lock(fence_issue_mutex_);
+            for (;;) {
+                const std::uint64_t before =
+                    admission_epoch_.load(std::memory_order_acquire);
+                if ((before & 1U) != 0U) {
+                    if (!running_.load(std::memory_order_acquire) ||
+                        !healthy()) {
+                        return fail(
+                            "decoder fence interrupted while capturing "
+                            "admission");
+                    }
+                    if (MonotonicNowNs() >= deadline_ns) {
+                        return fail(
+                            "decoder fence timed out while capturing "
+                            "admission");
+                    }
+                    std::this_thread::yield();
+                    continue;
+                }
+                for (std::size_t index = 0U;
+                     index < config_.tick_decoder_lanes; ++index) {
+                    tick_fence_capture_[index] =
+                        tick_admitted_through_[index].load(
+                            std::memory_order_acquire);
+                }
+                for (std::size_t index = 0U;
+                     index < config_.snapshot_decoder_lanes; ++index) {
+                    snapshot_fence_capture_[index] =
+                        snapshot_admitted_through_[index].load(
+                            std::memory_order_acquire);
+                }
+                const std::uint64_t after =
+                    admission_epoch_.load(std::memory_order_acquire);
+                if (before == after && (after & 1U) == 0U) {
+                    break;
+                }
+                if (MonotonicNowNs() >= deadline_ns) {
+                    return fail(
+                        "decoder fence timed out while capturing admission");
+                }
+            }
 
-    [[nodiscard]] bool TryPollGap(ChannelGap* output) noexcept {
-        return dispatcher_.TryPollGap(output);
-    }
+            const std::uint64_t previous =
+                fence_generation_.load(std::memory_order_relaxed);
+            if (previous == std::numeric_limits<std::uint64_t>::max()) {
+                SetFatal("decoder fence generation exhausted");
+                return fail(fatal_error());
+            }
+            const std::uint64_t generation = previous + 1U;
+            for (std::size_t index = 0U;
+                 index < config_.tick_decoder_lanes; ++index) {
+                tick_fence_targets_[index].store(
+                    tick_fence_capture_[index], std::memory_order_relaxed);
+            }
+            for (std::size_t index = 0U;
+                 index < config_.snapshot_decoder_lanes; ++index) {
+                snapshot_fence_targets_[index].store(
+                    snapshot_fence_capture_[index],
+                    std::memory_order_relaxed);
+            }
+            fence_generation_.store(generation, std::memory_order_release);
 
-    [[nodiscard]] bool TryPollChannelFault(
-        ChannelFault* output) noexcept {
-        return dispatcher_.TryPollFault(output);
+            const auto completed = [this, generation] {
+                if (!healthy() ||
+                    !running_.load(std::memory_order_acquire)) {
+                    return true;
+                }
+                for (std::size_t index = 0U;
+                     index < config_.tick_decoder_lanes; ++index) {
+                    if (tick_fence_completed_[index].load(
+                            std::memory_order_acquire) < generation) {
+                        return false;
+                    }
+                }
+                for (std::size_t index = 0U;
+                     index < config_.snapshot_decoder_lanes; ++index) {
+                    if (snapshot_fence_completed_[index].load(
+                            std::memory_order_acquire) < generation) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const std::uint64_t now_ns = MonotonicNowNs();
+            const std::uint64_t remaining_ns = now_ns < deadline_ns
+                ? deadline_ns - now_ns
+                : 0U;
+            const std::uint64_t bounded_timeout = std::min(
+                remaining_ns,
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::int64_t>::max()));
+            if (!fence_wake_.wait_for(
+                    issue_lock,
+                    std::chrono::nanoseconds(
+                        static_cast<std::int64_t>(bounded_timeout)),
+                    completed)) {
+                return fail("decoder fence timed out before every lane "
+                            "settled its pre-cut inputs");
+            }
+            if (!healthy() ||
+                !running_.load(std::memory_order_acquire)) {
+                return fail(fatal_error().empty()
+                                ? "decoder fence interrupted by engine stop"
+                                : fatal_error());
+            }
+            if (error != nullptr) {
+                error->clear();
+            }
+            return true;
+        } catch (const std::exception& exception) {
+            return fail(std::string("decoder fence failed: ") +
+                        exception.what());
+        } catch (...) {
+            return fail("decoder fence failed with unknown exception");
+        }
     }
 
     [[nodiscard]] EngineStats Stats() const noexcept {
@@ -2063,7 +1929,7 @@ public:
             result.channel_faults_dispatched +=
                 lane.channel_faults_dispatched.load(
                     std::memory_order_relaxed);
-            result.dispatch_overflows += lane.dispatch_overflows.load(
+            result.outbox_overflows += lane.outbox_overflows.load(
                 std::memory_order_relaxed);
         }
         for (std::size_t index = 0U;
@@ -2078,17 +1944,21 @@ public:
             result.dispatched_snapshots +=
                 lane.dispatched_snapshots.load(
                     std::memory_order_relaxed);
-            result.dispatch_overflows += lane.dispatch_overflows.load(
+            result.outbox_overflows += lane.outbox_overflows.load(
                 std::memory_order_relaxed);
         }
         return result;
     }
 
     [[nodiscard]] bool healthy() const noexcept {
-        return healthy_.load(std::memory_order_acquire);
+        return healthy_.load(std::memory_order_acquire) &&
+               config_.outbox != nullptr && config_.outbox->healthy();
     }
 
     [[nodiscard]] std::string fatal_error() const {
+        if (config_.outbox != nullptr && !config_.outbox->healthy()) {
+            return "FATAL_CONTINUITY: " + config_.outbox->fatal_error();
+        }
         std::lock_guard<std::mutex> lock(fatal_mutex_);
         return fatal_error_;
     }
@@ -2118,25 +1988,7 @@ private:
         }
         // Publish the health transition only after the diagnostic is ready.
         healthy_.store(false, std::memory_order_release);
-    }
-
-    template <typename Record, typename Publish>
-    [[nodiscard]] bool PublishBounded(const Record& record,
-                                      Publish&& publish,
-                                      std::atomic<std::uint64_t>*
-                                          overflow_counter) noexcept {
-        constexpr std::size_t kMaximumSpins = 2'048U;
-        for (std::size_t spin = 0U; spin < kMaximumSpins; ++spin) {
-            if (!healthy()) {
-                return false;
-            }
-            if (publish(record)) {
-                return true;
-            }
-            CpuRelax();
-        }
-        overflow_counter->fetch_add(1U, std::memory_order_relaxed);
-        return false;
+        fence_wake_.notify_all();
     }
 
     void TickWorker(std::size_t lane_index) noexcept {
@@ -2149,25 +2001,43 @@ private:
                 config_.maximum_depth_items,
                 config_.maximum_queue_items};
             const auto emit_occurrence = [this, lane_index, &lane_stats](
+                                       const CanonicalTick& original,
                                        const TickDispatch& dispatch) {
-                const std::size_t owner = InstrumentOwner(
-                    dispatch.tick.common.instrument_ordinal);
-                const bool published = PublishBounded(
-                    dispatch, [this, lane_index, owner](
-                              const TickDispatch& value) {
-                        return dispatcher_.PublishTickDispatch(
-                            lane_index, owner, value);
-                    },
-                    &lane_stats.dispatch_overflows);
+                outbox::CanonicalRecord record{};
+                record.kind = outbox::RecordKind::kTickOccurrence;
+                record.producer_lane = static_cast<std::uint32_t>(lane_index);
+                record.raw_tick = original;
+                record.disposition = dispatch;
+                record.catalog_match = dispatch.catalog_match;
+                if (dispatch.catalog_match) {
+                    const std::size_t owner = InstrumentOwner(
+                        dispatch.tick.common.instrument_ordinal);
+                    const std::size_t fence_index =
+                        lane_index * config_.instrument_workers + owner;
+                    std::uint64_t& fence =
+                        tick_dispatch_fences_[fence_index];
+                    if (fence == std::numeric_limits<std::uint64_t>::max()) {
+                        return false;
+                    }
+                    record.owner = static_cast<std::uint32_t>(owner);
+                    record.disposition.owner = record.owner;
+                    record.disposition.dispatch_fence = ++fence;
+                }
+                const bool published = config_.outbox->Enqueue(record);
+                if (!published) {
+                    lane_stats.outbox_overflows.fetch_add(
+                        1U, std::memory_order_relaxed);
+                }
                 if (published) {
-                    if (dispatch.kind ==
+                    if (dispatch.catalog_match &&
+                        (dispatch.kind ==
                             TickDispatchKind::kProjectOrdered ||
                         dispatch.kind ==
-                            TickDispatchKind::kProjectHoleFill) {
+                            TickDispatchKind::kProjectHoleFill)) {
                         lane_stats.dispatched_ticks.fetch_add(
                             1U, std::memory_order_relaxed);
                     }
-                    if (dispatch.kind ==
+                    if (dispatch.catalog_match && dispatch.kind ==
                         TickDispatchKind::kProjectHoleFill) {
                         lane_stats.hole_fills_dispatched.fetch_add(
                             1U, std::memory_order_relaxed);
@@ -2177,36 +2047,58 @@ private:
             };
             const auto emit_control = [this, lane_index, &lane_stats](
                                           const TickDispatch& control) {
-                const bool published = PublishBounded(
-                    control,
-                    [this, lane_index](const TickDispatch& value) {
-                        return dispatcher_.PublishTickControl(
-                            lane_index, value);
-                    },
-                    &lane_stats.dispatch_overflows);
-                if (published) {
-                    lane_stats.source_channel_controls.fetch_add(
-                        1U, std::memory_order_relaxed);
-                    lane_stats.owner_control_deliveries.fetch_add(
-                        config_.instrument_workers,
-                        std::memory_order_relaxed);
+                for (std::size_t owner = 0U;
+                     owner < config_.instrument_workers; ++owner) {
+                    const std::size_t fence_index =
+                        lane_index * config_.instrument_workers + owner;
+                    std::uint64_t& fence =
+                        tick_dispatch_fences_[fence_index];
+                    if (fence == std::numeric_limits<std::uint64_t>::max()) {
+                        return false;
+                    }
+                    outbox::CanonicalRecord record{};
+                    record.kind = outbox::RecordKind::kTickControl;
+                    record.producer_lane =
+                        static_cast<std::uint32_t>(lane_index);
+                    record.owner = static_cast<std::uint32_t>(owner);
+                    record.disposition = control;
+                    record.disposition.owner = record.owner;
+                    record.disposition.dispatch_fence = fence + 1U;
+                    if (!config_.outbox->Enqueue(record)) {
+                        lane_stats.outbox_overflows.fetch_add(
+                            1U, std::memory_order_relaxed);
+                        return false;
+                    }
+                    ++fence;
                 }
-                return published;
+                lane_stats.source_channel_controls.fetch_add(
+                    1U, std::memory_order_relaxed);
+                lane_stats.owner_control_deliveries.fetch_add(
+                    config_.instrument_workers,
+                    std::memory_order_relaxed);
+                return true;
             };
             const auto emit_gap = [this, lane_index](
                                       std::size_t channel_slot,
                                       const ChannelGap& gap) {
-                return healthy() &&
-                       dispatcher_.PublishGap(lane_index, channel_slot, gap);
+                static_cast<void>(channel_slot);
+                outbox::CanonicalRecord record{};
+                record.kind = outbox::RecordKind::kGapDiagnostic;
+                record.producer_lane = static_cast<std::uint32_t>(lane_index);
+                record.gap = gap;
+                return healthy() && config_.outbox->Enqueue(record);
             };
             const auto emit_fault = [this, lane_index, &lane_stats](
                                         const ChannelFault& fault) {
-                const bool published = PublishBounded(
-                    fault,
-                    [this, lane_index](const ChannelFault& value) {
-                        return dispatcher_.PublishFault(lane_index, value);
-                    },
-                    &lane_stats.dispatch_overflows);
+                outbox::CanonicalRecord record{};
+                record.kind = outbox::RecordKind::kChannelFault;
+                record.producer_lane = static_cast<std::uint32_t>(lane_index);
+                record.fault = fault;
+                const bool published = config_.outbox->Enqueue(record);
+                if (!published) {
+                    lane_stats.outbox_overflows.fetch_add(
+                        1U, std::memory_order_relaxed);
+                }
                 if (published) {
                     lane_stats.channel_faults_dispatched.fetch_add(
                         1U, std::memory_order_relaxed);
@@ -2218,8 +2110,44 @@ private:
             };
 
             std::uint64_t next_timer = MonotonicNowNs();
+            std::uint64_t last_consumed_ingress = 0U;
+            std::uint64_t checked_pending_revision =
+                std::numeric_limits<std::uint64_t>::max();
+            std::uint64_t minimum_pending_ingress =
+                std::numeric_limits<std::uint64_t>::max();
+            const auto service_fence = [&] {
+                const std::uint64_t generation =
+                    fence_generation_.load(std::memory_order_acquire);
+                if (generation == 0U ||
+                    tick_fence_completed_[lane_index].load(
+                        std::memory_order_relaxed) >= generation) {
+                    return;
+                }
+                const std::uint64_t target =
+                    tick_fence_targets_[lane_index].load(
+                        std::memory_order_acquire);
+                if (last_consumed_ingress < target) {
+                    return;
+                }
+                if (target != 0U) {
+                    const std::uint64_t revision =
+                        recovery.pending_revision();
+                    if (revision != checked_pending_revision) {
+                        minimum_pending_ingress =
+                            recovery.MinimumPendingIngress();
+                        checked_pending_revision = revision;
+                    }
+                    if (minimum_pending_ingress <= target) {
+                        return;
+                    }
+                }
+                tick_fence_completed_[lane_index].store(
+                    generation, std::memory_order_release);
+                fence_wake_.notify_all();
+            };
             std::size_t idle_spins = 0U;
             for (;;) {
+                service_fence();
                 std::uint32_t slot = 0U;
                 internal::OwnedMessageView message;
                 if (lane.TryConsume(&slot, &message)) {
@@ -2242,21 +2170,10 @@ private:
                             lane_stats.catalog_misses.fetch_add(
                                 1U, std::memory_order_relaxed);
                         }
-                        const bool raw_accepted =
-                            config_.raw_record_tap == nullptr ||
-                            config_.raw_record_tap->AppendTick(
-                                lane_index, decoded.tick);
-                        if (!raw_accepted) {
-                            SetFatal(
-                                "raw Tick batch queue exhausted or failed; "
-                                "admission stopped at a continuity boundary");
-                        }
-                        if (raw_accepted) {
-                            recovery.Process(
-                                decoded, message.receive_monotonic_ns,
-                                emit_occurrence, emit_control, emit_gap,
-                                fatal);
-                        }
+                        recovery.Process(
+                            decoded, message.receive_monotonic_ns,
+                            emit_occurrence, emit_control, emit_gap,
+                            fatal);
                     } else {
                         lane_stats.decode_errors.fetch_add(
                             1U, std::memory_order_relaxed);
@@ -2284,43 +2201,29 @@ private:
                     if (!lane.Release(slot)) {
                         SetFatal("tick lane recycle queue invariant failed");
                     }
+                    last_consumed_ingress = message.ingress_sequence;
                     if (healthy() &&
                         message.receive_monotonic_ns >= next_timer) {
                         recovery.Poll(
                             message.receive_monotonic_ns, emit_occurrence,
                             emit_control, emit_gap, fatal);
-                        if (healthy() &&
-                            config_.raw_record_tap != nullptr &&
-                            !config_.raw_record_tap->PollTick(
-                                lane_index,
-                                message.receive_monotonic_ns)) {
-                            SetFatal("raw Tick batch flush failed");
-                        }
                         next_timer = message.receive_monotonic_ns +
                                      config_.recovery_timer_scan_ns;
                     }
+                    service_fence();
                 } else {
                     const std::uint64_t now = MonotonicNowNs();
                     if (healthy() && now >= next_timer) {
                         recovery.Poll(now, emit_occurrence, emit_control,
                                       emit_gap, fatal);
-                        if (healthy() &&
-                            config_.raw_record_tap != nullptr &&
-                            !config_.raw_record_tap->PollTick(
-                                lane_index, now)) {
-                            SetFatal("raw Tick batch flush failed");
-                        }
                         next_timer = now + config_.recovery_timer_scan_ns;
+                        service_fence();
                     }
                     if (!running_.load(std::memory_order_acquire) &&
                         lane.empty()) {
                         if (healthy()) {
                             recovery.Flush(now, emit_occurrence, emit_control,
                                            emit_gap, fatal);
-                        }
-                        if (config_.raw_record_tap != nullptr &&
-                            !config_.raw_record_tap->FlushTick(lane_index)) {
-                            SetFatal("final raw Tick batch flush failed");
                         }
                         break;
                     }
@@ -2351,12 +2254,27 @@ private:
                 config_.maximum_depth_items,
                 config_.maximum_queue_items};
             std::size_t idle_spins = 0U;
-            std::size_t timer_check_spins = 0U;
-            std::uint64_t next_raw_timer =
-                config_.raw_record_tap == nullptr
-                    ? std::numeric_limits<std::uint64_t>::max()
-                    : MonotonicNowNs() + config_.recovery_timer_scan_ns;
+            std::uint64_t last_consumed_ingress = 0U;
+            const auto service_fence = [&] {
+                const std::uint64_t generation =
+                    fence_generation_.load(std::memory_order_acquire);
+                if (generation == 0U ||
+                    snapshot_fence_completed_[lane_index].load(
+                        std::memory_order_relaxed) >= generation) {
+                    return;
+                }
+                const std::uint64_t target =
+                    snapshot_fence_targets_[lane_index].load(
+                        std::memory_order_acquire);
+                if (last_consumed_ingress < target) {
+                    return;
+                }
+                snapshot_fence_completed_[lane_index].store(
+                    generation, std::memory_order_release);
+                fence_wake_.notify_all();
+            };
             for (;;) {
+                service_fence();
                 std::uint32_t slot = 0U;
                 internal::OwnedMessageView message;
                 if (lane.TryConsume(&slot, &message)) {
@@ -2381,35 +2299,26 @@ private:
                             lane_stats.catalog_misses.fetch_add(
                                 1U, std::memory_order_relaxed);
                         }
-                        const bool raw_accepted =
-                            config_.raw_record_tap == nullptr ||
-                            config_.raw_record_tap->AppendSnapshot(
-                                lane_index, decoded.snapshot);
-                        if (!raw_accepted) {
-                            SetFatal(
-                                "raw Snapshot batch queue exhausted or "
-                                "failed; admission stopped at a continuity "
-                                "boundary");
+                        outbox::CanonicalRecord record{};
+                        record.kind = outbox::RecordKind::kSnapshot;
+                        record.producer_lane =
+                            static_cast<std::uint32_t>(lane_index);
+                        record.raw_snapshot = decoded.snapshot;
+                        record.catalog_match = decoded.catalog_match;
+                        if (decoded.catalog_match) {
+                            record.owner = static_cast<std::uint32_t>(
+                                InstrumentOwner(decoded.snapshot.common
+                                                    .instrument_ordinal));
                         }
-                        if (raw_accepted && decoded.catalog_match) {
-                            const std::size_t owner = InstrumentOwner(
-                                decoded.snapshot.common.instrument_ordinal);
-                            const bool published = PublishBounded(
-                                decoded.snapshot,
-                                [this, lane_index, owner](
-                                    const CanonicalSnapshot& value) {
-                                    return dispatcher_.PublishSnapshot(
-                                        lane_index, owner, value);
-                                },
-                                &lane_stats.dispatch_overflows);
-                            if (published) {
+                        if (config_.outbox->Enqueue(record)) {
+                            if (decoded.catalog_match) {
                                 lane_stats.dispatched_snapshots.fetch_add(
                                     1U, std::memory_order_relaxed);
-                            } else {
-                                SetFatal(
-                                    "instrument snapshot dispatch queue "
-                                    "overflow");
                             }
+                        } else {
+                            lane_stats.outbox_overflows.fetch_add(
+                                1U, std::memory_order_relaxed);
+                            SetFatal("canonical snapshot outbox exhausted");
                         }
                     } else {
                         lane_stats.decode_errors.fetch_add(
@@ -2419,45 +2328,12 @@ private:
                         SetFatal(
                             "snapshot lane recycle queue invariant failed");
                     }
-                    if (healthy() &&
-                        config_.raw_record_tap != nullptr &&
-                        message.receive_monotonic_ns >= next_raw_timer &&
-                        !config_.raw_record_tap->PollSnapshot(
-                            lane_index, message.receive_monotonic_ns)) {
-                        SetFatal("raw Snapshot batch flush failed");
-                    }
-                    if (message.receive_monotonic_ns >= next_raw_timer) {
-                        next_raw_timer = message.receive_monotonic_ns +
-                                         config_.recovery_timer_scan_ns;
-                    }
+                    last_consumed_ingress = message.ingress_sequence;
+                    service_fence();
                 } else {
                     if (!running_.load(std::memory_order_acquire) &&
                         lane.empty()) {
-                        if (config_.raw_record_tap != nullptr &&
-                            !config_.raw_record_tap->FlushSnapshot(
-                                lane_index)) {
-                            SetFatal(
-                                "final raw Snapshot batch flush failed");
-                        }
                         break;
-                    }
-                    if (healthy() && config_.raw_record_tap != nullptr) {
-                        ++timer_check_spins;
-                    }
-                    if (healthy() &&
-                        config_.raw_record_tap != nullptr &&
-                        timer_check_spins >= 1'024U) {
-                        timer_check_spins = 0U;
-                        const std::uint64_t now = MonotonicNowNs();
-                        if (now >= next_raw_timer) {
-                            if (config_.raw_record_tap != nullptr &&
-                                !config_.raw_record_tap->PollSnapshot(
-                                    lane_index, now)) {
-                                SetFatal("raw Snapshot batch flush failed");
-                            }
-                            next_raw_timer = now +
-                                             config_.recovery_timer_scan_ns;
-                        }
                     }
                     if (config_.first_decoder_cpu >= 0) {
                         CpuRelax();
@@ -2483,7 +2359,15 @@ private:
     std::unique_ptr<TickLaneStats[]> tick_stats_;
     std::unique_ptr<SnapshotLaneStats[]> snapshot_stats_;
     std::size_t instrument_owner_mask_ = 0U;
-    Dispatcher dispatcher_;
+    std::vector<std::uint64_t> tick_dispatch_fences_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> tick_admitted_through_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> snapshot_admitted_through_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> tick_fence_targets_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> snapshot_fence_targets_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> tick_fence_completed_;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> snapshot_fence_completed_;
+    std::vector<std::uint64_t> tick_fence_capture_;
+    std::vector<std::uint64_t> snapshot_fence_capture_;
     std::vector<std::unique_ptr<LaneStorage>> tick_lanes_;
     std::vector<std::unique_ptr<LaneStorage>> snapshot_lanes_;
     std::vector<std::unique_ptr<SequenceRecovery>> tick_recovery_;
@@ -2493,6 +2377,10 @@ private:
     std::atomic<bool> accepting_{false};
     std::atomic<bool> healthy_{true};
     std::atomic_flag callback_active_ = ATOMIC_FLAG_INIT;
+    std::atomic<std::uint64_t> admission_epoch_{0U};
+    std::atomic<std::uint64_t> fence_generation_{0U};
+    std::mutex fence_issue_mutex_;
+    std::condition_variable fence_wake_;
     std::atomic_flag fatal_claimed_ = ATOMIC_FLAG_INIT;
     std::uint64_t next_ingress_sequence_ = 0U;
     mutable std::mutex fatal_mutex_;
@@ -2597,23 +2485,10 @@ AdmissionResult IngestEngine::AdmitMdlMessage(
     return impl_->Admit(header, body, receive_monotonic_ns);
 }
 
-bool IngestEngine::TryPollTickDispatch(
-    std::size_t owner,
-    TickDispatch* output) noexcept {
-    return impl_->TryPollTickDispatch(owner, output);
-}
-
-bool IngestEngine::TryPollSnapshot(std::size_t owner,
-                                   CanonicalSnapshot* output) noexcept {
-    return impl_->TryPollSnapshot(owner, output);
-}
-
-bool IngestEngine::TryPollGap(ChannelGap* output) noexcept {
-    return impl_->TryPollGap(output);
-}
-
-bool IngestEngine::TryPollChannelFault(ChannelFault* output) noexcept {
-    return impl_->TryPollChannelFault(output);
+bool IngestEngine::FenceAcceptedInputs(
+    std::uint64_t timeout_ns,
+    std::string* error) noexcept {
+    return impl_->FenceAcceptedInputs(timeout_ns, error);
 }
 
 EngineStats IngestEngine::stats() const noexcept { return impl_->Stats(); }

@@ -2,10 +2,88 @@
 
 Test date: 2026-08-11 (Asia/Shanghai)
 
-This report covers the current Event batching implementation after correctness
-fences, logical recovery commits, owner persistence submissions, and physical
-ClickHouse requests were separated. It replaces the former report for the old
-single-logical-batch sink path.
+> Historical pre-outbox evidence. The measured Event pipeline predates the
+> durable canonical/disposition WAL, exact independent consumer cursors,
+> request spool, and freshness frontier. The old benchmark path has been
+> replaced, so the figures below must not be used as a current capacity or
+> correctness claim. See [`event-worker-clickhouse.md`](event-worker-clickhouse.md).
+
+The measurements below cover the superseded pre-spool Event batching
+implementation. They are retained only as historical evidence and do not
+qualify the replacement concurrent-spool implementation.
+
+## Current replacement verification (2026-08-15)
+
+The replacement sink passed fresh Release loopback verification on a host with
+2 x AMD EPYC 9354 CPUs (64 physical cores / 128 logical CPUs). The run-scoped
+request spool was on the `/tmp` ext4 filesystem backed by `/dev/nvme0n1p2`.
+The transport scope is exactly:
+
+```text
+benchmark_scope=loopback_http_transport_no_clickhouse_storage
+```
+
+Both ten-second acceptance runs used 32 owners, 8 writer lanes, 512 rows per
+logical batch, 32 logical batches per submission, 4,096 rows / 4 MiB per
+revision request, and 16,384 rows / 16 MiB per physical group with a 50 ms
+maximum grouping delay.
+
+| Metric | 800k revisions/s | 1M revisions/s |
+| --- | ---: | ---: |
+| submitted / acknowledged rows | 8,000,000 / 8,000,000 | 10,000,000 / 10,000,000 |
+| steady acknowledged rate | 800,097.187 row/s | 998,143.006 row/s |
+| end-to-end durable rate | 797,036.145 row/s | 994,061.563 row/s |
+| target retained end to end | 99.630% | 99.406% |
+| drain tail | 37 ms | 60 ms |
+| producer queue-budget wait | 0 s | 0 s |
+| maximum producer schedule lag | 2.538 ms | 19.093 ms |
+| group / batch / row slope | -0.009 / -0.390 / -199.890 per s | 0.118 / 3.688 / 1,886.734 per s |
+| group / batch / row slope limit | 0.249 / 7.953 / 4,072.020 per s | 0.249 / 7.953 / 4,071.983 per s |
+| logical recovery batches / completed positions | 15,625 / 15,625 | 19,532 / 19,532 |
+| physical groups / marker requests | 489 / 489 | 611 / 611 |
+| revision requests | 1,954 | 2,442 |
+| maximum group / request rows | 16,384 / 4,096 | 16,384 / 4,096 |
+| retry / unknown outcome | 0 / 0 | 0 / 0 |
+| final queue groups / batches / rows | 0 / 0 / 0 | 0 / 0 / 0 |
+| final spool groups / preparing / live bytes / reserved bytes | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| aggregate spool registry-lock wait | 0.524 ms | 0.722 ms |
+| status | PASS | PASS |
+
+The revision-request counts are exact for the configured group boundary: the
+800k run produced 488 full four-request groups plus a two-request tail group;
+the 1M run produced 610 full four-request groups plus a two-request tail group.
+Every group produced exactly one marker after its revision requests.
+
+The sampler uses an independent 50 ms thread. Its least-squares queue gate is
+the larger of 0.1% of offered load and two integer queue quanta per steady
+window; the latter prevents a one-level sampling phase shift from being
+misreported as continuous accumulation. The benchmark prints both measured
+slopes and limits, and still requires every final queue counter to be zero.
+
+The measured spool encode/copy phase was 0.390 s at 800k and 0.495 s at 1M,
+versus 4.529 s and 7.170 s of aggregate checksum work. Copying is therefore
+not a significant remaining phase on this profile, so the conditional
+`pwritev` rewrite was deliberately not added.
+
+A separate two-second, 2M-row/s offered-load sweep measured the saturation
+curve rather than an acceptance rate:
+
+| Writer lanes | End-to-end durable rate | Aggregate `fdatasync` time | Registry-lock wait |
+| ---: | ---: | ---: | ---: |
+| 1 | 337,382.306 row/s | 2.474 s | 0.247 ms |
+| 2 | 682,362.094 row/s | 2.847 s | 0.287 ms |
+| 4 | 1,382,307.944 row/s | 2.658 s | 0.313 ms |
+| 8 | 396,114.739 row/s | 63.797 s | 4.925 ms |
+
+The 1→2→4 points scale by about 2x at each step. At the 8-lane 2M offered
+load, the local filesystem crossed a concurrent `fdatasync` saturation cliff;
+that point is a storage-limit observation, not a passing throughput result.
+The low registry-lock totals through four lanes show that the old global spool
+critical section is no longer the scaling boundary.
+
+These results qualify the replacement loopback transport gate only. They do
+not qualify MergeTree insertion, replication/quorum, server storage, or a
+remote network path; the real target ClickHouse rerun remains mandatory.
 
 ## 1. Result
 
@@ -53,7 +131,7 @@ maximum eviction watermark. A same-channel projected fact, hole fill, or
 `GapOpen` applies the pending seal first. `GapOpen` is never coalesced because
 the current FactJournal does not persist generation-specific gap controls.
 
-## 3. Selected configuration
+## 3. Historical measured configuration
 
 | Boundary | Selected value |
 | --- | ---: |
@@ -71,6 +149,11 @@ The 512-row computation cut is intentional. A measured 16,384-row cut reduced
 the same Event state workload to about 713k facts/s and raised projection-cut
 p99 to about 2.37 seconds. Larger logical cuts are therefore not assumed to be
 faster merely because they reduce batch count.
+
+The replacement production candidate, which has passed the fresh loopback gate
+above and still requires real-ClickHouse qualification, is 4,096 rows / 4 MiB per revision request,
+16,384 rows / 16 MiB per physical group, 256 logical batches, 50 ms maximum
+group delay, and 8 writer lanes. Request and group bounds are now independent.
 
 ## 4. Test host and placement
 
@@ -98,7 +181,7 @@ at both rates.
 
 ## 5. Callback and dispatch gate
 
-Command shape:
+Historical command shape:
 
 ```bash
 build-release/benchmark_mdl_ingest \
@@ -197,7 +280,7 @@ not parse rows into a ClickHouse table or execute MergeTree writes.
 | retry / unknown outcome | 0 / 0 | 0 / 0 |
 | status | PASS | PASS |
 
-The sink gate requires:
+The historical sink gate required:
 
 ```text
 durable rate >= 99% of target
@@ -221,7 +304,12 @@ five-second sample as a soak result.
 
 ## 8. Correctness regression
 
-The release build and all 40 registered tests passed. Focused Event tests cover:
+At the time of the historical run, the release build and its registered tests
+passed. The replacement implementation now also has focused fixtures for a
+32 x 512-row group producing four revision requests and one marker, complete
+RowBinary golden comparison, concurrent spool preparation, exact retry reuse,
+oversized logical batches, marker-before-cursor ordering, completion rejection,
+and zero final queue/spool accounting on success. Focused Event tests cover:
 
 - raw ACK first, disposition first, rejection settlement, and bounded ACK drain;
 - computation cuts that do not close owner persistence groups;

@@ -1,13 +1,15 @@
 #pragma once
 
-#include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/clickhouse/raw_consumer.h"
 #include "l2flow/kline/types.h"
+#include "l2flow/outbox/request_spool.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace l2flow::clickhouse {
 
@@ -33,11 +35,13 @@ struct KLineClickHouseConfig final {
     std::size_t queue_revision_batches = 1'024U;
     std::size_t queue_revision_rows = 1U * 1'024U * 1'024U;
 
+    outbox::RequestSpoolConfig request_spool;
+    outbox::ConsumerCompletionSink* completion_sink = nullptr;
+
     std::uint32_t connect_timeout_ms = 2'000U;
     std::uint32_t request_timeout_ms = 10'000U;
     std::uint32_t retry_initial_backoff_ms = 10U;
     std::uint32_t retry_max_backoff_ms = 1'000U;
-    std::uint32_t maximum_retry_elapsed_ms = 5'000U;
     std::uint32_t shutdown_timeout_ms = 30'000U;
 
     std::uint32_t insert_quorum = 0U;
@@ -49,6 +53,7 @@ struct KLineClickHouseConfig final {
 [[nodiscard]] bool ValidateKLineClickHouseConfig(
     const KLineClickHouseConfig& config,
     std::string* error) noexcept;
+[[nodiscard]] std::string KLineCurrentViewDdl(std::string_view database);
 
 struct KLineClickHouseLaneStats final {
     std::uint64_t queued_revision_batches = 0U;
@@ -88,6 +93,8 @@ struct KLineClickHouseStats final {
     std::uint64_t queued_revision_rows = 0U;
     std::uint64_t queued_revision_batches_high_water = 0U;
     std::uint64_t queued_revision_rows_high_water = 0U;
+    std::uint64_t request_spool_live_groups = 0U;
+    std::uint64_t request_spool_bytes = 0U;
     std::size_t writer_lanes = 0U;
     std::array<KLineClickHouseLaneStats, kMaximumKLineWriterLanes> lanes{};
 };

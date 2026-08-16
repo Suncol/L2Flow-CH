@@ -1,6 +1,6 @@
 #include "l2flow/event/worker.h"
 
-#include "l2flow/clickhouse/raw_sink.h"
+#include "l2flow/clickhouse/raw_consumer.h"
 #include "l2flow/ingest/engine.h"
 
 #include "event_exact_list.h"
@@ -28,6 +28,7 @@ namespace l2flow::event {
 namespace {
 
 using ingest::CanonicalTick;
+using outbox::WalPosition;
 
 struct ChannelKey final {
     std::uint32_t trade_date = 0U;
@@ -46,25 +47,6 @@ struct InstrumentChannelKey final {
 
     friend constexpr auto operator<=>(const InstrumentChannelKey&,
                                       const InstrumentChannelKey&) = default;
-};
-
-struct RawTickDependencyHash final {
-    [[nodiscard]] std::size_t operator()(
-        const RawTickDependency& dependency) const noexcept {
-        std::uint64_t value = dependency.ingress_sequence +
-            UINT64_C(0x9e3779b97f4a7c15);
-        value ^= value >> 30U;
-        value *= UINT64_C(0xbf58476d1ce4e5b9);
-        value ^= value >> 27U;
-        value *= UINT64_C(0x94d049bb133111eb);
-        value ^= value >> 31U;
-        value ^= static_cast<std::uint64_t>(dependency.kind) *
-            UINT64_C(0x517cc1b727220a95);
-        if constexpr (sizeof(std::size_t) < sizeof(std::uint64_t)) {
-            value ^= value >> 32U;
-        }
-        return static_cast<std::size_t>(value);
-    }
 };
 
 [[nodiscard]] std::uint64_t HashMix(std::uint64_t value) noexcept {
@@ -1508,7 +1490,6 @@ using ChannelFactTable = internal::LazyPagedHashMap<
 
 struct PendingCommit final {
     std::shared_ptr<const EventRevisionBatch> batch;
-    std::set<RawTickDependency> raw_dependencies;
     std::size_t owned_bytes = 0U;
     std::uint64_t queued_monotonic_ns = 0U;
 };
@@ -1545,9 +1526,9 @@ enum class PendingCutStage : std::uint8_t {
 
 struct PendingProjectionCut final {
     std::vector<FactKey> inserted;
-    std::vector<std::pair<FactKey, RawTickDependency>> inserted_dependencies;
+    std::vector<std::pair<FactKey, WalPosition>> inserted_positions;
     std::map<ChannelKey, std::uint64_t> retention_requests;
-    std::set<RawTickDependency> dependencies;
+    std::set<WalPosition> input_positions;
     std::vector<PhaseScanSpan> phase_spans;
     std::map<OrderKey, DirtyOrder> phase_dirty_orders;
     std::map<FactKey, bool> phase_dirty_bundles;
@@ -1598,7 +1579,7 @@ struct RepairTransaction final {
     std::set<OrderKey> ready_order_set;
     std::map<RoleCacheKey, RepairEvalPatch> eval_patch;
     std::map<FactKey, bool> dirty_bundles;
-    std::set<RawTickDependency> raw_dependencies;
+    std::set<WalPosition> input_positions;
     std::set<FactKey> inserted_facts;
     std::deque<EndExpansionTask> end_expansions;
     std::optional<OrderKey> next_order;
@@ -1624,7 +1605,7 @@ struct EvictionTask final {
         bytes,
         SaturatingMultiply(
             dependency_count,
-            TreeNodeOwnedBytes<RawTickDependency>()));
+            TreeNodeOwnedBytes<WalPosition>()));
     return bytes;
 }
 
@@ -1664,8 +1645,8 @@ struct EvictionTask final {
             TreeNodeOwnedBytes<std::pair<const FactKey, bool>>()));
     bytes = SaturatingAdd(
         bytes,
-        SaturatingMultiply(repair.raw_dependencies.size(),
-                           TreeNodeOwnedBytes<RawTickDependency>()));
+        SaturatingMultiply(repair.input_positions.size(),
+                           TreeNodeOwnedBytes<WalPosition>()));
     bytes = SaturatingAdd(
         bytes,
         SaturatingMultiply(repair.inserted_facts.size(),
@@ -1685,8 +1666,8 @@ struct EvictionTask final {
     bytes = SaturatingAdd(
         bytes,
         SaturatingMultiply(
-            cut.inserted_dependencies.capacity(),
-            sizeof(std::pair<FactKey, RawTickDependency>)));
+            cut.inserted_positions.capacity(),
+            sizeof(std::pair<FactKey, WalPosition>)));
     bytes = SaturatingAdd(
         bytes,
         SaturatingMultiply(cut.phase_spans.capacity(),
@@ -1703,8 +1684,8 @@ struct EvictionTask final {
                 std::pair<const ChannelKey, std::uint64_t>>()));
     bytes = SaturatingAdd(
         bytes,
-        SaturatingMultiply(cut.dependencies.size(),
-                           TreeNodeOwnedBytes<RawTickDependency>()));
+        SaturatingMultiply(cut.input_positions.size(),
+                           TreeNodeOwnedBytes<WalPosition>()));
     bytes = SaturatingAdd(
         bytes,
         SaturatingMultiply(
@@ -1768,8 +1749,7 @@ struct AtomicEventWorkerStats final {
     std::atomic<std::uint64_t> bundles_reassembled{0U};
     std::atomic<std::uint64_t> revisions_created{0U};
     std::atomic<std::uint64_t> tombstones_created{0U};
-    std::atomic<std::uint64_t> pending_raw_commits{0U};
-    std::atomic<std::uint64_t> acknowledged_raw_dependencies{0U};
+    std::atomic<std::uint64_t> pending_revision_commits{0U};
     std::atomic<std::uint64_t> revision_batches_submitted{0U};
     std::atomic<std::uint64_t> persistence_groups_submitted{0U};
     std::atomic<std::uint64_t> persistence_group_batches_max{0U};
@@ -1833,6 +1813,8 @@ struct AtomicEventWorkerStats final {
         (market == Market::kShanghai && tick.common.channel == 0U) ||
         tick.common.native_sequence == 0U ||
         tick.common.ingress_sequence == 0U ||
+        input.outbox_position.lsn == 0U ||
+        input.outbox_position.batch_sequence == 0U ||
         (market != Market::kShanghai && market != Market::kShenzhen) ||
         tick.common.instrument_ordinal == ingest::kInvalidInstrumentOrdinal ||
         tick.common.instrument_ordinal % config.owner_count != config.owner) {
@@ -2148,11 +2130,6 @@ public:
           order_histories_(config_.maximum_carry_orders),
           channel_facts_(config_.maximum_hot_facts),
           order_history_bytes_(order_histories_.directory_owned_bytes()) {
-        // Reserve the complete bounded ACK index up front.  This keeps the
-        // owner hot path free of rehash pauses while preserving the explicit
-        // in-memory capacity/fail-closed contract.
-        acknowledged_raw_.reserve(
-            config_.maximum_acknowledged_raw_dependencies);
         const auto reserve_bounded = [](auto* table, std::size_t limit) {
             constexpr std::size_t kMaximumInitialBuckets = 65'536U;
             table->max_load_factor(0.80F);
@@ -2206,7 +2183,7 @@ public:
             result.code = EventApplyCode::kDuplicateOnly;
             return result;
         }
-        if (!AdvanceDurableCommits()) {
+        if (!AdvanceRevisionCommits()) {
             result.code = EventApplyCode::kSinkFailed;
             return result;
         }
@@ -2272,14 +2249,14 @@ public:
             batch_tick_cache_.clear();
             std::vector<FactKey> inserted;
             inserted.reserve(inputs.size());
-            std::vector<std::pair<FactKey, RawTickDependency>>
-                inserted_dependencies;
-            inserted_dependencies.reserve(inputs.size());
+            std::vector<std::pair<FactKey, WalPosition>>
+                inserted_positions;
+            inserted_positions.reserve(inputs.size());
             std::vector<CanonicalTick> journal_ticks;
             journal_ticks.reserve(inputs.size());
             std::map<ChannelKey, std::uint64_t> cut_frontiers;
             std::map<ChannelKey, std::uint64_t> retention_requests;
-            std::set<RawTickDependency> dependencies;
+            std::set<WalPosition> input_positions;
             bool saw_conflict = false;
             bool saw_invalid = false;
             bool source_only_candidate = order_histories_.empty();
@@ -2319,9 +2296,7 @@ public:
 
             std::size_t admission_index = 0U;
             for (const EventInput& input : inputs) {
-                dependencies.insert(RawTickDependency{
-                    input.tick.common.ingress_sequence,
-                    input.tick.common.kind});
+                input_positions.insert(input.outbox_position);
                 const FactKey key = MakeFactKey(input.tick);
                 const ChannelKey channel{
                     key.trade_date, key.market, key.channel};
@@ -2428,10 +2403,8 @@ public:
                     return result;
                 }
                 inserted.push_back(key);
-                inserted_dependencies.emplace_back(
-                    key, RawTickDependency{
-                        input.tick.common.ingress_sequence,
-                        input.tick.common.kind});
+                inserted_positions.emplace_back(
+                    key, input.outbox_position);
                 if (!InsertInstrumentFactIndex(
                         instrument_range, key.native_sequence, &result)) {
                     return result;
@@ -2454,12 +2427,12 @@ public:
             }
 
             if (inserted.empty()) {
-                if (!QueueNoopDependencies(std::move(dependencies))) {
+                if (!CompleteNoopInputs(std::move(input_positions))) {
                     return CapacityFailure(
                         &result,
-                        "Event pending revision byte capacity exhausted");
+                        "Event cursor rejected completed no-op inputs");
                 }
-                static_cast<void>(AdvanceDurableCommits());
+                static_cast<void>(AdvanceRevisionCommits());
                 for (const auto& [channel, floor] : retention_requests) {
                     QueueEviction(channel, floor);
                 }
@@ -2479,8 +2452,8 @@ public:
             } else {
                 std::sort(inserted.begin(), inserted.end());
                 std::sort(
-                    inserted_dependencies.begin(),
-                    inserted_dependencies.end(),
+                    inserted_positions.begin(),
+                    inserted_positions.end(),
                     [](const auto& left, const auto& right) {
                         return left.first < right.first;
                     });
@@ -2498,9 +2471,9 @@ public:
             }
             PendingProjectionCut cut{};
             cut.inserted = std::move(inserted);
-            cut.inserted_dependencies = std::move(inserted_dependencies);
+            cut.inserted_positions = std::move(inserted_positions);
             cut.retention_requests = std::move(retention_requests);
-            cut.dependencies = std::move(dependencies);
+            cut.input_positions = std::move(input_positions);
             cut.source_only_fast = source_only_fast;
             cut.saw_conflict = saw_conflict;
             cut.saw_invalid = saw_invalid;
@@ -2861,51 +2834,12 @@ public:
         return AdvanceRepairSlice(nullptr);
     }
 
-    void AcknowledgeRawTicks(
-        std::span<const RawTickDependency> dependencies) noexcept {
-        if (!healthy_) {
-            return;
-        }
-        try {
-            for (const RawTickDependency& dependency : dependencies) {
-                if (acknowledged_raw_.contains(dependency)) {
-                    continue;
-                }
-                if (acknowledged_raw_.size() >=
-                    config_.maximum_acknowledged_raw_dependencies) {
-                    SetFatal("Event raw ACK index capacity exhausted");
-                    return;
-                }
-                acknowledged_raw_.insert(dependency);
-            }
-            stats_.acknowledged_raw_dependencies.store(
-                acknowledged_raw_.size(), std::memory_order_relaxed);
-        } catch (...) {
-            SetFatal("Event raw ACK index allocation failed");
-        }
-    }
-
-    [[nodiscard]] bool PendingCommitDurable(
-        const PendingCommit& commit) const noexcept {
-        return std::all_of(
-            commit.raw_dependencies.begin(),
-            commit.raw_dependencies.end(),
-            [this](const RawTickDependency& dependency) {
-                return acknowledged_raw_.contains(dependency);
-            });
-    }
-
     [[nodiscard]] bool ReleaseFrontPendingCommit() noexcept {
         if (pending_commits_.empty()) {
             SetFatal("Event pending commit release underflow");
             return false;
         }
         PendingCommit& commit = pending_commits_.front();
-        for (const RawTickDependency& dependency : commit.raw_dependencies) {
-            acknowledged_raw_.erase(dependency);
-        }
-        stats_.acknowledged_raw_dependencies.store(
-            acknowledged_raw_.size(), std::memory_order_relaxed);
         const std::size_t old_queue =
             DequeOwnedBytes<PendingCommit>(pending_commits_.size());
         const std::size_t new_queue = DequeOwnedBytes<PendingCommit>(
@@ -2922,7 +2856,7 @@ public:
         }
         pending_revision_bytes_ -= released_bytes;
         pending_commits_.pop_front();
-        stats_.pending_raw_commits.store(
+        stats_.pending_revision_commits.store(
             pending_commits_.size(), std::memory_order_relaxed);
         PublishPendingRevisionBytes();
         return true;
@@ -2935,9 +2869,6 @@ public:
         try {
             while (!pending_commits_.empty()) {
                 PendingCommit& front = pending_commits_.front();
-                if (!PendingCommitDurable(front)) {
-                    return true;
-                }
                 if (front.batch->revisions.empty()) {
                     if (!ReleaseFrontPendingCommit()) {
                         return false;
@@ -2950,9 +2881,6 @@ public:
                 std::size_t byte_count = 0U;
                 bool closed = false;
                 for (const PendingCommit& commit : pending_commits_) {
-                    if (!PendingCommitDurable(commit)) {
-                        break;
-                    }
                     if (commit.batch->revisions.empty()) {
                         closed = true;
                         break;
@@ -3039,11 +2967,11 @@ public:
         }
     }
 
-    [[nodiscard]] bool AdvanceDurableCommits() noexcept {
+    [[nodiscard]] bool AdvanceRevisionCommits() noexcept {
         return ServiceDurableCommits(false);
     }
 
-    [[nodiscard]] bool FlushDurableCommits() noexcept {
+    [[nodiscard]] bool FlushRevisionCommits() noexcept {
         return ServiceDurableCommits(true);
     }
 
@@ -3143,10 +3071,8 @@ public:
             std::memory_order_relaxed);
         result.tombstones_created = stats_.tombstones_created.load(
             std::memory_order_relaxed);
-        result.pending_raw_commits = stats_.pending_raw_commits.load(
-            std::memory_order_relaxed);
-        result.acknowledged_raw_dependencies =
-            stats_.acknowledged_raw_dependencies.load(
+        result.pending_revision_commits =
+            stats_.pending_revision_commits.load(
                 std::memory_order_relaxed);
         result.revision_batches_submitted =
             stats_.revision_batches_submitted.load(
@@ -3787,48 +3713,53 @@ private:
     }
 
     [[nodiscard]] bool QueuePendingCommit(
-        std::shared_ptr<const EventRevisionBatch> batch,
-        std::set<RawTickDependency> dependencies) {
+        std::shared_ptr<EventRevisionBatch> batch,
+        std::set<WalPosition> input_positions) {
         if (batch == nullptr) {
             SetFatal("Event pending revision batch is null");
             return false;
         }
-        if (batch->revisions.empty() && dependencies.empty()) {
-            return true;
+        if (batch->revisions.empty()) {
+            return CompleteNoopInputs(std::move(input_positions));
+        }
+        if (input_positions.empty()) {
+            SetFatal("Event revision batch has no durable outbox inputs");
+            return false;
         }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
             SetFatal("Event pending raw commit capacity exhausted");
             return false;
         }
         const std::size_t payload_bytes = PendingCommitPayloadOwnedBytes(
-            batch->revisions.capacity(), dependencies.size());
+            batch->revisions.capacity(), input_positions.size());
         const std::size_t additional_bytes = PendingCommitAdditionalBytes(
-            batch->revisions.capacity(), dependencies.size());
+            batch->revisions.capacity(), input_positions.size());
         if (additional_bytes > config_.maximum_pending_revision_bytes ||
             pending_revision_bytes_ >
                 config_.maximum_pending_revision_bytes - additional_bytes) {
             SetFatal("Event pending revision byte capacity exhausted");
             return false;
         }
+        batch->input_positions.assign(
+            input_positions.begin(), input_positions.end());
         pending_commits_.push_back(PendingCommit{
-            std::move(batch), std::move(dependencies), payload_bytes,
-            ingest::MonotonicNowNs()});
+            std::move(batch), payload_bytes, ingest::MonotonicNowNs()});
         pending_revision_bytes_ += additional_bytes;
-        stats_.pending_raw_commits.store(
+        stats_.pending_revision_commits.store(
             pending_commits_.size(), std::memory_order_relaxed);
         PublishPendingRevisionBytes();
         return true;
     }
 
-    [[nodiscard]] bool QueueNoopDependencies(
-        std::set<RawTickDependency> dependencies) {
-        if (dependencies.empty()) {
+    [[nodiscard]] bool CompleteNoopInputs(
+        std::set<WalPosition> input_positions) {
+        if (input_positions.empty()) {
             return true;
         }
-        auto empty = std::make_shared<EventRevisionBatch>();
-        empty->calculation_run_id = config_.calculation_run_id;
-        empty->owner = config_.owner;
-        return QueuePendingCommit(std::move(empty), std::move(dependencies));
+        std::vector<WalPosition> ordered(
+            input_positions.begin(), input_positions.end());
+        return config_.completion_sink->Complete(
+            outbox::ConsumerKind::kEvent, ordered);
     }
 
     [[nodiscard]] EventApplyResult CapacityFailure(
@@ -4353,7 +4284,7 @@ private:
         const std::map<FactKey, bool>& dirty_bundles,
         std::span<const FactKey> inserted,
         std::span<const EndExpansionTask> end_expansions,
-        std::set<RawTickDependency> dependencies,
+        std::set<WalPosition> input_positions,
         EventApplyResult* result) {
         const RepairTransaction* const current = active_repair_.has_value()
             ? &*active_repair_
@@ -4372,10 +4303,10 @@ private:
                 projected_bytes, SaturatingMultiply(count, bytes));
         };
 
-        for (const RawTickDependency& dependency : dependencies) {
+        for (const WalPosition position : input_positions) {
             if (current == nullptr ||
-                !current->raw_dependencies.contains(dependency)) {
-                add_nodes(1U, TreeNodeOwnedBytes<RawTickDependency>());
+                !current->input_positions.contains(position)) {
+                add_nodes(1U, TreeNodeOwnedBytes<WalPosition>());
             }
         }
         for (const FactKey& key : inserted) {
@@ -4487,8 +4418,8 @@ private:
         }
         stats_.repair_pending.store(true, std::memory_order_release);
         RepairTransaction& repair = *active_repair_;
-        repair.raw_dependencies.insert(dependencies.begin(),
-                                       dependencies.end());
+        repair.input_positions.insert(input_positions.begin(),
+                                      input_positions.end());
         repair.inserted_facts.insert(inserted.begin(), inserted.end());
         for (const auto& [key, late] : dirty_bundles) {
             auto [position, was_inserted] =
@@ -5011,7 +4942,7 @@ private:
         RepairTransaction* repair_overlay,
         std::map<FactKey, bool>* dirty_bundles,
         std::span<const FactKey> inserted,
-        std::set<RawTickDependency> dependencies,
+        std::set<WalPosition> input_positions,
         bool repair_commit,
         EventApplyResult* result) {
         if ((live_eval_patch == nullptr) == (repair_overlay == nullptr)) {
@@ -5025,7 +4956,7 @@ private:
         }
         if (pending_commits_.size() >= config_.maximum_pending_commits) {
             static_cast<void>(CapacityFailure(
-                result, "Event pending raw commit capacity exhausted"));
+                result, "Event pending revision commit capacity exhausted"));
             return false;
         }
 
@@ -5080,7 +5011,7 @@ private:
                     bundle));
         }
         const std::size_t pending_owned_bytes = PendingCommitAdditionalBytes(
-            pending_revision_count, dependencies.size());
+            pending_revision_count, input_positions.size());
         if (pending_owned_bytes > config_.maximum_pending_revision_bytes ||
             pending_revision_bytes_ >
                 config_.maximum_pending_revision_bytes -
@@ -5224,7 +5155,7 @@ private:
         const std::size_t revision_count =
             revision_batch->revisions.size();
         if (!QueuePendingCommit(
-                std::move(revision_batch), std::move(dependencies))) {
+                std::move(revision_batch), std::move(input_positions))) {
             static_cast<void>(CapacityFailure(
                 result, "Event pending revision byte capacity exhausted"));
             return false;
@@ -5262,7 +5193,7 @@ private:
         if (!CommitProjection(
                 touched_orders, nullptr, &repair,
                 &repair.dirty_bundles, inserted,
-                std::move(repair.raw_dependencies), true, result)) {
+                std::move(repair.input_positions), true, result)) {
             return false;
         }
         active_repair_.reset();
@@ -5283,7 +5214,7 @@ private:
             result->code = EventApplyCode::kFailed;
             return false;
         }
-        if (!AdvanceDurableCommits()) {
+        if (!AdvanceRevisionCommits()) {
             result->code = EventApplyCode::kSinkFailed;
             return false;
         }
@@ -5351,7 +5282,7 @@ private:
                         return false;
                     }
                     result->repair_pending = false;
-                    return AdvanceDurableCommits();
+                    return AdvanceRevisionCommits();
                 }
 
                 bool processed_use = false;
@@ -6067,14 +5998,14 @@ private:
             SaturatingMultiply(
                 maximum_live_evals,
                 TreeNodeOwnedBytes<std::pair<const FactKey, bool>>()));
-        // Dependency classification copies at most one node per inserted fact
-        // plus every cut dependency. The deliberate over-count also covers a
-        // malformed duplicate dependency until its consistency check fails.
+        // Input-position classification copies at most one node per inserted
+        // fact plus every cut position.
         bytes = SaturatingAdd(
             bytes,
             SaturatingMultiply(
-                SaturatingAdd(cut.inserted.size(), cut.dependencies.size()),
-                TreeNodeOwnedBytes<RawTickDependency>()));
+                SaturatingAdd(cut.inserted.size(),
+                              cut.input_positions.size()),
+                TreeNodeOwnedBytes<WalPosition>()));
         return ReservePendingProjectionGrowth(bytes, result);
     }
 
@@ -6128,45 +6059,45 @@ private:
                 .push_back(key);
         }
 
-        std::set<RawTickDependency> repair_dependencies;
-        std::set<RawTickDependency> live_dependencies;
-        const auto add_fact_dependency = [&cut](
+        std::set<WalPosition> repair_positions;
+        std::set<WalPosition> live_positions;
+        const auto add_fact_position = [&cut](
             const FactKey& key,
-            std::set<RawTickDependency>* output) -> bool {
-            const auto dependency = std::lower_bound(
-                cut.inserted_dependencies.begin(),
-                cut.inserted_dependencies.end(), key,
+            std::set<WalPosition>* output) -> bool {
+            const auto position = std::lower_bound(
+                cut.inserted_positions.begin(),
+                cut.inserted_positions.end(), key,
                 [](const auto& entry, const FactKey& value) {
                     return entry.first < value;
                 });
-            if (dependency == cut.inserted_dependencies.end() ||
-                dependency->first != key) {
+            if (position == cut.inserted_positions.end() ||
+                position->first != key) {
                 return false;
             }
-            output->insert(dependency->second);
+            output->insert(position->second);
             return true;
         };
         for (const FactKey& key : repair_inserted) {
-            if (!add_fact_dependency(key, &repair_dependencies)) {
+            if (!add_fact_position(key, &repair_positions)) {
                 static_cast<void>(Failure(
-                    result, "Event raw dependency fact read failed"));
+                    result, "Event outbox position fact read failed"));
                 return false;
             }
         }
         for (const FactKey& key : live_inserted) {
-            if (!add_fact_dependency(key, &live_dependencies)) {
+            if (!add_fact_position(key, &live_positions)) {
                 static_cast<void>(Failure(
-                    result, "Event raw dependency fact read failed"));
+                    result, "Event outbox position fact read failed"));
                 return false;
             }
         }
-        for (const RawTickDependency& dependency : cut.dependencies) {
-            if (!repair_dependencies.contains(dependency) &&
-                !live_dependencies.contains(dependency)) {
+        for (const WalPosition position : cut.input_positions) {
+            if (!repair_positions.contains(position) &&
+                !live_positions.contains(position)) {
                 (!live_inserted.empty()
-                     ? live_dependencies
-                     : repair_dependencies)
-                    .insert(dependency);
+                     ? live_positions
+                     : repair_positions)
+                    .insert(position);
             }
         }
 
@@ -6178,7 +6109,7 @@ private:
             !MergeRepair(
                 repair_dirty_orders, repair_dirty_bundles,
                 repair_inserted, end_expansions,
-                std::move(repair_dependencies), result)) {
+                std::move(repair_positions), result)) {
             if (healthy_) {
                 static_cast<void>(Failure(
                     result, "Event repair transaction merge failed"));
@@ -6203,14 +6134,14 @@ private:
             if (!CommitProjection(
                     touched_orders, &eval_patch, nullptr,
                     &live_dirty_bundles, live_inserted,
-                    std::move(live_dependencies), false, result)) {
+                    std::move(live_positions), false, result)) {
                 return false;
             }
-        } else if (!live_dependencies.empty()) {
-            if (!QueueNoopDependencies(std::move(live_dependencies))) {
+        } else if (!live_positions.empty()) {
+            if (!CompleteNoopInputs(std::move(live_positions))) {
                 static_cast<void>(CapacityFailure(
                     result,
-                    "Event pending revision byte capacity exhausted"));
+                    "Event cursor rejected completed no-op inputs"));
                 return false;
             }
         }
@@ -6218,7 +6149,7 @@ private:
             ? EventApplyCode::kSourceConflict
             : (cut.saw_invalid ? EventApplyCode::kInvalidInput
                                : EventApplyCode::kApplied);
-        if (!AdvanceDurableCommits()) {
+        if (!AdvanceRevisionCommits()) {
             result->code = EventApplyCode::kSinkFailed;
             return false;
         }
@@ -6976,8 +6907,6 @@ private:
     std::map<ChannelKey, EvictionTask> eviction_tasks_;
     std::deque<ChannelKey> eviction_ready_;
     std::set<ChannelKey> eviction_ready_set_;
-    std::unordered_set<RawTickDependency, RawTickDependencyHash>
-        acknowledged_raw_;
     std::deque<PendingCommit> pending_commits_;
     std::optional<RepairTransaction> active_repair_;
     std::optional<PendingProjectionCut> pending_projection_cut_;
@@ -7023,7 +6952,7 @@ bool ValidateEventWorkerConfig(const EventWorkerConfig& config,
         config.maximum_cached_events == 0U ||
         config.maximum_pending_commits == 0U ||
         config.maximum_pending_revision_bytes == 0U ||
-        config.maximum_acknowledged_raw_dependencies == 0U ||
+        config.completion_sink == nullptr ||
         config.persistence_group_max_batches == 0U ||
         config.persistence_group_max_rows == 0U ||
         config.persistence_group_max_bytes == 0U ||
@@ -7145,17 +7074,12 @@ bool EventWorker::AdvanceRepair() noexcept {
     return impl_->AdvanceRepair();
 }
 
-void EventWorker::AcknowledgeRawTicks(
-    std::span<const RawTickDependency> dependencies) noexcept {
-    impl_->AcknowledgeRawTicks(dependencies);
+bool EventWorker::AdvanceRevisionCommits() noexcept {
+    return impl_->AdvanceRevisionCommits();
 }
 
-bool EventWorker::AdvanceDurableCommits() noexcept {
-    return impl_->AdvanceDurableCommits();
-}
-
-bool EventWorker::FlushDurableCommits() noexcept {
-    return impl_->FlushDurableCommits();
+bool EventWorker::FlushRevisionCommits() noexcept {
+    return impl_->FlushRevisionCommits();
 }
 
 bool EventWorker::repair_pending() const noexcept {

@@ -1,58 +1,109 @@
 # L2Flow-CH `mdl_ingestd`
 
-This repository implements the first realtime market-data process boundary:
+`mdl_ingestd` decodes MDL market data into one run-scoped local canonical WAL.
+Raw ClickHouse, Event, and KLine are independent consumers of that durable
+record order:
 
 ```text
-MDL SDK callback
-  -> bounded minimal admission
-  -> channel/instrument-sharded decoder lanes
-  -> decode-complete raw tap -> preallocated canonical batches
-       -> ClickHouse writer threads -> raw_tick/raw_snapshot MergeTree
-  -> first-wins channel sequence recovery + exact hole ledger
-  -> per-owner FIFO of fixed-width TickDispatch records
-       -> ordered/hole-fill projection or rejected-occurrence settlement
-       -> GapOpen/ChannelSeal owner fences
-       -> bounded raw-ACK/disposition join
-            -> gap-driven Event retention + order baseline compaction
-            -> Event revision log/current ClickHouse tables
-            -> owner-local exchange-time KLine projection
-            -> KLine revision log/current ClickHouse tables
-       -> projectable ticks in per-owner Arrow rings
-  -> snapshot owner queues -> per-owner Arrow snapshot rings
+MDL callback -> bounded decoder lanes -> SequenceRecovery
+                                      -> canonical/disposition WAL
+                                           |-> raw cursor -> raw ClickHouse
+                                           |-> Event cursor -> Event revisions
+                                           `-> KLine cursor -> KLine revisions
 ```
 
-`raw_tick` and `raw_snapshot` are the first durable ClickHouse boundary in this
-repository. The raw tap runs after complete decode/normalization and before
-SequenceRecovery, duplicate/conflict handling, and catalog-miss suppression.
-The shared-memory Arrow branch remains an independent bounded volatile hot
-path. `SequenceRecovery` classifies every catalog-resolved occurrence exactly
-once as ordered, an accepted hole fill, or rejected. It sends that disposition
-and `GapOpen`/`ChannelSeal` controls through the same decoder-lane-to-owner FIFO;
-there is no second recovery queue. The Event and KLine runtimes join each
-disposition with its independently arriving `raw_tick` ACK. Event applies the
-gap/seal controls as retention fences; KLine validates the controls but does
-not reclaim bar state from them. Rejected occurrences settle in the bounded
-joins and never enter either worker or the FactJournal. Projectable occurrences
-may be calculated before raw durability, but immutable revision batches cannot
-enter a derived sink until their raw dependencies are acknowledged.
+The WAL committer assigns a global LSN and makes a batch visible only after
+`fdatasync`. It stores the source identity, feed epoch, batch identity, row
+count, checksums, original decoded fact, final recovery disposition/control,
+and exact `(lsn, batch_sequence, row_index)` positions. Consumer completion may
+arrive out of order, but a cursor advances only across the largest gap-free WAL
+prefix. Durable payloads are decoded from their segment on cache miss; only a
+configured number of decoded batches remains cached, so consumer lag does not
+retain every canonical record in RAM. `ingress_sequence` is never used as a
+global checkpoint.
 
-Event retains only the suffix required by open holes, compacts closed order
-uses into full private-state baselines, and processes repair, Shanghai END
-candidate attachment, and eviction in bounded slices. Final Bundle diff and
-`CommitProjection` remain one-shot. Carry orders and the channel, instrument,
-phase, and barrier outer indexes use fixed-directory lazy-paged hash tables;
-order range indexes use exactly accounted arrays. Fact, Bundle, and head maps
-remain standard C++ node containers. There is no per-channel hot-fact
-page/slab allocator or `madvise`/`unmap` path, so logical release does not
-guarantee that the allocator returns capacity to the OS. KLine bars and the
-shared FactJournal have independent lifetime/capacity contracts. Cold
-derived-state bootstrap and historical restart reconciliation remain outside
-this milestone. The supported startup modes are `from-open` and `partial`.
+Raw ClickHouse ACK no longer invokes or waits for Event/KLine. A slow or
+unavailable derived sink pins only its own cursor. The shared WAL is bounded;
+if its storage or admission capacity is exhausted, the process enters
+`FATAL_CONTINUITY`.
+
+## Continuity and current-query contract
+
+The process first fences every decoder lane, then writes a barrier into the WAL
+and publishes exact raw/Event/KLine cursors to `derived_freshness_log`. The
+fence waits for all inputs admitted before its cut to reach a final recovery or
+decode outcome; later inputs may continue concurrently. The WAL committer
+records the latest barrier only after its batch sync succeeds, so authority
+cannot skip older decoder work and closes even when every downstream consumer
+is blocked before reading that barrier.
+ClickHouse generates both lease timestamps from its own `now64(9)` value in
+the freshness `INSERT SELECT`; application wall-clock skew cannot lengthen or
+prematurely expire current-query authority.
+The states are:
+
+- `NORMAL`: enabled consumers have crossed the latest barrier.
+- `DERIVED_CATCHUP`: Event or KLine is behind, or has only recently become
+  unavailable.
+- `RAW_ONLY_STALE`: a derived cursor has stopped progressing, or its sink has
+  remained unavailable past `--derived-stale-after-ns`.
+- `RAW_CATCHUP`: the raw ClickHouse cursor is behind while the canonical WAL
+  remains healthy.
+- `FATAL_CONTINUITY`: the canonical WAL can no longer provide its durability
+  boundary.
+
+`event` and `kline` are fail-closed views, not `ReplacingMergeTree` current
+tables. A view returns rows only when exactly one calculation run has an
+authoritative, unexpired latest freshness lease; overlapping active runs close
+the view instead of mixing revisions. Each recovery marker stores
+the maximum causal WAL position of its batch; the view excludes markers beyond
+the published domain cursor before selecting the latest revision and filtering
+tombstones. Thus out-of-order owners cannot expose a partially completed prefix
+as authoritative current.
+
+An empty current view can mean either no business rows or a closed freshness
+gate. Query services must inspect `derived_freshness_log` and surface stale or
+unavailable status rather than silently interpreting both cases as the same
+answer.
+
+The schema files are:
+
+- [raw_tables.sql](clickhouse/schema/raw_tables.sql)
+- [event_tables.sql](clickhouse/schema/event_tables.sql)
+- [kline_tables.sql](clickhouse/schema/kline_tables.sql)
+- Keeper-backed variants under the same directory with `_replicated` suffixes.
+
+This is a replacement schema. An installation containing the old
+`event_current_mv`/`kline_current_mv` or current `ReplacingMergeTree` tables
+must receive an explicit offline migration; startup probes reject that layout
+instead of running a compatibility path.
+
+## Run-scoped durability boundary
+
+The canonical WAL creates a new `O_EXCL` run directory and does not reopen an
+old run. This matches the deployment assumption that another source can replay
+the feed after a process crash. The WAL is nevertheless the durable handoff
+inside a live run: no consumer can observe a record before its batch is synced,
+and lagging consumers retain WAL segments.
+
+Event and KLine also create a run-scoped request spool beneath the WAL run
+directory. Before the first HTTP send, a physical group is serialized and
+synced with its exact input positions, revision/marker RowBinary bytes, row
+counts, payload checksums, query IDs, deduplication tokens, and initial state.
+Live request states are updated in place. They are not individually synced,
+because this implementation deliberately does not resume request state after a
+process crash; the canonical WAL and external source recovery are the recovery
+boundaries.
+
+This adds one batched WAL sync before all consumers and one request-spool sync
+before each derived physical group. It can increase Event/KLine persistence
+latency, but it is not on the raw ClickHouse ACK path. Tune WAL commit size and
+delay, derived physical-group size, and storage placement together; do not
+remove the pre-send spool sync while relying on it as the live-run handoff.
 
 ## Build and test
 
-The default SDK include path points at the sibling reference checkout. It can
-be overridden with `-DL2FLOW_CH_SDK_INCLUDE_DIR=/path/to/include`.
+The default SDK include path points to the sibling MDL SDK checkout. Override
+it with `-DL2FLOW_CH_SDK_INCLUDE_DIR=/path/to/include` when needed.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -60,475 +111,104 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-## Python environment
-
-The shared-memory reader and local ClickHouse/Redis clients use one uv-managed
-Python 3.13 environment under `python/.venv`. Its Arrow major is pinned to the
-C++ build:
+Apache Arrow 25 and libcurl are required by the default build. A core-only
+build is useful when those development packages are unavailable:
 
 ```bash
-uv sync --project python --locked
-uv run --project python --locked python -c \
-  'import pyarrow, clickhouse_connect, redis, polars; print(pyarrow.__version__)'
-```
-
-Use `python/uv.lock` as the dependency source of truth; do not maintain a
-second `requirements.txt` or install packages into the environment with `pip`.
-
-The read-only MDL feeder Redis latest-value API, its Polars parsing and strict
-optional numeric view, and runnable query examples are documented in
-[python/README.md](python/README.md).
-
-## Local ClickHouse
-
-The repository-local single-binary ClickHouse test instance is documented in
-[clickhouse-test/README.md](clickhouse-test/README.md). It binds only to
-localhost, keeps all runtime state under `clickhouse-test/`, and includes
-lifecycle, MergeTree smoke-test, restart-persistence, and Python client tools.
-The raw table DDL is in [clickhouse/schema/raw_tables.sql](clickhouse/schema/raw_tables.sql)
-for a local node and
-[clickhouse/schema/raw_tables_replicated.sql](clickhouse/schema/raw_tables_replicated.sql)
-for a Keeper-backed deployment. Event revision/current DDL is in
-[clickhouse/schema/event_tables.sql](clickhouse/schema/event_tables.sql) and
-[clickhouse/schema/event_tables_replicated.sql](clickhouse/schema/event_tables_replicated.sql).
-KLine revision/current DDL is in
-[clickhouse/schema/kline_tables.sql](clickhouse/schema/kline_tables.sql) and
-[clickhouse/schema/kline_tables_replicated.sql](clickhouse/schema/kline_tables_replicated.sql).
-
-Run the C++ raw writer integration test against that local instance with:
-
-```bash
-./clickhouse-test/start.sh
-L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
-  ./build/test_clickhouse_raw
-L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
-  ./build/test_clickhouse_event
-L2FLOW_CH_TEST_URL=http://127.0.0.1:8123 \
-  ./build/test_clickhouse_kline
-```
-
-Optional checks:
-
-```bash
-cmake -S . -B build-asan \
-  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DL2FLOW_CH_ENABLE_ASAN_UBSAN=ON \
+cmake -S . -B build-core \
+  -DL2FLOW_CH_ENABLE_ARROW_RING=OFF \
+  -DL2FLOW_CH_ENABLE_CLICKHOUSE_RAW=OFF \
   -DL2FLOW_CH_BUILD_BENCHMARKS=OFF
-cmake --build build-asan -j
-ASAN_OPTIONS=detect_leaks=0 ./build-asan/test_mdl_ingest
+cmake --build build-core -j
+ctest --test-dir build-core --output-on-failure
 ```
 
-Leak detection is disabled in the example only because LeakSanitizer cannot
-run under the ptrace-based Codex environment; it should be enabled in normal
-CI.
+The new architecture is covered by `canonical_outbox` and
+`consumer_contracts`. The KLine loopback smoke additionally verifies exact
+marker/cursor completion through the durable request spool.
 
-## Stream selection
+## Configuration
 
-Stream selection is configuration-driven. By default `mdl_ingestd` reads
-`config/production.streams.conf`, which selects the five implemented L2
-message families used for Shanghai/Shenzhen A-share processing.
-`--stream-config FILE` overrides that path. The file contains one exact tuple
-per line; blank lines and full-line comments are accepted:
+Every run requires one nonzero shared feed epoch and a WAL root:
 
 ```text
-4.101.4
-4.101.24
-6.101.28
-6.101.33
-6.101.36
+--mode partial
+--trade-date 20260814
+--catalog config/catalog.example.csv
+--feed-epoch <new nonzero epoch>
+--outbox-dir /local-nvme/l2flow/canonical-outbox
 ```
 
-Only tuples with a decoder in this build are accepted. The example is
-[config/production.streams.conf](config/production.streams.conf). There is no
-tuple-specific hard-fail branch: an unconfigured tuple is not subscribed, a
-configured-but-unimplemented tuple is rejected during configuration, and an
-unexpected runtime tuple is reported as `unsupported_message`.
+Important WAL bounds are:
 
-For live deployments and Arrow-ring tests that must exclude snapshots, use
-[`config/live-ticks.streams.conf`](config/live-ticks.streams.conf). It subscribes
-only to Shanghai Tick plus Shenzhen Order and Transaction. The Arrow manifest
-still contains empty Snapshot rings as part of protocol v2's fixed ring set;
-`python/live_ring_probe.py` drains every Tick owner concurrently and fails if
-any Snapshot row is published.
+```text
+--outbox-producer-queue-records 65536
+--outbox-commit-batch-records 256
+--outbox-commit-batch-bytes 4194304
+--outbox-commit-max-delay-ns 500000
+--outbox-segment-max-bytes 268435456
+--outbox-maximum-reservoir-bytes 34359738368
+--outbox-read-cache-batches 8
+--derived-stale-after-ns 30000000000
+```
 
-This tuple selection controls message families, not the security universe
-inside a vendor stream. The exact A-share universe is the supplied daily
-instrument catalog: messages for identities absent from that catalog are not
-dispatched. Therefore the implementation does not claim that a tuple-level
-SDK subscription suppresses every non-A-share packet at the network edge.
-Production launch units should pass an absolute `--stream-config` path rather
-than depend on their working directory.
+Enable raw ClickHouse with `--clickhouse-url`. Event/KLine require that raw
+output plus their shared process-lifetime FactJournal, independent revision
+epochs, and unique calculation run IDs:
 
-## Validate a configuration
+```text
+--clickhouse-url http://127.0.0.1:8123
+--clickhouse-source-instance-id <stable 32-hex source ID>
+--fact-journal-path /local-nvme/l2flow/facts-current.fjn
+
+--event-enable
+--event-revision-epoch <new nonzero UInt32>
+--event-calculation-run-id <new 32-hex ID>
+
+--kline-enable
+--kline-interval-seconds 1
+--kline-revision-epoch <new nonzero UInt32>
+--kline-calculation-run-id <new 32-hex ID>
+```
+
+Use a new feed epoch and new calculation run IDs for external recovery. A
+calculation run ID must not be reused across sources or feed epochs because it
+is the query-gate identity.
+
+The checked-in host profile is
+[current-server.production.conf](config/current-server.production.conf); its
+environment template is
+[current-server.production.env.example](config/current-server.production.env.example).
+Validate it before loading the SDK:
 
 ```bash
 ./build/mdl_ingestd \
-  --mode partial \
-  --trade-date 20260806 \
-  --catalog config/catalog.example.csv \
-  --validate-only
-```
-
-The executable also accepts a strict response file through `--config FILE`.
-Each nonempty line is one `--long-option` followed by its complete value;
-comments must occupy a complete line. Each `${NAME}` reference expands one
-nonempty environment variable. There is no shell evaluation, recursive expansion,
-inline comment, or quote processing. A missing/malformed environment reference
-and a nested `--config` fail with a `file:line` diagnostic.
-
-Configuration-file arguments are parsed before ordinary command-line
-arguments, regardless of where `--config` appears. A scalar CLI option
-therefore overrides the file. Repeatable options append instead; in particular,
-an additional CLI `--kline-interval-seconds` adds an interval before startup
-sorts and deduplicates the list.
-
-## Current-server production profile
-
-[`config/current-server.production.conf`](config/current-server.production.conf)
-is the checked-in production profile for this host's two-socket AMD EPYC 9534
-topology. It configures the SDK, decoder/owner parallelism, Arrow rings, raw
-ClickHouse sink, Event projection, KLine projection, and all exposed batching,
-queue, timeout, and state-capacity limits for those paths. Dynamic run identity
-and credentials are intentionally supplied through environment variables;
-[`config/current-server.production.env.example`](config/current-server.production.env.example)
-lists every required variable without committing a credential or reusable
-identity.
-The profile subscribes only to the three Tick tuples in
-`config/live-ticks.streams.conf`; fixed empty Snapshot lanes and Arrow rings are
-retained for the current engine and Arrow protocol layout.
-
-Run validation from the repository working directory before starting the SDK:
-
-```bash
-set -a
-. /etc/l2flow/mdl_ingestd.env
-set +a
-
-./build-release/mdl_ingestd \
   --config config/current-server.production.conf \
   --validate-only
 ```
 
-The live supervisor uses the same environment and command without
-`--validate-only`. Set its working directory to
-`/home/sunc/code/L2Flow-CH-latency-optimization`, or replace relative paths
-in the profile with absolute paths. `L2FLOW_START_MODE=from-open` is valid only
-when the subscribed sequence domains genuinely start with complete coverage
-from sequence 1. A mid-session start or restart must use `partial`.
+Response files accept one complete long option per nonempty line. `${NAME}`
+expands one nonempty environment variable; there is no shell, quote, inline
+comment, recursive expansion, or nested response-file evaluation.
 
-Run identity is an external durable-allocation responsibility:
+## Sequence recovery and outputs
 
-- `L2FLOW_SOURCE_INSTANCE_HEX32` is a stable 32-hex (128-bit) identity for the
-  logical raw source, not a new value on every restart.
-- `L2FLOW_RAW_FEED_EPOCH` must not be reused with that source identity.
-- `L2FLOW_ARROW_FEED_EPOCH` must be greater than the epoch already recorded at
-  the configured Arrow root.
-- Event and KLine revision epochs are separate nonzero 32-bit domains. Each
-  must be strictly greater than every epoch previously used for the same
-  derived logical key space.
-- Event and KLine calculation run IDs are new, nonzero 32-hex identifiers for
-  every calculation run. They are not interchangeable with revision epochs.
+`SequenceRecovery` remains first-wins per native channel position. A decoded
+tick is durably recorded with both the original fact and exactly one final
+disposition: ordered projection, accepted hole fill, or rejected late fact.
+`GapOpen` and `ChannelSeal` are WAL control records fanned out in owner order.
+Catalog misses remain in raw storage but do not enter derived projection.
 
-On Linux, `--process-cpus` applies the inherited thread-affinity mask before
-any sink, engine, SDK, decoder, owner, or writer thread is created. Startup
-reads the mask back and fails if a cpuset/cgroup silently removed a requested
-CPU. `--memory-node` applies `MPOL_BIND` to future allocations and is inherited
-by subsequently created threads. `--validate-only` checks syntax, NUMA sysfs
-presence, and decoder containment without changing affinity or memory policy;
-the real startup syscall additionally enforces the current cpuset/memory-node
-permissions.
+The optional Arrow branch follows the canonical WAL as a volatile observer. It
+does not own a durable cursor and therefore does not delay WAL reclamation; if
+it falls behind the oldest resident LSN, it resumes at that LSN. It must not be
+used as a durability or continuity authority.
 
-The current host allocation is:
+Detailed current contracts are in:
 
-| CPUs | Role |
-|---|---|
-| `0-3,128-131` | NIC IRQ budget, configured outside this executable |
-| `4-7,132-135` | external `feeder_client` budget |
-| `8-23` | 16 individually pinned Tick decoders |
-| `24-27` | 4 individually pinned Snapshot decoders |
-| `28-59` | nominal owner/SDK/raw/Event/KLine writer budget inside the `8-59` process mask |
-| `60-63,188-191` | external Arrow consumers |
-| `64-119,192-247` | separately supervised ClickHouse server |
-| `120-127,248-255` | OS/storage IRQ/housekeeping budget |
-| `136-187` | initially idle SMT siblings of ingest physical cores `8-59` |
-
-The 32 owner drain threads are the parallel Event and KLine calculation actors;
-there is no additional background calculation pool. Four Event and four KLine
-writer lanes independently parallelize ClickHouse INSERTs while retaining FIFO
-for each owner. The configured process mask permits all non-decoder ingest
-threads on `8-59`; `28-59` is a scheduling budget, not a per-thread hard pin.
-
-The ClickHouse server is outside `mdl_ingestd`, so the profile configures its
-HTTP client and writer lanes but cannot bind or supervise the server process.
-For the local separately supervised instance, start it on NUMA 1 before ingest:
-
-```bash
-numactl --physcpubind=64-119,192-247 --membind=1 \
-  ./clickhouse-test/start.sh
-```
-
-The profile disables table auto-creation; provision the selected single-node
-or replicated production schema first. Its 32-owner Arrow layout preallocates
-approximately 17.13 GiB of ring payload capacity in `/dev/shm`, plus metadata
-and alignment overhead. Event hot-fact count/bytes, carry orders, private
-repair, pending revision bytes, Shanghai END staging, ACK joins, and sink queues
-have independent per-owner or global hard bounds and fail closed on exhaustion.
-Those logical bounds do not include allocator-retained buckets/pages, the
-process-lifetime FactJournal directory/file, or KLine bar state. These settings
-are a topology-derived starting profile, not proof of 1M messages/s end-to-end
-capacity; qualify the actual catalog, interval set, replay distribution,
-ClickHouse schema/storage, and Arrow consumers under a sustained
-production-like run before rollout.
-
-Physical runs default to `--operation-mode live`. Live mode is unbounded,
-does not accept `--run-seconds`, and does not allocate or publish the test
-latency sampler. Use test mode only for a bounded operational measurement:
-
-```bash
-./build/mdl_ingestd \
-  --mode partial \
-  --operation-mode test \
-  --run-seconds 300 \
-  --trade-date 20260806 \
-  --catalog config/catalog.example.csv \
-  --sdk-library /path/to/libmdl_api.so \
-  --server 127.0.0.1:9112 \
-  --user l2flow-measurement \
-  --allow-discard-after-dispatch
-```
-
-Test mode reports callback, admission, and dispatch throughput plus a 1-in-64
-sample of callback-entry-to-dispatch-drain latency. Production launch units
-must use live mode and external process supervision for lifecycle control.
-
-The catalog uses exact, untrimmed identities:
-
-```text
-instrument_id,market,security_id_source,security_id
-1,SH,,600000
-2,SZ,102,000001
-```
-
-The executable enables durable raw writes with `--clickhouse-url` and a
-nonzero `--clickhouse-feed-epoch`. A stable 128-bit source identity may be
-supplied with `--clickhouse-source-instance-id`; otherwise the process creates
-one and prints it. Passwords are read only through
-`--clickhouse-password-env`. The optional Arrow hot path uses
-`--arrow-ring-dir` and `--arrow-feed-epoch`. A physical SDK run with neither
-output requires `--allow-discard-after-dispatch`, making temporary drain
-behavior explicit rather than silently discarding data.
-
-Example local raw launch arguments are:
-
-```text
---clickhouse-url http://127.0.0.1:8123
---clickhouse-database l2flow
---clickhouse-feed-epoch <durably allocated nonzero run epoch>
---clickhouse-source-instance-id <stable 32-hex source ID>
-```
-
-Event and KLine require one shared process-lifetime canonical fact journal:
-
-```text
---fact-journal-path <path on dedicated local storage>
---fact-journal-hot-cache 262144
---fact-journal-maximum-records 600000000
---fact-journal-maximum-directory-pages 262144
-```
-
-The record-count, disk, memory-directory, latency, and restart boundaries are
-documented in [docs/fact-journal.md](docs/fact-journal.md). This local file is
-not a replacement for durable raw ClickHouse data and is not reopened after a
-crash.
-
-Enable the Event projection on top of that durable raw path with:
-
-```text
---event-enable
---event-revision-epoch <durably allocated nonzero monotone epoch>
---event-calculation-run-id <unique 32-hex calculation run ID>
---event-logic-version 1
---event-micro-batch-rows <calculation cut row bound>
---event-micro-batch-max-delay-ns <owner scheduling delay bound>
---event-persistence-group-max-batches <logical commits per owner submission>
---event-persistence-group-max-rows <revisions per owner submission>
---event-persistence-group-max-bytes <owned bytes per owner submission>
---event-persistence-group-max-delay-ns <oldest durable commit wait>
---event-insert-request-max-rows <revision rows per physical HTTP request>
---event-insert-request-max-bytes <RowBinary bytes per physical HTTP request>
---event-physical-group-max-batches <logical commits per physical group>
---event-physical-group-max-delay-ns <oldest lane entry wait>
---event-writer-lanes <1|2|4|8|16|32>
---event-queue-revision-batches <global logical-batch queue cap>
---event-queue-revision-rows <global revision-row queue cap>
---event-maximum-carry-orders <per-owner hard cap>
---event-maximum-order-history-bytes <per-owner logical-owned-byte hard cap>
---event-maximum-hot-facts <per-owner hard cap>
---event-maximum-hot-fact-bytes <per-owner hard cap>
---event-maximum-repair-bytes <per-owner hard cap>
---event-maximum-pending-revision-bytes <per-owner hard cap>
---event-maximum-end-staging-bytes <per-owner hard cap>
---event-maximum-occurrence-join <per-owner hard cap>
---event-maximum-pending-channel-seals <per-owner mailbox cap>
---event-phase-slice-max-nodes <per-owner slice budget>
---event-phase-slice-max-bytes <per-owner slice budget>
---event-phase-slice-max-cpu-ns <per-owner slice budget>
-```
-
-The revision epoch occupies the high 32 bits of each Event version and must be
-strictly larger than every epoch previously used for the same logical Event
-key space. `mdl_ingestd` validates that it is nonzero but does not allocate or
-persist it. The detailed ordering, repair, raw-ACK, ClickHouse current-table,
-and restart boundaries are documented in
-[docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
-
-Enable one or more integer-second KLine intervals on the same durable raw path:
-
-```text
---kline-enable
---kline-interval-seconds 1
---kline-interval-seconds 5
---kline-revision-epoch <durably allocated nonzero monotone epoch>
---kline-calculation-run-id <unique 32-hex calculation run ID>
---kline-logic-version 1
---kline-insert-request-max-rows 1024
---kline-insert-request-max-bytes 1048576
---kline-physical-group-max-batches 256
---kline-physical-group-max-delay-ns 1000000
---kline-writer-lanes <1|2|4|8|16|32>
-```
-
-Intervals are repeatable and restricted to 1 through 86,400 seconds. Window
-keys and OHLC order use the valid SDK `TickTime`/`TransactTime` normalized to
-nanoseconds from exchange midnight; host wall time, receive time, and SDK
-header `LocalTime` never substitute for it. An accepted hole fill emits a
-higher-version update to the same logical bar. The exact eligibility,
-ordering, provisional, raw-ACK, and restart contracts are documented in
-[docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
-The KLine sink transport benchmark and the limits of its 800k-1M revision/s
-loopback result are recorded in
-[docs/kline-sink-physical-grouping-benchmark-report.md](docs/kline-sink-physical-grouping-benchmark-report.md).
-
-For replicated production tables, provision the external DDL, add
-`--clickhouse-no-auto-create`, and set the required quorum, normally
-`--clickhouse-insert-quorum 2`.
-
-An error-free return from the SDK `Connect()` call is not considered ready.
-`mdl_ingestd` waits up to `--sdk-ready-timeout-seconds` (default 30) for a
-successful Logon response and successful status for every configured stream;
-failure creates a continuity boundary and requires a new feed session epoch.
-In `partial` mode, business callbacks delivered by the SDK before readiness
-are counted and discarded, and normal admission starts only after readiness.
-`from-open` rejects the same condition because dropping an initial record would
-invalidate its complete-prefix contract.
-Both successful and failed connection attempts print the stable startup field
-`pre_ready_messages_discarded`; these callbacks are rejected by the handler
-before engine, raw, Event, KLine, or Arrow admission.
-The core library exposes `TryPollTickDispatch`, `TryPollSnapshot`, `TryPollGap`,
-and `TryPollChannelFault`. Each `TickDispatch` is one of
-`kProjectOrdered`, `kProjectHoleFill`, `kRejectLateFact`, `kGapOpen`, or
-`kChannelSeal`. For a channel with next expected sequence `E`, configured
-online repair span `W`, and process origin `origin`, recovery captures
-`A=max(origin,E-W)` when an occurrence first arrives. A position in `[A,E)` is
-accepted only when it atomically claims a still-open hole; `sequence < A` and
-every behind-frontier position not present in the exact hole ledger are
-rejected permanently. `sequence == A` is therefore accepted only for an open
-hole. The captured `E/A` token travels with the occurrence and is never
-recomputed after owner-queue delay.
-
-The first canonical body observed for one `(trade_date, market, channel,
-feed_session_epoch, native_sequence)` is authoritative. Every later body at the
-same position is rejected without comparing or replacing payloads. This live
-classification is separate from the raw path, which captures every decoded
-occurrence before `SequenceRecovery` classifies it; only a successful raw
-ClickHouse INSERT ACK establishes the raw durability boundary.
-
-The Arrow memory protocol, restart/disconnect contract, sizing formulas,
-deployment rules, and Python API are documented in
-[docs/arrow-hot-path.md](docs/arrow-hot-path.md).
-The ClickHouse ACK, batching, retry, replay-order, schema, and overload
-contracts are documented in
-[docs/clickhouse-raw-path.md](docs/clickhouse-raw-path.md).
-The Event gap-driven retention, order baseline compaction, minimal-closure
-repair, stable-key, revision, and current-query contracts are documented in
-[docs/event-worker-clickhouse.md](docs/event-worker-clickhouse.md).
-The exchange-time KLine, hole-fill revision, and ClickHouse current-query
-contracts are documented in
-[docs/kline-worker-clickhouse.md](docs/kline-worker-clickhouse.md).
-The shared Event/KLine FactJournal capacity and storage contract is documented
-in [docs/fact-journal.md](docs/fact-journal.md).
-The measured Event worker → ClickHouse throughput limits, 800k/1M short-window
-results, 30-second fail-closed qualification runs, and ClickHouse query-log
-latencies are in
-[docs/event-worker-clickhouse-benchmark-report.md](docs/event-worker-clickhouse-benchmark-report.md).
-The volatile-memory state-compute isolation benchmark and its 800k/1M
-results are in
-[docs/event-state-capacity-benchmark-report.md](docs/event-state-capacity-benchmark-report.md).
-
-`from-open` and `partial` both default to a 20,000,000 ns (20 ms) gap wait. The
-two settings remain independent (`--from-open-gap-wait-ns` and
-`--partial-gap-wait-ns`) for measured production tuning. PARTIAL's separate
-initial hold remains 200,000 ns by default.
-`--maximum-reorder-span` configures the online hole-admission window `W`.
-`--reorder-entries-per-channel` configures the preallocated pending-record and
-hole-interval capacity; it must be a power of two and at least `W`. Tune both
-from measured reorder/backfill distance rather than increasing either after a
-repair or eviction backlog appears.
-
-The full contract and deployment guidance are in
-[docs/mdl-ingestd-design.md](docs/mdl-ingestd-design.md).
-
-## NUMA-pinned ingest benchmark
-
-The synthetic benchmark enters through `MdlMessageHandler::OnMessage` and
-measures from the first timestamp inside that callback until an instrument
-owner polls the canonical tick from its dispatch endpoint. It covers SDK
-message access, header admission, body copy, full decode/normalization,
-Channel recovery, and the lane-by-owner dispatch matrix. It does not include
-the physical MDL network/SDK path before callback entry.
-
-The current acceptance envelope is 500k, 750k, and 1M messages/s; the default
-target is 1M messages/s. Example for the tested NUMA node 1 layout on a
-64-physical-core host:
-
-```bash
-numactl --physcpubind=32-63 --membind=1 \
-  ./build/benchmark_mdl_ingest \
-  --rate 1000000 --seconds 300 --warmup-seconds 5 \
-  --pattern ordered --sample-every 67 \
-  --channels 16 --tick-lanes 12 --owners 16 \
-  --producer-cpu 63 --first-consumer-cpu 32 \
-  --first-decoder-cpu 48
-```
-
-Use `--pattern local-reverse --reorder-window 8` to inject bounded local
-out-of-order delivery independently within every Channel. `--gap-wait-ns`
-is an explicit benchmark override; omitting it preserves the production
-FROM_OPEN default of 20,000,000 ns. When decoder CPU affinity is configured,
-decoder idle loops use pause-spin instead of yielding, so each configured
-decoder, including an idle snapshot decoder in this benchmark, consumes a
-dedicated logical CPU by design.
-
-When Arrow is enabled at build time, `--arrow-ring-dir` extends the same run
-through the production `ArrowHotEgress` and one concurrently pinned C++
-reader/decode worker per owner. It verifies exact row counts, native sequence
-continuity, CRC/protocol validity, lifecycle Control publication, and zero hot
-loss. It reports both callback-to-Arrow-append and callback-to-reader-decode
-latency. The required sweep is:
-
-```text
-500000 messages/s
-750000 messages/s
-1000000 messages/s
-```
-
-Use five-second measurement windows only as development checks. Production
-qualification uses 300-second windows on the deployment NUMA/tmpfs layout and
-must pass every rate without lane overflow, reader overrun, segment drop,
-decode/protocol error, or ordering error. Reproducible commands and the exact
-measurement boundary are in [docs/arrow-hot-path.md](docs/arrow-hot-path.md).
-
-The earlier ingestion-only five-minute 800k/1.0M/1.2M msg/s results,
-measurement contract, NUMA placement, default-gap boundary test, and
-production caveats remain in
-[docs/numa-stress-report.md](docs/numa-stress-report.md).
+- [durable ingest design](docs/mdl-ingestd-design.md)
+- [raw ClickHouse consumer](docs/clickhouse-raw-path.md)
+- [Event projection and ClickHouse](docs/event-worker-clickhouse.md)
+- [KLine projection and ClickHouse](docs/kline-worker-clickhouse.md)
+- [FactJournal](docs/fact-journal.md)
+- [Arrow hot path](docs/arrow-hot-path.md)

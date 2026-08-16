@@ -1,7 +1,8 @@
 #pragma once
 
 #include "l2flow/common/identifier.h"
-#include "l2flow/ingest/raw_tap.h"
+#include "l2flow/ingest/canonical.h"
+#include "l2flow/outbox/types.h"
 
 #include <array>
 #include <cstddef>
@@ -21,9 +22,6 @@ inline constexpr std::uint32_t kRawSnapshotSchemaVersion = 1U;
 [[nodiscard]] std::string IdentifierString(Identifier128 identifier);
 [[nodiscard]] bool ParseIdentifier(std::string_view text,
                                    Identifier128* output) noexcept;
-
-// The raw pipeline hashes only fixed provenance inputs below one BLAKE3 chunk.
-// This helper is public so deterministic test/recovery code can reproduce IDs.
 [[nodiscard]] Identifier128 Blake3Hash128(
     std::span<const std::byte> input) noexcept;
 
@@ -68,15 +66,14 @@ struct RawClickHouseConfig final {
     std::uint64_t snapshot_batch_max_delay_ns = 20'000'000U;
     std::size_t snapshot_queue_batches_per_lane = 8U;
 
-    // Optional per-occurrence durability bridge for derived workers.
-    // Its lifetime must cover this sink's Start through Stop interval.
-    ingest::RawTickBatchAckListener* tick_ack_listener = nullptr;
+    // The raw consumer is the only component allowed to advance this cursor.
+    // Event/KLine never appear on the raw ACK path.
+    outbox::ConsumerCompletionSink* completion_sink = nullptr;
 
     std::uint32_t connect_timeout_ms = 2'000U;
     std::uint32_t request_timeout_ms = 10'000U;
     std::uint32_t retry_initial_backoff_ms = 10U;
     std::uint32_t retry_max_backoff_ms = 1'000U;
-    std::uint32_t maximum_retry_elapsed_ms = 5'000U;
     std::uint32_t shutdown_timeout_ms = 30'000U;
 
     std::uint32_t insert_quorum = 0U;
@@ -103,13 +100,13 @@ struct RawClickHouseStats final {
     std::uint64_t preallocated_canonical_bytes = 0U;
 };
 
-class RawClickHouseSink final : public ingest::RawRecordTap {
+class RawClickHouseConsumer final {
 public:
-    ~RawClickHouseSink() override;
-    RawClickHouseSink(const RawClickHouseSink&) = delete;
-    RawClickHouseSink& operator=(const RawClickHouseSink&) = delete;
+    ~RawClickHouseConsumer();
+    RawClickHouseConsumer(const RawClickHouseConsumer&) = delete;
+    RawClickHouseConsumer& operator=(const RawClickHouseConsumer&) = delete;
 
-    [[nodiscard]] static std::unique_ptr<RawClickHouseSink> Create(
+    [[nodiscard]] static std::unique_ptr<RawClickHouseConsumer> Create(
         RawClickHouseConfig config,
         std::string* error);
 
@@ -118,20 +115,24 @@ public:
 
     [[nodiscard]] bool AppendTick(
         std::size_t decoder_lane,
-        const ingest::CanonicalTick& tick) noexcept override;
+        outbox::WalPosition position,
+        const ingest::CanonicalTick& tick) noexcept;
     [[nodiscard]] bool AppendSnapshot(
         std::size_t decoder_lane,
-        const ingest::CanonicalSnapshot& snapshot) noexcept override;
+        outbox::WalPosition position,
+        const ingest::CanonicalSnapshot& snapshot) noexcept;
+    [[nodiscard]] bool CanAppendTick(std::size_t decoder_lane) noexcept;
+    [[nodiscard]] bool CanAppendSnapshot(std::size_t decoder_lane) noexcept;
+    [[nodiscard]] bool CanFlushTick(std::size_t decoder_lane) noexcept;
+    [[nodiscard]] bool CanFlushSnapshot(std::size_t decoder_lane) noexcept;
     [[nodiscard]] bool PollTick(
         std::size_t decoder_lane,
-        std::uint64_t monotonic_ns) noexcept override;
+        std::uint64_t monotonic_ns) noexcept;
     [[nodiscard]] bool PollSnapshot(
         std::size_t decoder_lane,
-        std::uint64_t monotonic_ns) noexcept override;
-    [[nodiscard]] bool FlushTick(
-        std::size_t decoder_lane) noexcept override;
-    [[nodiscard]] bool FlushSnapshot(
-        std::size_t decoder_lane) noexcept override;
+        std::uint64_t monotonic_ns) noexcept;
+    [[nodiscard]] bool FlushTick(std::size_t decoder_lane) noexcept;
+    [[nodiscard]] bool FlushSnapshot(std::size_t decoder_lane) noexcept;
 
     [[nodiscard]] bool healthy() const noexcept;
     [[nodiscard]] std::string fatal_error() const;
@@ -144,7 +145,7 @@ public:
 
 private:
     class Impl;
-    explicit RawClickHouseSink(std::unique_ptr<Impl> impl) noexcept;
+    explicit RawClickHouseConsumer(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
 };
 

@@ -3,6 +3,7 @@
 #include "l2flow/ingest/canonical.h"
 #include "l2flow/ingest/catalog.h"
 #include "l2flow/ingest/message.h"
+#include "l2flow/outbox/wal.h"
 
 #include <atomic>
 #include <cstddef>
@@ -12,8 +13,6 @@
 #include <string>
 
 namespace l2flow::ingest {
-
-class RawRecordTap;
 
 struct EngineConfig final {
     std::uint32_t trade_date = 0U;
@@ -31,12 +30,6 @@ struct EngineConfig final {
     std::size_t snapshot_slots_per_lane = 512U;
     std::size_t maximum_tick_body_bytes = 512U;
     std::size_t maximum_snapshot_body_bytes = 64U * 1024U;
-    // Capacity is per producer-lane -> instrument-owner SPSC edge.
-    std::size_t dispatch_queue_capacity = 1'024U;
-    // Gap telemetry uses one coalescing mailbox per native Channel plus a dirty
-    // bitmap. Correctness controls use the owner TickDispatch FIFOs.
-    std::size_t diagnostic_queue_capacity = 4'096U;
-
     std::size_t maximum_channels_per_tick_lane = 256U;
     std::size_t reorder_entries_per_channel = 4'096U;
     std::uint64_t maximum_reorder_span = 4'096U;
@@ -50,10 +43,10 @@ struct EngineConfig final {
     std::uint64_t from_open_gap_wait_ns = 20'000'000U;
     std::uint64_t recovery_timer_scan_ns = 25'000U;
 
-    // Optional decode-complete, pre-SequenceRecovery fact tap. Its lifetime
-    // must cover Start through Stop and it must expose exactly one producer
-    // endpoint for every configured decoder lane.
-    RawRecordTap* raw_record_tap = nullptr;
+    // Mandatory durability boundary. Decoder lanes enqueue only finalized
+    // canonical/disposition records; no raw/Event/KLine sink is called from a
+    // decoder thread.
+    outbox::DurableOutbox* outbox = nullptr;
 
     std::size_t maximum_text_bytes = kMaximumIdentityBytes;
     std::size_t maximum_depth_items = 4'096U;
@@ -83,7 +76,7 @@ struct EngineStats final {
     std::uint64_t gaps_skipped = 0U;
     std::uint64_t from_open_channels_frozen = 0U;
     std::uint64_t channel_faults_dispatched = 0U;
-    std::uint64_t dispatch_overflows = 0U;
+    std::uint64_t outbox_overflows = 0U;
 };
 
 class IngestEngine final {
@@ -108,20 +101,13 @@ public:
         std::span<const std::byte> body,
         std::uint64_t receive_monotonic_ns) noexcept;
 
-    // Each owner index is a single-consumer endpoint. Production mdl_ingestd
-    // assigns one owner drain thread to these calls and forwards TickDispatch
-    // records to the Event/KLine runtimes.
-    [[nodiscard]] bool TryPollTickDispatch(
-        std::size_t owner,
-        TickDispatch* output) noexcept;
-    [[nodiscard]] bool TryPollSnapshot(
-        std::size_t owner,
-        CanonicalSnapshot* output) noexcept;
-    // Gap and fault diagnostics each form one shared single-consumer
-    // endpoint across all tick lanes.
-    [[nodiscard]] bool TryPollGap(ChannelGap* output) noexcept;
-    [[nodiscard]] bool TryPollChannelFault(
-        ChannelFault* output) noexcept;
+    // Establishes a cut across every decoder lane without stopping SDK
+    // admission. On success, every message admitted before the cut has either
+    // produced its final WAL record/control set or reached a terminal decode
+    // outcome. A freshness barrier may be enqueued only after this succeeds.
+    [[nodiscard]] bool FenceAcceptedInputs(
+        std::uint64_t timeout_ns,
+        std::string* error) noexcept;
 
     [[nodiscard]] EngineStats stats() const noexcept;
     [[nodiscard]] bool healthy() const noexcept;

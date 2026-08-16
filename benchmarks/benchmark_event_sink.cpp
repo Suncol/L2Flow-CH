@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -57,18 +58,21 @@ using l2flow::ingest::MonotonicNowNs;
 using l2flow::ingest::TickAction;
 
 constexpr std::size_t kRevisionRowBytes = 665U;
+constexpr std::size_t kMarkerRowBytes = 140U;
 
 struct Options final {
     std::uint64_t target_rows_per_second = 1'000'000U;
-    std::uint32_t seconds = 5U;
+    std::uint32_t seconds = 10U;
     std::size_t owners = 32U;
     std::size_t writer_lanes = 8U;
     std::size_t logical_batch_rows = 512U;
     std::size_t submission_batches = 32U;
-    std::size_t insert_request_rows = 1'024U;
-    std::size_t insert_request_bytes = 1U * 1'024U * 1'024U;
+    std::size_t insert_request_rows = 4'096U;
+    std::size_t insert_request_bytes = 4U * 1'024U * 1'024U;
     std::size_t physical_group_batches = 256U;
-    std::uint64_t physical_group_delay_ns = 1'000'000U;
+    std::size_t physical_group_rows = 16'384U;
+    std::size_t physical_group_bytes = 16U * 1'024U * 1'024U;
+    std::uint64_t physical_group_delay_ns = 50'000'000U;
     std::uint32_t response_delay_us = 0U;
 };
 
@@ -77,6 +81,23 @@ struct QueueSample final {
     std::uint64_t groups = 0U;
     std::uint64_t batches = 0U;
     std::uint64_t rows = 0U;
+    std::uint64_t acked_rows = 0U;
+};
+
+class CompletionSink final : public l2flow::outbox::ConsumerCompletionSink {
+public:
+    [[nodiscard]] bool Complete(
+        l2flow::outbox::ConsumerKind consumer,
+        std::span<const l2flow::outbox::WalPosition> positions)
+        noexcept override {
+        if (consumer != l2flow::outbox::ConsumerKind::kEvent) {
+            return false;
+        }
+        completed.fetch_add(positions.size(), std::memory_order_relaxed);
+        return true;
+    }
+
+    std::atomic<std::uint64_t> completed{0U};
 };
 
 template <typename Integer>
@@ -100,15 +121,17 @@ void PrintUsage() {
     std::cout
         << "usage: benchmark_event_sink [options]\n"
         << "  --rate N                    revision rows/s; default 1000000\n"
-        << "  --seconds N                 measured seconds; default 5\n"
+        << "  --seconds N                 measured seconds; default 10\n"
         << "  --owners N                  logical Event owners; default 32\n"
         << "  --writer-lanes N            one of 1,2,4,8,16,32; default 8\n"
         << "  --logical-batch-rows N      rows/recovery commit; default 512\n"
         << "  --submission-batches N      commits/sink enqueue; default 32\n"
-        << "  --insert-request-rows N     revision rows/HTTP bound; default 1024\n"
-        << "  --insert-request-bytes N    HTTP body bound; default 1048576\n"
+        << "  --insert-request-rows N     revision rows/HTTP bound; default 4096\n"
+        << "  --insert-request-bytes N    HTTP body bound; default 4194304\n"
         << "  --physical-group-batches N  commits/physical group; default 256\n"
-        << "  --physical-group-delay-ns N grouping delay; default 1000000\n"
+        << "  --physical-group-rows N     rows/physical group; default 16384\n"
+        << "  --physical-group-bytes N    revision bytes/group; default 16777216\n"
+        << "  --physical-group-delay-ns N grouping delay; default 50000000\n"
         << "  --response-delay-us N       loopback INSERT delay; default 0\n";
 }
 
@@ -181,6 +204,18 @@ void PrintUsage() {
                 *error = "invalid --physical-group-batches";
                 return false;
             }
+        } else if (argument == "--physical-group-rows") {
+            if (!ParseInteger(next(argument),
+                              &parsed.physical_group_rows)) {
+                *error = "invalid --physical-group-rows";
+                return false;
+            }
+        } else if (argument == "--physical-group-bytes") {
+            if (!ParseInteger(next(argument),
+                              &parsed.physical_group_bytes)) {
+                *error = "invalid --physical-group-bytes";
+                return false;
+            }
         } else if (argument == "--physical-group-delay-ns") {
             if (!ParseInteger(next(argument),
                               &parsed.physical_group_delay_ns)) {
@@ -219,6 +254,8 @@ void PrintUsage() {
         parsed.insert_request_rows == 0U ||
         parsed.insert_request_bytes < kRevisionRowBytes ||
         parsed.physical_group_batches == 0U ||
+        parsed.physical_group_rows == 0U ||
+        parsed.physical_group_bytes < kRevisionRowBytes ||
         parsed.physical_group_delay_ns == 0U ||
         parsed.physical_group_delay_ns > UINT64_C(1'000'000'000) ||
         parsed.response_delay_us > 1'000'000U ||
@@ -661,7 +698,8 @@ MakeSubmission(std::uint64_t first_row,
                std::uint32_t owner,
                std::size_t logical_batch_rows,
                Identifier128 calculation_run,
-               std::uint64_t* next_batch_sequence) {
+               std::uint64_t* next_batch_sequence,
+               std::uint64_t* next_wal_lsn) {
     std::vector<std::shared_ptr<const EventRevisionBatch>> submission;
     const std::size_t batch_count =
         (rows + logical_batch_rows - 1U) / logical_batch_rows;
@@ -678,6 +716,9 @@ MakeSubmission(std::uint64_t first_row,
         batch->owner = owner;
         batch->batch_sequence = batch_sequence;
         batch->reason = RevisionReason::kLiveProjection;
+        const std::uint64_t wal_lsn = (*next_wal_lsn)++;
+        batch->input_positions.push_back(
+            l2flow::outbox::WalPosition{wal_lsn, wal_lsn, 0U});
         batch->revisions.reserve(batch_rows);
         for (std::size_t row = 0U; row < batch_rows; ++row) {
             batch->revisions.push_back(Revision(
@@ -754,11 +795,14 @@ int main(int argc, char** argv) {
         1'024U, static_cast<std::uint64_t>(options.submission_batches));
 
     EventClickHouseConfig config{};
+    CompletionSink completion;
     config.endpoint = server.endpoint();
     config.database = "event_sink_benchmark";
     config.insert_request_max_rows = options.insert_request_rows;
     config.insert_request_max_bytes = options.insert_request_bytes;
     config.physical_group_max_batches = options.physical_group_batches;
+    config.physical_group_max_rows = options.physical_group_rows;
+    config.physical_group_max_revision_bytes = options.physical_group_bytes;
     config.physical_group_max_delay_ns = options.physical_group_delay_ns;
     config.writer_lanes = options.writer_lanes;
     config.queue_revision_batches = static_cast<std::size_t>(queue_batches);
@@ -767,9 +811,14 @@ int main(int argc, char** argv) {
     config.request_timeout_ms = 10'000U;
     config.retry_initial_backoff_ms = 1U;
     config.retry_max_backoff_ms = 10U;
-    config.maximum_retry_elapsed_ms = 1'000U;
     config.shutdown_timeout_ms = 30'000U;
     config.ensure_local_tables = false;
+    config.completion_sink = &completion;
+    config.request_spool.directory =
+        std::filesystem::temp_directory_path() /
+        ("l2flow-event-sink-benchmark-" +
+         std::to_string(static_cast<unsigned long long>(::getpid())) + "-" +
+         std::to_string(MonotonicNowNs()));
 
     std::unique_ptr<EventClickHouseSink> sink =
         EventClickHouseSink::Create(config, &error);
@@ -781,27 +830,47 @@ int main(int argc, char** argv) {
     const Identifier128 calculation_run = Identifier(1U, 5U);
     std::vector<std::uint64_t> owner_batch_sequences(
         options.owners, 1U);
+    std::uint64_t next_wal_lsn = 1U;
     std::vector<QueueSample> queue_samples;
-    queue_samples.reserve(static_cast<std::size_t>(
-        total_rows / static_cast<std::uint64_t>(submission_rows) + 3U));
+    queue_samples.reserve(static_cast<std::size_t>(options.seconds) * 25U +
+                          4U);
     const std::uint64_t start_ns =
         MonotonicNowNs() + UINT64_C(100'000'000);
-    queue_samples.push_back(QueueSample{start_ns, 0U, 0U, 0U});
+    queue_samples.push_back(QueueSample{start_ns, 0U, 0U, 0U, 0U});
+    std::atomic<bool> sampler_running{true};
+    std::thread sampler([&] {
+        static_cast<void>(WaitUntil(start_ns));
+        while (sampler_running.load(std::memory_order_acquire)) {
+            const EventClickHouseStats current = sink->stats();
+            queue_samples.push_back(QueueSample{
+                MonotonicNowNs(), current.queued_submission_groups,
+                current.queued_revision_batches,
+                current.queued_revision_rows, current.revision_rows_acked});
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
     std::uint64_t emitted_rows = 0U;
     std::uint64_t submitted_batches = 0U;
     std::uint64_t submitted_groups = 0U;
     std::uint64_t maximum_schedule_lag_ns = 0U;
+    std::uint64_t producer_build_ns = 0U;
+    std::uint64_t append_call_ns = 0U;
     bool append_ok = true;
     while (emitted_rows < total_rows) {
         const std::size_t rows = static_cast<std::size_t>(std::min<
             std::uint64_t>(submission_rows, total_rows - emitted_rows));
         const std::uint32_t owner = static_cast<std::uint32_t>(
             submitted_groups % options.owners);
+        const std::uint64_t build_started_ns = MonotonicNowNs();
         std::vector<std::shared_ptr<const EventRevisionBatch>> submission =
             MakeSubmission(
                 emitted_rows + 1U, rows, owner,
                 options.logical_batch_rows, calculation_run,
-                &owner_batch_sequences[owner]);
+                &owner_batch_sequences[owner], &next_wal_lsn);
+        const std::uint64_t build_completed_ns = MonotonicNowNs();
+        producer_build_ns += build_completed_ns >= build_started_ns
+            ? build_completed_ns - build_started_ns
+            : 0U;
         const std::uint64_t deadline_ns = start_ns + ScheduledOffsetNs(
             emitted_rows, options.target_rows_per_second);
         const std::uint64_t now = WaitUntil(deadline_ns);
@@ -809,25 +878,31 @@ int main(int argc, char** argv) {
             maximum_schedule_lag_ns,
             now >= deadline_ns ? now - deadline_ns : 0U);
         submitted_batches += submission.size();
-        if (!sink->AppendRevisionGroup(std::move(submission))) {
+        const std::uint64_t append_started_ns = MonotonicNowNs();
+        const bool appended =
+            sink->AppendRevisionGroup(std::move(submission));
+        const std::uint64_t append_completed_ns = MonotonicNowNs();
+        append_call_ns += append_completed_ns >= append_started_ns
+            ? append_completed_ns - append_started_ns
+            : 0U;
+        if (!appended) {
             append_ok = false;
             break;
         }
         emitted_rows += rows;
         ++submitted_groups;
-        const EventClickHouseStats current = sink->stats();
-        queue_samples.push_back(QueueSample{
-            MonotonicNowNs(), current.queued_submission_groups,
-            current.queued_revision_batches, current.queued_revision_rows});
     }
     const std::uint64_t scheduled_end_ns = start_ns + ScheduledOffsetNs(
         total_rows, options.target_rows_per_second);
     const std::uint64_t producer_end_ns = WaitUntil(scheduled_end_ns);
+    sampler_running.store(false, std::memory_order_release);
+    sampler.join();
     const EventClickHouseStats before_stop = sink->stats();
     queue_samples.push_back(QueueSample{
         producer_end_ns, before_stop.queued_submission_groups,
         before_stop.queued_revision_batches,
-        before_stop.queued_revision_rows});
+        before_stop.queued_revision_rows,
+        before_stop.revision_rows_acked});
     const bool stopped = sink->Stop(&error);
     const std::uint64_t durable_end_ns = MonotonicNowNs();
     const EventClickHouseStats stats = sink->stats();
@@ -848,12 +923,23 @@ int main(int argc, char** argv) {
         ? 0.0
         : static_cast<double>(durable_end_ns - start_ns) /
               1'000'000'000.0;
-    const double enqueue_rows_per_second = producer_seconds == 0.0
+    const double producer_build_revision_s = producer_build_ns == 0U
         ? 0.0
-        : static_cast<double>(emitted_rows) / producer_seconds;
-    const double durable_rows_per_second = durable_seconds == 0.0
+        : static_cast<double>(emitted_rows) * 1'000'000'000.0 /
+              static_cast<double>(producer_build_ns);
+    const double append_accepted_revision_s = append_call_ns == 0U
+        ? 0.0
+        : static_cast<double>(emitted_rows) * 1'000'000'000.0 /
+              static_cast<double>(append_call_ns);
+    const double end_to_end_durable_revision_s = durable_seconds == 0.0
         ? 0.0
         : static_cast<double>(stats.revision_rows_acked) / durable_seconds;
+    const double drain_tail_seconds = durable_end_ns <= producer_end_ns
+        ? 0.0
+        : static_cast<double>(durable_end_ns - producer_end_ns) /
+              1'000'000'000.0;
+    const double queue_wait_seconds =
+        static_cast<double>(stats.queue_budget_wait_ns) / 1'000'000'000.0;
     const double sink_batches_per_second = producer_seconds == 0.0
         ? 0.0
         : static_cast<double>(submitted_groups) / producer_seconds;
@@ -870,13 +956,13 @@ int main(int argc, char** argv) {
     const double revision_request_average_us =
         stats.revision_insert_requests_acked == 0U
         ? 0.0
-        : static_cast<double>(stats.revision_insert_latency_ns_total) /
+        : static_cast<double>(stats.revision_http_ns) /
               static_cast<double>(stats.revision_insert_requests_acked) /
               1'000.0;
     const double marker_request_average_us =
         stats.marker_insert_requests_acked == 0U
         ? 0.0
-        : static_cast<double>(stats.marker_insert_latency_ns_total) /
+        : static_cast<double>(stats.marker_http_ns) /
               static_cast<double>(stats.marker_insert_requests_acked) /
               1'000.0;
     const double group_queue_slope = QueueSlope(
@@ -886,19 +972,43 @@ int main(int argc, char** argv) {
         [](const QueueSample& sample) { return sample.batches; });
     const double row_queue_slope = QueueSlope(
         queue_samples, [](const QueueSample& sample) { return sample.rows; });
+    const double steady_acked_revision_s = QueueSlope(
+        queue_samples,
+        [](const QueueSample& sample) { return sample.acked_rows; });
+    const std::size_t steady_begin = queue_samples.size() / 5U;
+    const double steady_window_seconds =
+        queue_samples.size() < 4U ||
+                queue_samples.back().monotonic_ns <=
+                    queue_samples[steady_begin].monotonic_ns
+        ? 0.0
+        : static_cast<double>(
+              queue_samples.back().monotonic_ns -
+              queue_samples[steady_begin].monotonic_ns) /
+              1'000'000'000.0;
     const std::size_t request_row_capacity = std::min(
         options.insert_request_rows,
         options.insert_request_bytes / kRevisionRowBytes);
     const double minimum_density =
         static_cast<double>(request_row_capacity) * 0.90;
-    const double maximum_row_slope =
-        static_cast<double>(options.target_rows_per_second) * 0.001;
-    const double maximum_batch_slope =
+    // Queue depths are integer-valued. A one-level step inside a finite
+    // least-squares window can report roughly 1.5 levels/window despite no
+    // continuing accumulation. Keep the 0.1% offered-rate gate, but never
+    // make it narrower than two observable queue quanta per steady window.
+    const double slope_quantization = steady_window_seconds == 0.0
+        ? 0.0
+        : 2.0 / steady_window_seconds;
+    const double maximum_row_slope = std::max(
+        static_cast<double>(options.target_rows_per_second) * 0.001,
+        slope_quantization * static_cast<double>(submission_rows));
+    const double maximum_batch_slope = std::max(
         static_cast<double>(options.target_rows_per_second) /
-        static_cast<double>(options.logical_batch_rows) * 0.001;
-    const double maximum_group_slope =
+            static_cast<double>(options.logical_batch_rows) * 0.001,
+        slope_quantization *
+            static_cast<double>(options.submission_batches));
+    const double maximum_group_slope = std::max(
         static_cast<double>(options.target_rows_per_second) /
-        static_cast<double>(submission_rows) * 0.001;
+            static_cast<double>(submission_rows) * 0.001,
+        slope_quantization);
 
     const bool valid = append_ok && stopped && sink_healthy &&
         server.healthy() && emitted_rows == total_rows &&
@@ -907,6 +1017,8 @@ int main(int argc, char** argv) {
         stats.revision_batches_queued == submitted_batches &&
         stats.revision_batches_acked == submitted_batches &&
         stats.revision_batches_released == submitted_batches &&
+        completion.completed.load(std::memory_order_relaxed) ==
+            submitted_batches &&
         stats.revision_rows_queued == total_rows &&
         stats.revision_rows_acked == total_rows &&
         stats.recovery_runs_committed == submitted_batches &&
@@ -919,17 +1031,27 @@ int main(int argc, char** argv) {
         revision_latencies.size() ==
             stats.revision_insert_requests_acked &&
         marker_latencies.size() == stats.marker_insert_requests_acked &&
+        server.revision_body_bytes() == total_rows * kRevisionRowBytes &&
+        server.marker_body_bytes() == submitted_batches * kMarkerRowBytes &&
+        stats.bytes_sent ==
+            server.revision_body_bytes() + server.marker_body_bytes() &&
         revisions_per_insert >= minimum_density &&
         revisions_per_insert <=
             static_cast<double>(request_row_capacity) &&
-        durable_rows_per_second >=
+        stats.request_spool_live_groups == 0U &&
+        stats.request_spool_preparing_groups == 0U &&
+        stats.request_spool_bytes == 0U &&
+        stats.request_spool_reserved_bytes == 0U &&
+        end_to_end_durable_revision_s >=
             static_cast<double>(options.target_rows_per_second) * 0.99 &&
         row_queue_slope <= maximum_row_slope &&
         batch_queue_slope <= maximum_batch_slope &&
         group_queue_slope <= maximum_group_slope;
 
     std::cout << std::fixed << std::setprecision(3)
-              << "event_sink_config target_revision_s="
+              << "event_sink_config benchmark_scope="
+                 "loopback_http_transport_no_clickhouse_storage"
+              << " target_revision_s="
               << options.target_rows_per_second
               << " seconds=" << options.seconds
               << " owners=" << options.owners
@@ -941,6 +1063,8 @@ int main(int argc, char** argv) {
               << " insert_request_bytes=" << options.insert_request_bytes
               << " physical_group_batches="
               << options.physical_group_batches
+              << " physical_group_rows=" << options.physical_group_rows
+              << " physical_group_bytes=" << options.physical_group_bytes
               << " physical_group_delay_ns="
               << options.physical_group_delay_ns
               << " queue_revision_batches=" << queue_batches
@@ -950,9 +1074,16 @@ int main(int argc, char** argv) {
               << " acked_rows=" << stats.revision_rows_acked
               << " producer_seconds=" << producer_seconds
               << " durable_seconds=" << durable_seconds
-              << " enqueue_revision_s=" << enqueue_rows_per_second
-              << " durable_revision_s=" << durable_rows_per_second
-              << " sink_batches_per_second=" << sink_batches_per_second
+              << " producer_build_revision_s="
+              << producer_build_revision_s
+              << " append_accepted_revision_s="
+              << append_accepted_revision_s
+              << " queue_wait_seconds=" << queue_wait_seconds
+              << " steady_acked_revision_s=" << steady_acked_revision_s
+              << " end_to_end_durable_revision_s="
+              << end_to_end_durable_revision_s
+              << " drain_tail_seconds=" << drain_tail_seconds
+              << " append_submission_group_s=" << sink_batches_per_second
               << " maximum_schedule_lag_us="
               << static_cast<double>(maximum_schedule_lag_ns) / 1'000.0
               << '\n'
@@ -974,15 +1105,9 @@ int main(int argc, char** argv) {
               << stats.revision_request_rows_max
               << " revision_request_bytes_max="
               << stats.revision_request_bytes_max << '\n'
-              << "event_sink_latency client_revision_avg_us="
+              << "event_sink_latency http_revision_avg_us="
               << revision_request_average_us
-              << " client_revision_max_us="
-              << static_cast<double>(stats.revision_insert_latency_ns_max) /
-                     1'000.0
-              << " client_marker_avg_us=" << marker_request_average_us
-              << " client_marker_max_us="
-              << static_cast<double>(stats.marker_insert_latency_ns_max) /
-                     1'000.0
+              << " http_marker_avg_us=" << marker_request_average_us
               << " server_revision_p50_us="
               << static_cast<double>(Percentile(
                      revision_latencies, 0.50L)) / 1'000.0
@@ -1001,10 +1126,42 @@ int main(int argc, char** argv) {
               << " server_marker_p99_us="
               << static_cast<double>(Percentile(
                      marker_latencies, 0.99L)) / 1'000.0 << '\n'
+              << "event_sink_phases admission_validation_ns="
+              << stats.admission_validation_ns
+              << " queue_budget_wait_ns=" << stats.queue_budget_wait_ns
+              << " queue_budget_wait_count="
+              << stats.queue_budget_wait_count
+              << " queue_budget_wait_ns_max="
+              << stats.queue_budget_wait_ns_max
+              << " group_wait_ns=" << stats.group_wait_ns
+              << " rowbinary_serialize_ns="
+              << stats.rowbinary_serialize_ns
+              << " chunk_id_ns=" << stats.chunk_id_ns
+              << " spool_checksum_ns=" << stats.spool_checksum_ns
+              << " spool_encode_copy_ns=" << stats.spool_encode_copy_ns
+              << " spool_write_ns=" << stats.spool_write_ns
+              << " spool_fdatasync_ns=" << stats.spool_fdatasync_ns
+              << " spool_registry_lock_wait_ns="
+              << stats.spool_registry_lock_wait_ns
+              << " spool_entry_lock_wait_ns="
+              << stats.spool_entry_lock_wait_ns
+              << " request_state_before_send_ns="
+              << stats.request_state_before_send_ns
+              << " curl_easy_perform_ns=" << stats.curl_easy_perform_ns
+              << " request_state_after_ack_ns="
+              << stats.request_state_after_ack_ns
+              << " revision_http_ns=" << stats.revision_http_ns
+              << " marker_http_ns=" << stats.marker_http_ns
+              << " completion_ns=" << stats.completion_ns
+              << " retire_ns=" << stats.retire_ns << '\n'
               << "event_sink_queue samples=" << queue_samples.size()
+              << " steady_window_seconds=" << steady_window_seconds
               << " group_slope_per_s=" << group_queue_slope
+              << " group_slope_limit_per_s=" << maximum_group_slope
               << " batch_slope_per_s=" << batch_queue_slope
+              << " batch_slope_limit_per_s=" << maximum_batch_slope
               << " row_slope_per_s=" << row_queue_slope
+              << " row_slope_limit_per_s=" << maximum_row_slope
               << " group_hwm="
               << stats.queued_submission_groups_high_water
               << " batch_hwm=" << stats.queued_revision_batches_high_water
@@ -1018,6 +1175,13 @@ int main(int argc, char** argv) {
               << " sink_bytes_sent=" << stats.bytes_sent
               << " retry_attempts=" << stats.retry_attempts
               << " unknown_outcomes=" << stats.unknown_outcomes
+              << " final_spool_groups="
+              << stats.request_spool_live_groups
+              << " final_spool_preparing="
+              << stats.request_spool_preparing_groups
+              << " final_spool_bytes=" << stats.request_spool_bytes
+              << " final_spool_reserved_bytes="
+              << stats.request_spool_reserved_bytes
               << " sink_healthy=" << (sink_healthy ? "true" : "false")
               << " server_healthy="
               << (server.healthy() ? "true" : "false") << '\n'

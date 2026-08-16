@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -54,7 +55,7 @@ using l2flow::kline::RevisionOperation;
 using l2flow::kline::RevisionReason;
 
 constexpr std::size_t kRevisionRowBytes = 313U;
-constexpr std::size_t kMarkerRowBytes = 120U;
+constexpr std::size_t kMarkerRowBytes = 140U;
 
 struct Options final {
     std::uint64_t target_rows_per_second = 1'000'000U;
@@ -74,6 +75,22 @@ struct QueueSample final {
     std::uint64_t monotonic_ns = 0U;
     std::uint64_t batches = 0U;
     std::uint64_t rows = 0U;
+};
+
+class CompletionSink final : public l2flow::outbox::ConsumerCompletionSink {
+public:
+    [[nodiscard]] bool Complete(
+        l2flow::outbox::ConsumerKind consumer,
+        std::span<const l2flow::outbox::WalPosition> positions)
+        noexcept override {
+        if (consumer != l2flow::outbox::ConsumerKind::kKLine) {
+            return false;
+        }
+        completed.fetch_add(positions.size(), std::memory_order_relaxed);
+        return true;
+    }
+
+    std::atomic<std::uint64_t> completed{0U};
 };
 
 template <typename Integer>
@@ -707,7 +724,8 @@ MakeBurst(std::uint64_t first_row,
           std::size_t logical_batch_rows,
           Identifier128 calculation_run,
           std::uint64_t* next_owner_batch_sequence,
-          std::uint64_t* next_recovery_sequence) {
+          std::uint64_t* next_recovery_sequence,
+          std::uint64_t* next_wal_lsn) {
     std::vector<std::shared_ptr<const KLineRevisionBatch>> batches;
     const std::size_t batch_count =
         (rows + logical_batch_rows - 1U) / logical_batch_rows;
@@ -726,6 +744,9 @@ MakeBurst(std::uint64_t first_row,
         batch->owner = owner;
         batch->batch_sequence = batch_sequence;
         batch->reason = RevisionReason::kLiveProjection;
+        const std::uint64_t wal_lsn = (*next_wal_lsn)++;
+        batch->input_positions.push_back(
+            l2flow::outbox::WalPosition{wal_lsn, wal_lsn, 0U});
         batch->revisions.reserve(batch_rows);
         for (std::size_t row = 0U; row < batch_rows; ++row) {
             batch->revisions.push_back(Revision(
@@ -805,6 +826,7 @@ int main(int argc, char** argv) {
             options.producer_burst_batches);
 
     KLineClickHouseConfig config{};
+    CompletionSink completion;
     config.endpoint = server.endpoint();
     config.database = "kline_sink_benchmark";
     config.insert_request_max_rows = options.insert_request_rows;
@@ -818,9 +840,14 @@ int main(int argc, char** argv) {
     config.request_timeout_ms = 10'000U;
     config.retry_initial_backoff_ms = 1U;
     config.retry_max_backoff_ms = 10U;
-    config.maximum_retry_elapsed_ms = 1'000U;
     config.shutdown_timeout_ms = 30'000U;
     config.ensure_local_tables = false;
+    config.completion_sink = &completion;
+    config.request_spool.directory =
+        std::filesystem::temp_directory_path() /
+        ("l2flow-kline-sink-benchmark-" +
+         std::to_string(static_cast<unsigned long long>(::getpid())) + "-" +
+         std::to_string(MonotonicNowNs()));
 
     std::unique_ptr<KLineClickHouseSink> sink =
         KLineClickHouseSink::Create(config, &error);
@@ -832,6 +859,7 @@ int main(int argc, char** argv) {
     const Identifier128 calculation_run = Identifier(1U, 5U);
     std::vector<std::uint64_t> owner_batch_sequences(options.owners, 1U);
     std::uint64_t next_recovery_sequence = 1U;
+    std::uint64_t next_wal_lsn = 1U;
     std::vector<QueueSample> queue_samples;
     queue_samples.reserve(static_cast<std::size_t>(
         total_rows / static_cast<std::uint64_t>(burst_rows) + 3U));
@@ -852,7 +880,8 @@ int main(int argc, char** argv) {
             MakeBurst(
                 emitted_rows + 1U, rows, owner,
                 options.logical_batch_rows, calculation_run,
-                &owner_batch_sequences[owner], &next_recovery_sequence);
+                &owner_batch_sequences[owner], &next_recovery_sequence,
+                &next_wal_lsn);
         const std::uint64_t deadline_ns = start_ns + ScheduledOffsetNs(
             emitted_rows, options.target_rows_per_second);
         const std::uint64_t now = WaitUntil(deadline_ns);
@@ -962,6 +991,8 @@ int main(int argc, char** argv) {
         stats.revision_batches_queued == submitted_batches &&
         stats.revision_batches_acked == submitted_batches &&
         stats.revision_batches_released == submitted_batches &&
+        completion.completed.load(std::memory_order_relaxed) ==
+            submitted_batches &&
         stats.revision_rows_queued == total_rows &&
         stats.revision_rows_acked == total_rows &&
         stats.revision_insert_rows_acked == total_rows &&
@@ -988,6 +1019,11 @@ int main(int argc, char** argv) {
         revisions_per_insert >= minimum_density &&
         revisions_per_insert <=
             static_cast<double>(request_row_capacity) &&
+        stats.request_spool_live_groups == 0U &&
+        stats.request_spool_bytes == 0U &&
+        // The one-second smoke includes schema probes and one durable spool
+        // handoff per physical group. Allow a small fixed cold-start cost
+        // while still rejecting a sustained throughput collapse.
         durable_rows_per_second >=
             static_cast<double>(options.target_rows_per_second) * 0.99 &&
         row_queue_slope <= maximum_row_slope &&
@@ -1099,6 +1135,9 @@ int main(int argc, char** argv) {
               << " sink_bytes_sent=" << stats.bytes_sent
               << " retry_attempts=" << stats.retry_attempts
               << " unknown_outcomes=" << stats.unknown_outcomes
+              << " final_spool_groups="
+              << stats.request_spool_live_groups
+              << " final_spool_bytes=" << stats.request_spool_bytes
               << " sink_healthy=" << (sink_healthy ? "true" : "false")
               << " server_healthy="
               << (server.healthy() ? "true" : "false") << '\n'
