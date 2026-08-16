@@ -1,5 +1,6 @@
 #include "l2flow/ingest/catalog.h"
 #include "l2flow/ingest/engine.h"
+#include "l2flow/ingest/latency.h"
 #include "l2flow/ingest/sdk_runtime.h"
 
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -16,7 +17,6 @@
 #endif
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -34,7 +34,6 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <span>
 #include <string>
@@ -71,6 +70,10 @@ using l2flow::ingest::TickDispatchKind;
 using l2flow::ingest::ContinuityInputs;
 using l2flow::ingest::ContinuityModeName;
 using l2flow::ingest::DispositionOutbox;
+using l2flow::ingest::DispatchLatencyAggregate;
+using l2flow::ingest::DispatchLatencySampler;
+using l2flow::ingest::DispatchLatencySummary;
+using l2flow::ingest::DispatchLatencyWindow;
 using l2flow::ingest::FreshnessFrontier;
 using l2flow::ingest::MonotonicNowNs;
 
@@ -116,103 +119,7 @@ struct Options final {
 #endif
 };
 
-inline constexpr std::uint64_t kLatencySampleEvery = 64U;
-inline constexpr std::size_t kLatencyRingCapacity = 4'096U;
-inline constexpr std::size_t kLatencyHistogramMaximumUs = 100'000U;
 inline constexpr std::size_t kDrainBurstMessages = 256U;
-
-struct LatencySampleSlot final {
-    std::atomic<std::uint64_t> sequence{0U};
-    std::atomic<std::uint64_t> latency_ns{0U};
-};
-
-// Each sampler has one drain-thread writer. Sequence tags let the reporting
-// thread detect a ring overwrite without blocking the hot path.
-struct alignas(64) LatencySampler final {
-    std::array<LatencySampleSlot, kLatencyRingCapacity> samples{};
-    std::atomic<std::uint64_t> published{0U};
-    std::atomic<std::uint64_t> clock_errors{0U};
-    std::uint64_t next_sequence = 0U;
-};
-
-struct LatencyWindow final {
-    std::vector<std::uint64_t> samples_ns;
-    std::uint64_t overwritten = 0U;
-    std::uint64_t clock_errors = 0U;
-};
-
-struct LatencySummary final {
-    std::size_t count = 0U;
-    double average_us = 0.0;
-    double p50_us = 0.0;
-    double p95_us = 0.0;
-    double p99_us = 0.0;
-    double maximum_us = 0.0;
-};
-
-class LatencyAggregate final {
-public:
-    LatencyAggregate()
-        : histogram_(kLatencyHistogramMaximumUs + 2U, 0U) {}
-
-    void Add(const LatencyWindow& window) {
-        overwritten_ += window.overwritten;
-        clock_errors_ += window.clock_errors;
-        for (const std::uint64_t latency_ns : window.samples_ns) {
-            ++count_;
-            sum_ns_ += static_cast<long double>(latency_ns);
-            maximum_ns_ = std::max(maximum_ns_, latency_ns);
-            const std::uint64_t latency_us = latency_ns / 1'000U;
-            const std::size_t bucket = latency_us <=
-                    kLatencyHistogramMaximumUs
-                ? static_cast<std::size_t>(latency_us)
-                : kLatencyHistogramMaximumUs + 1U;
-            ++histogram_[bucket];
-        }
-    }
-
-    [[nodiscard]] std::uint64_t count() const noexcept { return count_; }
-    [[nodiscard]] std::uint64_t overwritten() const noexcept {
-        return overwritten_;
-    }
-    [[nodiscard]] std::uint64_t clock_errors() const noexcept {
-        return clock_errors_;
-    }
-    [[nodiscard]] double average_us() const noexcept {
-        if (count_ == 0U) {
-            return 0.0;
-        }
-        return static_cast<double>(
-                   sum_ns_ / static_cast<long double>(count_)) /
-               1'000.0;
-    }
-    [[nodiscard]] double maximum_us() const noexcept {
-        return static_cast<double>(maximum_ns_) / 1'000.0;
-    }
-    [[nodiscard]] double PercentileUs(std::uint64_t percentile) const {
-        if (count_ == 0U) {
-            return 0.0;
-        }
-        const std::uint64_t target =
-            (count_ * percentile + 99U) / 100U;
-        std::uint64_t cumulative = 0U;
-        for (std::size_t bucket = 0U; bucket < histogram_.size(); ++bucket) {
-            cumulative += histogram_[bucket];
-            if (cumulative >= target) {
-                return static_cast<double>(bucket);
-            }
-        }
-        return static_cast<double>(kLatencyHistogramMaximumUs + 1U);
-    }
-
-private:
-    std::vector<std::uint64_t> histogram_;
-    std::uint64_t count_ = 0U;
-    std::uint64_t maximum_ns_ = 0U;
-    std::uint64_t overwritten_ = 0U;
-    std::uint64_t clock_errors_ = 0U;
-    long double sum_ns_ = 0.0L;
-};
 
 void PrintUsage() {
     std::cout
@@ -249,9 +156,9 @@ void PrintUsage() {
         << "  --sdk-work-threads N       default 1\n"
         << "  --sdk-ready-timeout-seconds N default 30; range 1..3600\n"
         << "  --sdk-console-log\n"
+        << "  --feed-epoch N            shared nonzero physical-output epoch\n"
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
         << "  --arrow-ring-dir DIR       publish per-owner Arrow rings\n"
-        << "  --arrow-feed-epoch N       required nonzero connection epoch\n"
         << "  --arrow-descriptors N      power of two; default 1024\n"
         << "  --arrow-segments N         default 1088\n"
         << "  --arrow-tick-segment-bytes N      default 262144\n"
@@ -271,7 +178,6 @@ void PrintUsage() {
         << "  --clickhouse-user USER     default default\n"
         << "  --clickhouse-password-env NAME read password from environment\n"
         << "  --clickhouse-no-proxy LIST libcurl no-proxy list; default *\n"
-        << "  --clickhouse-feed-epoch N  required nonzero feed-run epoch\n"
         << "  --clickhouse-source-instance-id HEX32 optional stable source ID\n"
         << "  --clickhouse-writers N     default 2\n"
         << "  --clickhouse-tick-batch-rows N default 16384\n"
@@ -820,12 +726,9 @@ struct CpuSelection final {
                                 std::string* error) {
     Options parsed{};
     bool mode_set = false;
-#if defined(L2FLOW_CH_HAS_ARROW_RING)
-    bool arrow_feed_epoch_set = false;
-#endif
+    bool feed_epoch_set = false;
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
     bool clickhouse_option_seen = false;
-    bool clickhouse_feed_epoch_set = false;
     bool clickhouse_source_instance_set = false;
     bool event_option_seen = false;
     bool event_revision_epoch_set = false;
@@ -865,6 +768,13 @@ struct CpuSelection final {
                 *error = "invalid --trade-date";
                 return false;
             }
+        } else if (argument == "--feed-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.engine.feed_session_epoch)) {
+                *error = "invalid --feed-epoch";
+                return false;
+            }
+            feed_epoch_set = true;
         } else if (argument == "--catalog") {
             parsed.catalog_path = next(argument);
         } else if (argument == "--operation-mode") {
@@ -994,14 +904,6 @@ struct CpuSelection final {
             clickhouse_option_seen = true;
         } else if (argument == "--clickhouse-no-proxy") {
             parsed.clickhouse.no_proxy = next(argument);
-            clickhouse_option_seen = true;
-        } else if (argument == "--clickhouse-feed-epoch") {
-            if (!ParseInteger(next(argument),
-                              &parsed.clickhouse.feed_session_epoch)) {
-                *error = "invalid --clickhouse-feed-epoch";
-                return false;
-            }
-            clickhouse_feed_epoch_set = true;
             clickhouse_option_seen = true;
         } else if (argument == "--clickhouse-source-instance-id") {
             if (!l2flow::clickhouse::ParseIdentifier(
@@ -1586,13 +1488,6 @@ struct CpuSelection final {
         } else if (argument == "--arrow-ring-dir") {
             parsed.arrow.root_directory = next(argument);
             parsed.arrow_enabled = true;
-        } else if (argument == "--arrow-feed-epoch") {
-            if (!ParseInteger(next(argument),
-                              &parsed.arrow.feed_session_epoch)) {
-                *error = "invalid --arrow-feed-epoch";
-                return false;
-            }
-            arrow_feed_epoch_set = true;
         } else if (argument == "--arrow-descriptors") {
             if (!ParseInteger(next(argument),
                               &parsed.arrow.descriptor_capacity)) {
@@ -1678,6 +1573,10 @@ struct CpuSelection final {
         *error = "--mode, --trade-date, and --catalog are required";
         return false;
     }
+    if (feed_epoch_set && parsed.engine.feed_session_epoch == 0U) {
+        *error = "--feed-epoch must be nonzero";
+        return false;
+    }
     if (!parsed.validate_only &&
         (parsed.sdk.shared_library.empty() ||
          parsed.sdk.server_address.empty() || parsed.sdk.user_name.empty())) {
@@ -1714,12 +1613,13 @@ struct CpuSelection final {
         return false;
     }
     if (parsed.clickhouse_enabled) {
-        if (!clickhouse_feed_epoch_set ||
-            parsed.clickhouse.feed_session_epoch == 0U) {
+        if (!feed_epoch_set || parsed.engine.feed_session_epoch == 0U) {
             *error =
-                "--clickhouse-url requires a nonzero --clickhouse-feed-epoch";
+                "physical output requires a nonzero --feed-epoch";
             return false;
         }
+        parsed.clickhouse.feed_session_epoch =
+            parsed.engine.feed_session_epoch;
         if (clickhouse_source_instance_set &&
             parsed.clickhouse.source_instance_id ==
                 l2flow::clickhouse::Identifier128{}) {
@@ -1743,8 +1643,6 @@ struct CpuSelection final {
                 parsed.clickhouse, error)) {
             return false;
         }
-        parsed.engine.feed_session_epoch =
-            parsed.clickhouse.feed_session_epoch;
         output_configured = true;
     }
     if (parsed.event_enabled) {
@@ -1886,22 +1784,16 @@ struct CpuSelection final {
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     parsed.arrow.owner_count = parsed.engine.instrument_workers;
     if (parsed.arrow_enabled) {
-        if (parsed.engine.feed_session_epoch != 0U &&
-            parsed.engine.feed_session_epoch !=
-                parsed.arrow.feed_session_epoch) {
-            *error = "Arrow and ClickHouse feed epochs must match";
+        if (!feed_epoch_set || parsed.engine.feed_session_epoch == 0U) {
+            *error = "physical output requires a nonzero --feed-epoch";
             return false;
         }
+        parsed.arrow.feed_session_epoch = parsed.engine.feed_session_epoch;
         if (!l2flow::arrow_hot::ValidateArrowHotEgressConfig(
                 parsed.arrow, error)) {
             return false;
         }
-        parsed.engine.feed_session_epoch =
-            parsed.arrow.feed_session_epoch;
         output_configured = true;
-    } else if (arrow_feed_epoch_set) {
-        *error = "--arrow-feed-epoch requires --arrow-ring-dir";
-        return false;
     }
 #endif
     // Validate-only and discard-only runs have no persisted cross-process
@@ -2334,107 +2226,6 @@ void PublishMdlConnectionBoundary(
 }
 #endif
 
-void ObserveLatency(std::uint64_t ingress_sequence,
-                    std::uint64_t receive_monotonic_ns,
-                    LatencySampler* sampler) noexcept {
-    if (sampler == nullptr ||
-        ingress_sequence % kLatencySampleEvery != 0U) {
-        return;
-    }
-    const std::uint64_t now = l2flow::ingest::MonotonicNowNs();
-    if (now < receive_monotonic_ns) {
-        sampler->clock_errors.fetch_add(1U, std::memory_order_relaxed);
-        return;
-    }
-    const std::uint64_t write_sequence = sampler->next_sequence;
-    LatencySampleSlot& slot = sampler->samples[static_cast<std::size_t>(
-        write_sequence % kLatencyRingCapacity)];
-    slot.latency_ns.store(
-        now - receive_monotonic_ns, std::memory_order_relaxed);
-    slot.sequence.store(write_sequence + 1U, std::memory_order_release);
-    sampler->next_sequence = write_sequence + 1U;
-    sampler->published.store(write_sequence + 1U, std::memory_order_release);
-}
-
-LatencyWindow CollectLatency(
-    LatencySampler* samplers,
-    std::size_t sampler_count,
-    std::vector<std::uint64_t>* cursors,
-    std::vector<std::uint64_t>* clock_error_cursors) {
-    LatencyWindow window;
-    if (samplers == nullptr || cursors == nullptr ||
-        clock_error_cursors == nullptr || cursors->size() != sampler_count ||
-        clock_error_cursors->size() != sampler_count) {
-        return window;
-    }
-    for (std::size_t index = 0U; index < sampler_count; ++index) {
-        LatencySampler& sampler = samplers[index];
-        const std::uint64_t end =
-            sampler.published.load(std::memory_order_acquire);
-        std::uint64_t begin = (*cursors)[index];
-        if (end < begin) {
-            begin = end;
-        }
-        if (end - begin > kLatencyRingCapacity) {
-            window.overwritten += end - begin - kLatencyRingCapacity;
-            begin = end - kLatencyRingCapacity;
-        }
-        for (std::uint64_t sequence = begin; sequence < end; ++sequence) {
-            LatencySampleSlot& slot = sampler.samples[
-                static_cast<std::size_t>(
-                    sequence % kLatencyRingCapacity)];
-            const std::uint64_t expected = sequence + 1U;
-            const std::uint64_t first_tag =
-                slot.sequence.load(std::memory_order_acquire);
-            const std::uint64_t latency_ns =
-                slot.latency_ns.load(std::memory_order_relaxed);
-            const std::uint64_t second_tag =
-                slot.sequence.load(std::memory_order_acquire);
-            if (first_tag == expected && second_tag == expected) {
-                window.samples_ns.push_back(latency_ns);
-            } else {
-                ++window.overwritten;
-            }
-        }
-        (*cursors)[index] = end;
-
-        const std::uint64_t clock_errors =
-            sampler.clock_errors.load(std::memory_order_acquire);
-        const std::uint64_t previous_clock_errors =
-            (*clock_error_cursors)[index];
-        if (clock_errors >= previous_clock_errors) {
-            window.clock_errors += clock_errors - previous_clock_errors;
-        }
-        (*clock_error_cursors)[index] = clock_errors;
-    }
-    return window;
-}
-
-LatencySummary SummarizeLatency(
-    std::vector<std::uint64_t>* samples_ns) {
-    LatencySummary summary;
-    if (samples_ns == nullptr || samples_ns->empty()) {
-        return summary;
-    }
-    std::sort(samples_ns->begin(), samples_ns->end());
-    summary.count = samples_ns->size();
-    const long double sum = std::accumulate(
-        samples_ns->begin(), samples_ns->end(), 0.0L);
-    summary.average_us = static_cast<double>(
-        sum / static_cast<long double>(summary.count)) / 1'000.0;
-    const auto percentile = [samples_ns](std::size_t percent) {
-        const std::size_t rank =
-            (samples_ns->size() * percent + 99U) / 100U - 1U;
-        return static_cast<double>((*samples_ns)[rank]) / 1'000.0;
-    };
-    summary.p50_us = percentile(50U);
-    summary.p95_us = percentile(95U);
-    summary.p99_us = percentile(99U);
-    summary.maximum_us =
-        static_cast<double>(samples_ns->back()) / 1'000.0;
-    return summary;
-}
-
 [[nodiscard]] std::uint64_t CounterDelta(std::uint64_t current,
                                          std::uint64_t previous) noexcept {
     return current >= previous ? current - previous : 0U;
@@ -2443,9 +2234,9 @@ LatencySummary SummarizeLatency(
 void PrintMonitor(const EngineStats& current,
                   const EngineStats& previous,
                   double interval_seconds,
-                  const LatencySummary& latency,
-                  const LatencyWindow& latency_window,
-                  const LatencyAggregate& latency_aggregate) {
+                  const DispatchLatencySummary& latency,
+                  const DispatchLatencyWindow& latency_window,
+                  const DispatchLatencyAggregate& latency_aggregate) {
     const double safe_interval = interval_seconds > 0.0
         ? interval_seconds
         : 1.0;
@@ -2467,7 +2258,8 @@ void PrintMonitor(const EngineStats& current,
               << static_cast<double>(CounterDelta(
                      dispatch_current, dispatch_previous)) /
                      safe_interval
-              << " delay_sample_every=" << kLatencySampleEvery
+              << " delay_sample_every="
+              << l2flow::ingest::kDispatchLatencySampleEvery
               << " delay_samples=" << latency.count
               << " delay_avg_us=" << latency.average_us
               << " delay_p50_us=" << latency.p50_us
@@ -2509,10 +2301,11 @@ void PrintMonitor(const EngineStats& current,
               << std::flush;
 }
 
-void PrintFinalLatency(const LatencyAggregate& latency) {
+void PrintFinalLatency(const DispatchLatencyAggregate& latency) {
     std::cout << std::fixed << std::setprecision(3)
               << "final_delay basis=callback_to_dispatch"
-              << " sample_every=" << kLatencySampleEvery
+              << " sample_every="
+              << l2flow::ingest::kDispatchLatencySampleEvery
               << " samples=" << latency.count()
               << " avg_us=" << latency.average_us()
               << " p50_us=" << latency.PercentileUs(50U)
@@ -2819,17 +2612,17 @@ int main(int argc, char** argv) {
          owner < options.engine.instrument_workers; ++owner) {
         owner_drained[owner].store(false, std::memory_order_relaxed);
     }
-    std::unique_ptr<LatencySampler[]> latency_samplers;
+    std::unique_ptr<DispatchLatencySampler[]> latency_samplers;
     std::vector<std::uint64_t> latency_cursors;
     std::vector<std::uint64_t> latency_clock_error_cursors;
-    std::unique_ptr<LatencyAggregate> latency_aggregate;
+    std::unique_ptr<DispatchLatencyAggregate> latency_aggregate;
     if (options.operation_mode == OperationMode::kTest) {
-        latency_samplers = std::make_unique<LatencySampler[]>(
+        latency_samplers = std::make_unique<DispatchLatencySampler[]>(
             options.engine.instrument_workers);
         latency_cursors.resize(options.engine.instrument_workers, 0U);
         latency_clock_error_cursors.resize(
             options.engine.instrument_workers, 0U);
-        latency_aggregate = std::make_unique<LatencyAggregate>();
+        latency_aggregate = std::make_unique<DispatchLatencyAggregate>();
     }
     std::vector<std::thread> drain_threads;
     drain_threads.reserve(options.engine.instrument_workers);
@@ -2867,10 +2660,17 @@ int main(int argc, char** argv) {
                     const bool projectable =
                         dispatch.kind == TickDispatchKind::kProjectOrdered ||
                         dispatch.kind == TickDispatchKind::kProjectHoleFill;
-                    if (projectable && latency_samplers != nullptr) {
-                        ObserveLatency(
+                    // Consumer zero is the single measurement plane. Every
+                    // sampled ingress Tick contributes at most one latency,
+                    // independent of how many derived sinks are enabled.
+                    if (consumer == 0U && projectable &&
+                        latency_samplers != nullptr &&
+                        l2flow::ingest::ShouldSampleDispatchLatency(
+                            dispatch.tick.common.ingress_sequence)) {
+                        l2flow::ingest::ObserveDispatchLatency(
                             dispatch.tick.common.ingress_sequence,
                             dispatch.tick.common.receive_monotonic_ns,
+                            l2flow::ingest::MonotonicNowNs(),
                             &latency_samplers[owner]);
                     }
                     // TryPoll has already advanced this plane's cursor. Stop
@@ -2964,10 +2764,13 @@ int main(int argc, char** argv) {
 #endif
                      engine->TryPollSnapshot(owner, &snapshot);
                      ++drained) {
-                    if (latency_samplers != nullptr) {
-                        ObserveLatency(
+                    if (latency_samplers != nullptr &&
+                        l2flow::ingest::ShouldSampleDispatchLatency(
+                            snapshot.common.ingress_sequence)) {
+                        l2flow::ingest::ObserveDispatchLatency(
                             snapshot.common.ingress_sequence,
                             snapshot.common.receive_monotonic_ns,
+                            l2flow::ingest::MonotonicNowNs(),
                             &latency_samplers[owner]);
                     }
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
@@ -3060,6 +2863,9 @@ int main(int argc, char** argv) {
     }
 
     const auto stop_engine_producers = [&] { engine->Stop(); };
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    bool final_gap_delivery_ok = true;
+#endif
     const auto finish_owner_drain = [&] {
         drain_after_stop.store(true, std::memory_order_release);
         for (;;) {
@@ -3084,8 +2890,13 @@ int main(int argc, char** argv) {
         ChannelGap final_gap{};
         while (engine->TryPollGap(&final_gap)) {
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
-            if (arrow_egress != nullptr) {
-                static_cast<void>(arrow_egress->AppendGap(final_gap));
+            if (arrow_egress != nullptr &&
+                !arrow_egress->AppendGap(final_gap)) {
+                // TryPoll has consumed this coalesced snapshot. Fail closed
+                // and leave later snapshots untouched instead of claiming
+                // that rejected diagnostics were delivered.
+                final_gap_delivery_ok = false;
+                break;
             }
 #endif
             consumed_gaps.fetch_add(1U, std::memory_order_relaxed);
@@ -3275,13 +3086,15 @@ int main(int argc, char** argv) {
             const SteadyClock::time_point now = SteadyClock::now();
             if (now >= next_report_time) {
                 const EngineStats current_stats = engine->stats();
-                LatencyWindow latency_window = CollectLatency(
-                    latency_samplers.get(),
-                    options.engine.instrument_workers,
-                    &latency_cursors, &latency_clock_error_cursors);
+                DispatchLatencyWindow latency_window =
+                    l2flow::ingest::CollectDispatchLatency(
+                        latency_samplers.get(),
+                        options.engine.instrument_workers,
+                        &latency_cursors, &latency_clock_error_cursors);
                 latency_aggregate->Add(latency_window);
-                const LatencySummary latency_summary =
-                    SummarizeLatency(&latency_window.samples_ns);
+                const DispatchLatencySummary latency_summary =
+                    l2flow::ingest::SummarizeDispatchLatency(
+                        &latency_window.samples);
                 const double interval_seconds =
                     std::chrono::duration<double>(
                         now - previous_report_time).count();
@@ -3362,9 +3175,10 @@ int main(int argc, char** argv) {
 #endif
         !engine->healthy());
     if (options.operation_mode == OperationMode::kTest) {
-        LatencyWindow final_latency_window = CollectLatency(
-            latency_samplers.get(), options.engine.instrument_workers,
-            &latency_cursors, &latency_clock_error_cursors);
+        DispatchLatencyWindow final_latency_window =
+            l2flow::ingest::CollectDispatchLatency(
+                latency_samplers.get(), options.engine.instrument_workers,
+                &latency_cursors, &latency_clock_error_cursors);
         latency_aggregate->Add(final_latency_window);
         PrintFinalLatency(*latency_aggregate);
     }
@@ -3437,9 +3251,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
-    if (arrow_egress != nullptr && !arrow_egress->healthy()) {
+    if (arrow_egress != nullptr &&
+        (!final_gap_delivery_ok || !arrow_egress->healthy())) {
+        const std::string arrow_error = arrow_egress->fatal_error();
         std::cerr << "fatal Arrow hot-egress error: "
-                  << arrow_egress->fatal_error() << '\n';
+                  << (arrow_error.empty()
+                          ? "final gap delivery was rejected"
+                          : arrow_error)
+                  << '\n';
         return 1;
     }
 #endif

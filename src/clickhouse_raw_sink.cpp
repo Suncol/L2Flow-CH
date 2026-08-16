@@ -985,12 +985,21 @@ SETTINGS
     return sql;
 }
 
-[[nodiscard]] std::string RawTableEngineProbe(std::string_view database) {
+[[nodiscard]] std::string RawTableContractProbe(std::string_view database) {
     return "SELECT throwIf(count() != 2 OR "
            "countIf(engine NOT IN ('MergeTree', 'ReplicatedMergeTree')) != 0 "
-           "OR countIf(partition_key != 'trade_date') != 0, "
+           "OR countIf(partition_key != 'trade_date') != 0 "
+           "OR countIf(engine = 'MergeTree' AND "
+           "toUInt64OrZero(extract(engine_full, "
+           "'non_replicated_deduplication_window[[:space:]]*="
+           "[[:space:]]*([0-9]+)')) < 10000) != 0 "
+           "OR countIf(engine = 'ReplicatedMergeTree' AND "
+           "toUInt64OrZero(extract(engine_full, "
+           "'replicated_deduplication_window[[:space:]]*="
+           "[[:space:]]*([0-9]+)')) < 10000) != 0, "
            "'raw tables must be MergeTree/ReplicatedMergeTree partitioned "
-           "by trade_date') FROM system.tables WHERE database = '" +
+           "by trade_date with a deduplication window of at least 10000') "
+           "FROM system.tables WHERE database = '" +
            std::string(database) +
            "' AND name IN ('raw_tick', 'raw_snapshot') FORMAT Null";
 }
@@ -1434,7 +1443,7 @@ public:
                     return false;
                 }
             }
-            if (!execute(RawTableEngineProbe(config_.database)) ||
+            if (!execute(RawTableContractProbe(config_.database)) ||
                 !execute(RawColumnProbe(
                     config_.database, "raw_tick", kTickFields)) ||
                 !execute(RawColumnProbe(

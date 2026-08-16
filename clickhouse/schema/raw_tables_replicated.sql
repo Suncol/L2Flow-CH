@@ -4,8 +4,8 @@
 --   shard:              stable shard identifier
 --   replica:            unique replica identifier within the shard
 -- Apply this file through the deployment orchestrator on each replica (or add
--- the deployment's ON CLUSTER clause). Also set replicated_deduplication_window
--- high enough to cover the configured INSERT retry interval and block rate.
+-- the deployment's ON CLUSTER clause). Increase the table-local deduplication
+-- window if 10000 blocks do not cover the configured retry interval.
 CREATE DATABASE IF NOT EXISTS l2flow;
 
 CREATE TABLE IF NOT EXISTS l2flow.raw_tick
@@ -76,7 +76,9 @@ ORDER BY
     feed_session_epoch,
     ingress_sequence
 )
-SETTINGS allow_nullable_key = 1;
+SETTINGS
+    allow_nullable_key = 1,
+    replicated_deduplication_window = 10000;
 
 CREATE TABLE IF NOT EXISTS l2flow.raw_snapshot
 (
@@ -179,4 +181,6 @@ ORDER BY
     feed_session_epoch,
     ingress_sequence
 )
-SETTINGS allow_nullable_key = 1;
+SETTINGS
+    allow_nullable_key = 1,
+    replicated_deduplication_window = 10000;

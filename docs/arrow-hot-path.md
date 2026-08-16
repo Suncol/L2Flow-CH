@@ -333,7 +333,7 @@ numactl --physcpubind=64-127 --membind=1 \
   --producer-cpu 127 --first-consumer-cpu 64 \
   --first-decoder-cpu 80 --first-arrow-reader-cpu 93 \
   --arrow-ring-dir /dev/shm/l2flow/arrow-benchmark \
-  --arrow-feed-epoch EPOCH \
+  --feed-epoch EPOCH \
   --arrow-descriptors 256 --arrow-segments 320 \
   --arrow-tick-bytes 262144 --arrow-batch-rows 256 \
   --arrow-max-delay-ns 1000000
@@ -408,7 +408,7 @@ Example launch arguments for the Arrow portion are:
 
 ```text
 --arrow-ring-dir /dev/shm/l2flow/arrow
---arrow-feed-epoch <durably allocated increasing value>
+--feed-epoch <durably allocated increasing process epoch>
 --sdk-ready-timeout-seconds 30
 --arrow-descriptors 1024
 --arrow-segments 1088

@@ -124,9 +124,10 @@ ClickHouse committed an INSERT but its response did not reach the writer.
 The retry elapsed-time budget begins when the first unknown outcome returns, so
 an initial request timeout cannot consume the budget before the first exact
 retry is attempted.
-Local `MergeTree` tables set `non_replicated_deduplication_window=10000`.
-Replicated deployments must size `replicated_deduplication_window` for their
-block rate and maximum retry interval.
+Local `MergeTree` tables set `non_replicated_deduplication_window=10000` and
+replicated tables set `replicated_deduplication_window=10000`. Startup rejects
+either table type when its table-local window is smaller. Deployments with more
+than 10000 blocks inside the maximum retry interval must increase the setting.
 
 Every request uses ArrowStream with synchronous settings equivalent to:
 
@@ -249,7 +250,7 @@ should cover seconds of measured ClickHouse jitter, not minutes of outage.
 
 ```text
 --clickhouse-url <http-or-https-base-url>
---clickhouse-feed-epoch <nonzero run epoch>
+--feed-epoch <nonzero process epoch>
 --clickhouse-source-instance-id <optional stable 32-hex ID>
 --clickhouse-database <database>
 --clickhouse-user <user>

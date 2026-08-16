@@ -1,10 +1,12 @@
 #include "l2flow/ingest/outbox.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -191,6 +193,53 @@ void TestRejectsInvalidCreate() {
     CHECK(DispositionOutbox::Create(1U, 1U, 1U, 8U, 0U, &error) == nullptr);
 }
 
+void TestConcurrentWrapPreservesWholeRecords() {
+    auto outbox = MakeOutbox(1U, 1U, 1U, 2U);
+    constexpr std::uint64_t kRecords = 250'000U;
+    std::atomic<bool> producer_done{false};
+    std::thread producer([&] {
+        for (std::uint64_t sequence = 1U;
+             sequence <= kRecords; ++sequence) {
+            TickDispatch dispatch = Occurrence(0U, 1U);
+            dispatch.tick.common.ingress_sequence = sequence;
+            dispatch.tick.common.vendor_sequence_id = sequence;
+            dispatch.tick.common.receive_monotonic_ns = sequence;
+            dispatch.tick.common.native_sequence = sequence;
+            dispatch.tick.price.raw = static_cast<std::int64_t>(sequence);
+            dispatch.tick.price.p6 = static_cast<std::int64_t>(sequence);
+            dispatch.tick.quantity.raw = static_cast<std::int64_t>(sequence);
+            while (!outbox->Append(0U, dispatch)) {
+                std::this_thread::yield();
+            }
+        }
+        producer_done.store(true, std::memory_order_release);
+    });
+
+    std::uint64_t expected = 1U;
+    TickDispatch dispatch{};
+    while (expected <= kRecords) {
+        if (!outbox->TryRead(0U, 0U, &dispatch)) {
+            CHECK(!producer_done.load(std::memory_order_acquire) ||
+                  expected > outbox->head_lsn(0U));
+            std::this_thread::yield();
+            continue;
+        }
+        CHECK(dispatch.outbox_lsn == expected);
+        CHECK(dispatch.dispatch_fence == expected);
+        CHECK(dispatch.tick.common.ingress_sequence == expected);
+        CHECK(dispatch.tick.common.vendor_sequence_id == expected);
+        CHECK(dispatch.tick.common.receive_monotonic_ns == expected);
+        CHECK(dispatch.tick.common.native_sequence == expected);
+        CHECK(dispatch.tick.price.raw == static_cast<std::int64_t>(expected));
+        CHECK(dispatch.tick.price.p6 == static_cast<std::int64_t>(expected));
+        CHECK(dispatch.tick.quantity.raw ==
+              static_cast<std::int64_t>(expected));
+        ++expected;
+    }
+    producer.join();
+    CHECK(producer_done.load(std::memory_order_acquire));
+}
+
 }  // namespace
 
 int main() {
@@ -200,6 +249,7 @@ int main() {
     TestLanesHaveIndependentLsns();
     TestFreshnessModes();
     TestRejectsInvalidCreate();
+    TestConcurrentWrapPreservesWholeRecords();
     std::cout << "test_outbox: ok\n";
     return 0;
 }

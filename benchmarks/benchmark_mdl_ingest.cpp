@@ -72,6 +72,7 @@ struct Options final {
     std::size_t dispatch_queue_capacity = 4'096U;
     std::size_t tick_consumer_count = 1U;
     std::uint64_t latency_sample_every = 1U;
+    std::uint64_t feed_session_epoch = 0U;
     std::uint64_t gap_wait_ns = 500'000U;
     ArrivalPattern pattern = ArrivalPattern::kOrdered;
     std::size_t reorder_window = 1U;
@@ -96,7 +97,6 @@ struct Options final {
 #endif
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::filesystem::path arrow_ring_directory;
-    std::uint64_t arrow_feed_session_epoch = 1U;
     std::size_t arrow_descriptor_capacity = 256U;
     std::size_t arrow_segment_count = 320U;
     std::size_t arrow_tick_segment_payload_bytes = 256U * 1'024U;
@@ -115,7 +115,7 @@ struct Options final {
     l2flow::arrow_hot::ArrowHotEgressConfig config{};
     config.root_directory = options.arrow_ring_directory;
     config.owner_count = options.instrument_owners;
-    config.feed_session_epoch = options.arrow_feed_session_epoch;
+    config.feed_session_epoch = options.feed_session_epoch;
     config.descriptor_capacity = options.arrow_descriptor_capacity;
     config.segment_count = options.arrow_segment_count;
     config.tick_segment_payload_bytes =
@@ -327,6 +327,7 @@ void PrintUsage() {
         << "  --dispatch-queue-capacity N default 4096\n"
         << "  --tick-consumers N       independent outbox cursors; default 1\n"
         << "  --sample-every N         latency percentile sample stride\n"
+        << "  --feed-epoch N           shared nonzero physical-output epoch\n"
         << "  --gap-wait-ns N          FROM_OPEN reorder wait; default 500000\n"
         << "  --producer-cpu N         default 0\n"
         << "  --first-consumer-cpu N   default 1\n"
@@ -335,7 +336,6 @@ void PrintUsage() {
     std::cout
         << "  --clickhouse-url URL     enable durable raw writes\n"
         << "  --clickhouse-database NAME default l2flow\n"
-        << "  --clickhouse-feed-epoch N required nonzero run epoch\n"
         << "  --clickhouse-writers N   default 2\n"
         << "  --clickhouse-tick-batch-rows N default 16384\n"
         << "  --clickhouse-tick-batch-bytes N default 16777216\n"
@@ -380,7 +380,6 @@ void PrintUsage() {
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
     std::cout
         << "  --arrow-ring-dir PATH    enable Arrow publish/read/decode\n"
-        << "  --arrow-feed-epoch N     default 1\n"
         << "  --arrow-descriptors N    default 256, power of two\n"
         << "  --arrow-segments N       default 320\n"
         << "  --arrow-tick-bytes N     segment payload bytes; default 262144\n"
@@ -398,6 +397,7 @@ void PrintUsage() {
         return false;
     }
     Options parsed{};
+    bool feed_epoch_set = false;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
         const auto next = [&](std::string_view name) -> std::string_view {
@@ -462,6 +462,13 @@ void PrintUsage() {
                 *error = "invalid --sample-every";
                 return false;
             }
+        } else if (argument == "--feed-epoch") {
+            if (!ParseInteger(next(argument),
+                              &parsed.feed_session_epoch)) {
+                *error = "invalid --feed-epoch";
+                return false;
+            }
+            feed_epoch_set = true;
         } else if (argument == "--gap-wait-ns") {
             if (!ParseInteger(next(argument), &parsed.gap_wait_ns)) {
                 *error = "invalid --gap-wait-ns";
@@ -504,13 +511,6 @@ void PrintUsage() {
             parsed.clickhouse_configuration_set = true;
         } else if (argument == "--clickhouse-database") {
             parsed.clickhouse.database = next(argument);
-            parsed.clickhouse_configuration_set = true;
-        } else if (argument == "--clickhouse-feed-epoch") {
-            if (!ParseInteger(next(argument),
-                              &parsed.clickhouse.feed_session_epoch)) {
-                *error = "invalid --clickhouse-feed-epoch";
-                return false;
-            }
             parsed.clickhouse_configuration_set = true;
         } else if (argument == "--clickhouse-writers") {
             if (!ParseInteger(next(argument),
@@ -805,13 +805,6 @@ void PrintUsage() {
             }
             parsed.arrow_ring_directory = std::string(value);
             parsed.arrow_configuration_set = true;
-        } else if (argument == "--arrow-feed-epoch") {
-            if (!ParseInteger(next(argument),
-                              &parsed.arrow_feed_session_epoch)) {
-                *error = "invalid --arrow-feed-epoch";
-                return false;
-            }
-            parsed.arrow_configuration_set = true;
         } else if (argument == "--arrow-descriptors") {
             if (!ParseInteger(next(argument),
                               &parsed.arrow_descriptor_capacity)) {
@@ -924,11 +917,11 @@ void PrintUsage() {
         return false;
     }
     if (parsed.clickhouse_enabled) {
-        if (parsed.clickhouse.feed_session_epoch == 0U) {
-            *error = "--clickhouse-url requires a nonzero "
-                     "--clickhouse-feed-epoch";
+        if (!feed_epoch_set || parsed.feed_session_epoch == 0U) {
+            *error = "physical output requires a nonzero --feed-epoch";
             return false;
         }
+        parsed.clickhouse.feed_session_epoch = parsed.feed_session_epoch;
         parsed.clickhouse.tick_decoder_lanes = parsed.tick_lanes;
         parsed.clickhouse.snapshot_decoder_lanes = 1U;
         if (!l2flow::clickhouse::ValidateRawClickHouseConfig(
@@ -1018,6 +1011,10 @@ void PrintUsage() {
         return false;
     }
     if (arrow_enabled) {
+        if (!feed_epoch_set || parsed.feed_session_epoch == 0U) {
+            *error = "physical output requires a nonzero --feed-epoch";
+            return false;
+        }
         const std::size_t decoder_threads = parsed.tick_lanes + 1U;
         if (parsed.first_arrow_reader_cpu == -1) {
             if (parsed.first_decoder_cpu < 0) {
@@ -1041,15 +1038,6 @@ void PrintUsage() {
                 arrow_config, error)) {
             return false;
         }
-    }
-#endif
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW) && \
-    defined(L2FLOW_CH_HAS_ARROW_RING)
-    if (parsed.clickhouse_enabled && arrow_enabled &&
-        parsed.clickhouse.feed_session_epoch !=
-            parsed.arrow_feed_session_epoch) {
-        *error = "--clickhouse-feed-epoch and --arrow-feed-epoch must match";
-        return false;
     }
 #endif
 #if defined(__linux__)
@@ -1444,15 +1432,9 @@ int main(int argc, char** argv) {
     }
     EngineConfig config{};
     config.trade_date = 20260806U;
-    config.feed_session_epoch =
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-        options.clickhouse_enabled ? options.clickhouse.feed_session_epoch :
-#endif
-#if defined(L2FLOW_CH_HAS_ARROW_RING)
-        !options.arrow_ring_directory.empty()
-            ? options.arrow_feed_session_epoch :
-#endif
-        1U;
+    config.feed_session_epoch = options.feed_session_epoch == 0U
+        ? 1U
+        : options.feed_session_epoch;
     config.start_mode = StartMode::kFromOpen;
     config.tick_decoder_lanes = options.tick_lanes;
     config.snapshot_decoder_lanes = 1U;
@@ -1773,7 +1755,7 @@ int main(int argc, char** argv) {
                     l2flow::arrow_hot::RingStreamKind::kOrderedTick ||
                 reader->shard_id() != static_cast<std::uint32_t>(owner) ||
                 reader->feed_session_epoch() !=
-                    options.arrow_feed_session_epoch ||
+                    options.feed_session_epoch ||
                 reader->producer_instance() !=
                     arrow_egress->producer_instance()) {
                 std::cerr << "Arrow benchmark reader open failed for owner "
@@ -2041,7 +2023,7 @@ int main(int argc, char** argv) {
                         read.metadata.row_count !=
                             static_cast<std::uint32_t>(batch->num_rows()) ||
                         read.metadata.feed_session_epoch !=
-                            options.arrow_feed_session_epoch ||
+                            options.feed_session_epoch ||
                         static_cast<std::uint64_t>(batch->num_rows()) >
                             total_per_channel - state.rows) {
                         ++state.protocol_errors;
@@ -3119,7 +3101,7 @@ int main(int argc, char** argv) {
         std::cout
             << "arrow_config root="
             << options.arrow_ring_directory.string()
-            << " epoch=" << options.arrow_feed_session_epoch
+            << " epoch=" << options.feed_session_epoch
             << " descriptors=" << options.arrow_descriptor_capacity
             << " segments=" << options.arrow_segment_count
             << " tick_segment_bytes="

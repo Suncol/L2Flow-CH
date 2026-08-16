@@ -437,11 +437,21 @@ void TestUnknownOutcomeRetriesIdenticalBatch() {
     server.Stop();
 
     std::vector<CapturedRequest> inserts;
+    bool schema_contract_seen = false;
     for (const CapturedRequest& request : server.requests()) {
         if (request.target.find("INSERT") != std::string::npos) {
             inserts.push_back(request);
         }
+        if (request.target.find(
+                "non_replicated_deduplication_window") !=
+                std::string::npos &&
+            request.target.find(
+                "replicated_deduplication_window") !=
+                std::string::npos) {
+            schema_contract_seen = true;
+        }
     }
+    CHECK(schema_contract_seen);
     CHECK(inserts.size() == 2U);
     CHECK(!inserts[0U].body.empty());
     CHECK(inserts[0U].target == inserts[1U].target);
@@ -636,6 +646,16 @@ void TestClickHouseIntegration(std::string endpoint) {
     CHECK(externally_managed != nullptr);
     CHECK(externally_managed->Start(&error));
     CHECK(externally_managed->Stop(&error));
+
+    Query(config.endpoint,
+          "ALTER TABLE " + tick_table +
+              " MODIFY SETTING non_replicated_deduplication_window = 0");
+    std::unique_ptr<RawClickHouseSink> invalid_contract =
+        RawClickHouseSink::Create(config, &error);
+    CHECK(invalid_contract != nullptr);
+    CHECK(!invalid_contract->Start(&error));
+    CHECK(error.find("deduplication window of at least 10000") !=
+          std::string::npos);
     std::cout << "ClickHouse raw integration passed: database="
               << database << '\n';
 }

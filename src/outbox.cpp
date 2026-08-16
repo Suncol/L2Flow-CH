@@ -143,10 +143,15 @@ public:
                 const TickDispatch& record = slot.dispatch;
                 const bool deliver =
                     IsBroadcastOwner(record.owner) || record.owner == owner;
+                if (deliver) {
+                    // Keep the slot pinned until the complete non-atomic
+                    // record has been copied. Publishing the cursor first
+                    // would let the producer wrap and overwrite this slot.
+                    *output = record;
+                }
                 ++next;
                 next_cell.store(next, std::memory_order_release);
                 if (deliver) {
-                    *output = record;
                     output->owner = static_cast<std::uint32_t>(owner);
                     poll = (lane + 1U) % lane_count_;
                     publish_skipped();

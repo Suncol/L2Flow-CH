@@ -79,6 +79,7 @@ add_library(l2flow_ch_ingest STATIC
     src/catalog.cpp
     src/decoder.cpp
     src/engine.cpp
+    src/latency.cpp
     src/outbox.cpp
     src/stream_config.cpp
     src/sdk_runtime.cpp)
@@ -162,6 +163,11 @@ if(L2FLOW_CH_BUILD_TESTS)
     l2flow_ch_configure(test_outbox)
     target_link_libraries(test_outbox PRIVATE L2FlowCH::ingest)
     add_test(NAME disposition_outbox COMMAND test_outbox)
+
+    add_executable(test_latency tests/test_latency.cpp)
+    l2flow_ch_configure(test_latency)
+    target_link_libraries(test_latency PRIVATE L2FlowCH::ingest)
+    add_test(NAME dispatch_latency COMMAND test_latency)
 
     add_executable(test_fact_journal tests/test_fact_journal.cpp)
     l2flow_ch_configure(test_fact_journal)
@@ -252,7 +258,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --clickhouse-source-instance-id
                     000102030405060708090a0b0c0d0e0f
                 --clickhouse-queue-batches-per-lane 2
@@ -278,7 +284,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --event-enable
                 --fact-journal-path /tmp/l2flow-event-config.fjn
                 --fact-journal-maximum-directory-pages 16
@@ -297,7 +303,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --event-enable
                 --event-calculation-run-id
                     000102030405060708090a0b0c0d0e0f
@@ -338,7 +344,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --kline-enable
                 --fact-journal-path /tmp/l2flow-kline-config.fjn
                 --kline-interval-seconds 5
@@ -359,7 +365,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 --stream-config
                     ${CMAKE_CURRENT_SOURCE_DIR}/config/production.streams.conf
                 --clickhouse-url http://127.0.0.1:8123
-                --clickhouse-feed-epoch 42
+                --feed-epoch 42
                 --kline-enable
                 --kline-interval-seconds 5
                 --kline-calculation-run-id
@@ -454,16 +460,16 @@ if(L2FLOW_CH_BUILD_TESTS)
             --validate-only)
     if(L2FLOW_CH_ENABLE_ARROW_RING)
         add_test(
-            NAME mdl_ingest_rejects_zero_arrow_epoch
+            NAME mdl_ingest_rejects_zero_feed_epoch
             COMMAND mdl_ingestd
                 --mode partial
                 --trade-date 20260806
                 --catalog ${CMAKE_CURRENT_SOURCE_DIR}/config/catalog.example.csv
                 --arrow-ring-dir /tmp/l2flow-arrow-validate-only
-                --arrow-feed-epoch 0
+                --feed-epoch 0
                 --validate-only)
         set_tests_properties(
-            mdl_ingest_rejects_zero_arrow_epoch PROPERTIES WILL_FAIL TRUE)
+            mdl_ingest_rejects_zero_feed_epoch PROPERTIES WILL_FAIL TRUE)
     endif()
     add_test(
         NAME mdl_ingest_live_rejects_run_seconds
@@ -548,7 +554,7 @@ if(L2FLOW_CH_BUILD_TESTS)
                 L2FLOW_CLICKHOUSE_PASSWORD=
                 L2FLOW_FACT_JOURNAL_PATH=/tmp/l2flow-production-config.fjn
                 L2FLOW_SOURCE_INSTANCE_HEX32=000102030405060708090a0b0c0d0e0f
-                L2FLOW_RAW_FEED_EPOCH=42
+                L2FLOW_FEED_EPOCH=42
                 L2FLOW_EVENT_REVISION_EPOCH=9
                 L2FLOW_EVENT_RUN_HEX32=101112131415161718191a1b1c1d1e1f
                 L2FLOW_KLINE_INTERVAL_SECONDS=5
@@ -633,7 +639,7 @@ if(L2FLOW_CH_BUILD_BENCHMARKS)
                     --producer-cpu 0 --first-consumer-cpu 1
                     --first-decoder-cpu 2
                     --clickhouse-url http://127.0.0.1:8123
-                    --clickhouse-feed-epoch 1 --event-enable --kline-enable
+                    --feed-epoch 1 --event-enable --kline-enable
                     --event-journal-dir /tmp
                     --event-construction-smoke)
         endif()

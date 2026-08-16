@@ -251,7 +251,7 @@ Enable the path on top of durable raw ClickHouse output:
 
 ```text
 --clickhouse-url http://127.0.0.1:8123
---clickhouse-feed-epoch <nonzero raw feed epoch>
+--feed-epoch <nonzero process epoch>
 --kline-enable
 --kline-interval-seconds 1
 --kline-interval-seconds 5

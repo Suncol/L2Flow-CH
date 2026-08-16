@@ -219,9 +219,9 @@ Run identity is an external durable-allocation responsibility:
 
 - `L2FLOW_SOURCE_INSTANCE_HEX32` is a stable 32-hex (128-bit) identity for the
   logical raw source, not a new value on every restart.
-- `L2FLOW_RAW_FEED_EPOCH` must not be reused with that source identity.
-- `L2FLOW_ARROW_FEED_EPOCH` must be greater than the epoch already recorded at
-  the configured Arrow root.
+- `L2FLOW_FEED_EPOCH` is the single process continuity epoch. It must not be
+  reused with that source identity and must be greater than the epoch already
+  recorded at the configured Arrow root.
 - Event and KLine revision epochs are separate nonzero 32-bit domains. Each
   must be strictly greater than every epoch previously used for the same
   derived logical key space.
@@ -296,9 +296,13 @@ latency sampler. Use test mode only for a bounded operational measurement:
   --allow-discard-after-dispatch
 ```
 
-Test mode reports callback, admission, and dispatch throughput plus a 1-in-64
-sample of callback-entry-to-dispatch-drain latency. Production launch units
-must use live mode and external process supervision for lifecycle control.
+Test mode reports callback, admission, and dispatch throughput plus one
+callback-entry-to-dispatch-drain latency sample for every 64th ingress message.
+Tick latency is measured only at outbox consumer zero, so enabling Event,
+KLine, or Arrow cannot duplicate a sampled Tick. Interval percentiles are exact
+for the collected window; total percentiles use a bounded logarithmic histogram
+with no upper latency clip. Production launch units must use live mode and
+external process supervision for lifecycle control.
 
 The catalog uses exact, untrimmed identities:
 
@@ -308,12 +312,12 @@ instrument_id,market,security_id_source,security_id
 2,SZ,102,000001
 ```
 
-The executable enables durable raw writes with `--clickhouse-url` and a
-nonzero `--clickhouse-feed-epoch`. A stable 128-bit source identity may be
-supplied with `--clickhouse-source-instance-id`; otherwise the process creates
-one and prints it. Passwords are read only through
+The executable uses one nonzero `--feed-epoch` for every physical output and
+enables durable raw writes with `--clickhouse-url`. A stable 128-bit source
+identity may be supplied with `--clickhouse-source-instance-id`; otherwise the
+process creates one and prints it. Passwords are read only through
 `--clickhouse-password-env`. The optional Arrow hot path uses
-`--arrow-ring-dir` and `--arrow-feed-epoch`. A physical SDK run with neither
+`--arrow-ring-dir`. A physical SDK run with neither
 output requires `--allow-discard-after-dispatch`, making temporary drain
 behavior explicit rather than silently discarding data.
 
@@ -322,7 +326,7 @@ Example local raw launch arguments are:
 ```text
 --clickhouse-url http://127.0.0.1:8123
 --clickhouse-database l2flow
---clickhouse-feed-epoch <durably allocated nonzero run epoch>
+--feed-epoch <durably allocated nonzero process epoch>
 --clickhouse-source-instance-id <stable 32-hex source ID>
 ```
 
