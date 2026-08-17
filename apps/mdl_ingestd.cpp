@@ -2170,6 +2170,48 @@ void PrintKLineStats(
 }
 #endif
 
+[[nodiscard]] const char* MdlConnectionBoundaryReasonName(
+    MdlConnectionBoundaryReason reason) noexcept {
+    switch (reason) {
+        case MdlConnectionBoundaryReason::kNone:
+            return "none";
+        case MdlConnectionBoundaryReason::kConnectError:
+            return "connect_error";
+        case MdlConnectionBoundaryReason::kDisconnected:
+            return "disconnected";
+        case MdlConnectionBoundaryReason::kServiceTimeout:
+            return "service_timeout";
+        case MdlConnectionBoundaryReason::kMessageDiscarded:
+            return "message_discarded";
+        case MdlConnectionBoundaryReason::kSubscriptionRejected:
+            return "subscription_rejected";
+        case MdlConnectionBoundaryReason::kControlProtocolError:
+            return "control_protocol_error";
+        case MdlConnectionBoundaryReason::kReadyTimeout:
+            return "ready_timeout";
+    }
+    return "unknown";
+}
+
+void PrintMdlConnectionBoundaryDiagnostic(
+    const MdlMessageHandler& handler) {
+    const MdlConnectionBoundaryReason reason =
+        handler.connection_boundary_reason();
+    if (reason == MdlConnectionBoundaryReason::kNone) {
+        return;
+    }
+    std::cerr << "MDL_CONNECTION_BOUNDARY reason="
+              << MdlConnectionBoundaryReasonName(reason)
+              << " reason_code=" << static_cast<unsigned int>(reason)
+              << " monotonic_ns="
+              << handler.connection_boundary_monotonic_ns();
+    const std::string detail = handler.connection_boundary_detail();
+    if (!detail.empty()) {
+        std::cerr << " detail=" << detail;
+    }
+    std::cerr << '\n' << std::flush;
+}
+
 #if defined(L2FLOW_CH_HAS_ARROW_RING)
 void PrintArrowStats(
     const l2flow::arrow_hot::ArrowHotEgressStats& stats) {
@@ -2650,10 +2692,11 @@ int main(int argc, char** argv) {
 #endif
 #endif
             const auto consume_dispatch = [&](std::size_t consumer,
+                                              auto&& can_poll,
                                               auto&& deliver) {
                 bool consumed = false;
                 for (std::size_t drained = 0U;
-                     drained < kDrainBurstMessages &&
+                     drained < kDrainBurstMessages && can_poll() &&
                      engine->TryPollTickDispatch(
                          consumer, owner, &dispatch);
                      ++drained) {
@@ -2696,6 +2739,10 @@ int main(int argc, char** argv) {
                 if (event_runtime != nullptr && !event_poll_blocked) {
                     progress = consume_dispatch(
                                    event_consumer,
+                                   [&] {
+                                       return event_runtime->CanPollDispatch(
+                                           owner);
+                                   },
                                    [&](const TickDispatch& value) {
                                        return event_runtime->AppendDispatch(
                                            owner, value);
@@ -2705,6 +2752,7 @@ int main(int argc, char** argv) {
                 if (kline_runtime != nullptr && kline_runtime->healthy()) {
                     progress = consume_dispatch(
                                    kline_consumer,
+                                   [&] { return kline_runtime->healthy(); },
                                    [&](const TickDispatch& value) {
                                        return kline_runtime->AppendDispatch(
                                            owner, value);
@@ -2716,6 +2764,7 @@ int main(int argc, char** argv) {
                 if (arrow_egress != nullptr && arrow_egress->healthy()) {
                     progress = consume_dispatch(
                                    arrow_consumer,
+                                   [&] { return arrow_egress->healthy(); },
                                    [&](const TickDispatch& value) {
                                        const bool projectable =
                                            value.kind ==
@@ -2735,6 +2784,7 @@ int main(int argc, char** argv) {
     !defined(L2FLOW_CH_HAS_ARROW_RING)
                 progress = consume_dispatch(
                                0U,
+                               [] { return true; },
                                [&](const TickDispatch&) { return true; }) ||
                     progress;
 #endif
@@ -2746,6 +2796,7 @@ int main(int argc, char** argv) {
                 ) {
                     progress = consume_dispatch(
                                    0U,
+                                   [] { return true; },
                                    [&](const TickDispatch&) { return true; }) ||
                         progress;
                 }
@@ -2753,6 +2804,7 @@ int main(int argc, char** argv) {
                 if (arrow_egress == nullptr) {
                     progress = consume_dispatch(
                                    0U,
+                                   [] { return true; },
                                    [&](const TickDispatch&) { return true; }) ||
                         progress;
                 }
@@ -3136,6 +3188,74 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    std::cerr << "RUN_LOOP_EXIT stop_requested="
+              << static_cast<int>(g_stop_requested)
+              << " engine_healthy=" << engine->healthy()
+              << " handler_failed=" << handler.failed()
+              << " boundary_reason="
+              << MdlConnectionBoundaryReasonName(
+                     handler.connection_boundary_reason())
+              << " boundary_reason_code="
+              << static_cast<unsigned int>(
+                     handler.connection_boundary_reason())
+              << " arrow_healthy=" << arrow_healthy()
+              << " clickhouse_healthy=" << clickhouse_healthy();
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    std::cerr << " raw_sink_healthy="
+              << (clickhouse_raw == nullptr || clickhouse_raw->healthy())
+              << " event_sink_healthy="
+              << (clickhouse_event == nullptr || clickhouse_event->healthy())
+              << " event_runtime_healthy="
+              << (event_runtime == nullptr || event_runtime->healthy())
+              << " kline_sink_healthy="
+              << (clickhouse_kline == nullptr || clickhouse_kline->healthy())
+              << " kline_runtime_healthy="
+              << (kline_runtime == nullptr || kline_runtime->healthy())
+              << " fact_journal_healthy="
+              << (fact_journal == nullptr || fact_journal->healthy());
+#endif
+    std::cerr << '\n' << std::flush;
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    if (clickhouse_raw != nullptr && !clickhouse_raw->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=raw_sink detail="
+                  << clickhouse_raw->fatal_error() << '\n';
+    }
+    if (clickhouse_event != nullptr && !clickhouse_event->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=event_sink detail="
+                  << clickhouse_event->fatal_error() << '\n';
+    }
+    if (event_runtime != nullptr && !event_runtime->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=event_runtime detail="
+                  << event_runtime->fatal_error() << '\n';
+    }
+    if (clickhouse_kline != nullptr && !clickhouse_kline->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=kline_sink detail="
+                  << clickhouse_kline->fatal_error() << '\n';
+    }
+    if (kline_runtime != nullptr && !kline_runtime->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=kline_runtime detail="
+                  << kline_runtime->fatal_error() << '\n';
+    }
+    if (fact_journal != nullptr && !fact_journal->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=fact_journal detail="
+                  << fact_journal->fatal_error() << '\n';
+    }
+#endif
+    if (!engine->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=engine detail="
+                  << engine->fatal_error() << '\n';
+    }
+#if defined(L2FLOW_CH_HAS_ARROW_RING)
+    if (arrow_egress != nullptr && !arrow_egress->healthy()) {
+        std::cerr << "RUN_LOOP_FATAL component=arrow detail="
+                  << arrow_egress->fatal_error() << '\n';
+    }
+#endif
+    std::cerr << std::flush;
+
+    // Preserve the causal boundary before shutdown/drain failures can mask it.
+    PrintMdlConnectionBoundaryDiagnostic(handler);
 
     // Shutdown order is contractual: quiesce SDK callbacks and decoder
     // producers, stop the independent raw writers, drain every owner cursor,
