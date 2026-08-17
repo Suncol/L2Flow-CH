@@ -160,6 +160,13 @@ if(L2FLOW_CH_BUILD_TESTS)
     add_executable(test_outbox tests/test_outbox.cpp)
     l2flow_ch_configure(test_outbox)
     target_link_libraries(test_outbox PRIVATE L2FlowCH::ingest)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR
+        CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
+        target_compile_definitions(test_outbox PRIVATE
+            L2FLOW_TEST_WRAP_PREAD=1)
+        target_link_options(test_outbox PRIVATE -Wl,--wrap=pread)
+    endif()
     add_test(NAME canonical_outbox COMMAND test_outbox)
 
     add_executable(test_engine_fence tests/test_engine_fence.cpp)

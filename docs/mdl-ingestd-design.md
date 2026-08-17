@@ -58,10 +58,18 @@ Each WAL batch persists source instance ID, feed epoch, run ID, batch sequence,
 batch ID, first LSN, row count, payload byte count, per-row payload length and
 CRC32C, batch CRC32C, and frame CRC32C. The in-memory index is published only
 after the frame sync succeeds. Consumers read and validate the exact frame
-from its still-open segment on a cache miss. Decoded records live only in the
-hard-bounded `outbox-read-cache-batches` cache; a lagging consumer therefore
-retains disk segments and compact batch indexes, not every canonical payload
-object.
+from its segment on a cache miss. A miss copies the immutable batch index and
+takes a reference-counted segment-file lease under the WAL state mutex, then
+performs `pread`, checksum validation, and decoding after releasing that mutex.
+Concurrent misses for the same batch share one load; loads for different
+batches have three execution slots, one for each durable consumer. Reclaim may
+remove and unlink an old segment while a read is in flight, but the lease keeps
+its descriptor valid until that read finishes. Because an unlinked open file
+still occupies filesystem blocks, its bytes remain charged to the WAL reservoir
+until the final read lease closes. The outbox retains decoded batches only in
+the hard-bounded `outbox-read-cache-batches` cache and transient reader results;
+a lagging consumer therefore retains disk segments and compact batch indexes,
+not every canonical payload object.
 
 ## Admission, batching, and fatal boundary
 

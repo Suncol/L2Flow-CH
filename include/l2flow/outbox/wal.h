@@ -56,6 +56,18 @@ struct DurableOutboxStats final {
     std::uint64_t indexed_records = 0U;
     std::uint64_t cached_records = 0U;
     std::uint64_t indexed_batches = 0U;
+    // Successful cache-miss loads. Callers that join an in-flight same-batch
+    // load increment coalesced_cold_read_waits without repeating the work.
+    std::uint64_t cold_read_batches = 0U;
+    std::uint64_t cold_read_bytes = 0U;
+    std::uint64_t coalesced_cold_read_waits = 0U;
+    // Disk read, validation, and decode execution time; semaphore queueing is
+    // excluded.
+    std::uint64_t cold_read_ns = 0U;
+    std::uint64_t maximum_cold_read_ns = 0U;
+    // Maximum delay from a successful WAL sync to acquisition of the state
+    // mutex that publishes the durable batch index.
+    std::uint64_t maximum_durable_publish_wait_ns = 0U;
     WalPosition durable_tail{};
     WalPosition latest_barrier_position{};
     FreshnessBarrier latest_barrier{};

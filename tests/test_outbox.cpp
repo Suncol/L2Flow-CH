@@ -5,12 +5,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -20,6 +22,36 @@
 #include <vector>
 
 #include <unistd.h>
+
+#if defined(L2FLOW_TEST_WRAP_PREAD)
+namespace {
+
+std::atomic<bool> g_intercept_pread{false};
+std::atomic<bool> g_pread_entered{false};
+std::atomic<bool> g_release_pread{false};
+std::atomic<std::uint64_t> g_intercepted_preads{0U};
+
+}  // namespace
+
+extern "C" ssize_t __real_pread(int descriptor,
+                                 void* buffer,
+                                 std::size_t count,
+                                 off_t offset);
+
+extern "C" ssize_t __wrap_pread(int descriptor,
+                                 void* buffer,
+                                 std::size_t count,
+                                 off_t offset) {
+    if (g_intercept_pread.load(std::memory_order_acquire)) {
+        g_intercepted_preads.fetch_add(1U, std::memory_order_relaxed);
+        g_pread_entered.store(true, std::memory_order_release);
+        while (!g_release_pread.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+    return __real_pread(descriptor, buffer, count, offset);
+}
+#endif
 
 namespace {
 
@@ -31,6 +63,37 @@ namespace {
             std::abort();                                                    \
         }                                                                    \
     } while (false)
+
+template <typename Predicate>
+[[nodiscard]] bool WaitFor(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+#if defined(L2FLOW_TEST_WRAP_PREAD)
+void BlockWalReads() noexcept {
+    g_intercepted_preads.store(0U, std::memory_order_relaxed);
+    g_pread_entered.store(false, std::memory_order_relaxed);
+    g_release_pread.store(false, std::memory_order_relaxed);
+    g_intercept_pread.store(true, std::memory_order_release);
+}
+
+void ReleaseWalReads() noexcept {
+    g_release_pread.store(true, std::memory_order_release);
+}
+
+void StopInterceptingWalReads() noexcept {
+    ReleaseWalReads();
+    g_intercept_pread.store(false, std::memory_order_release);
+}
+#endif
 
 using l2flow::outbox::CanonicalRecord;
 using l2flow::outbox::ConsumerKind;
@@ -709,6 +772,222 @@ void TestDecodedReadCacheHasConfiguredHardBound() {
     CHECK(outbox->Stop(&error));
 }
 
+void TestColdReadDoesNotBlockWalState() {
+#if defined(L2FLOW_TEST_WRAP_PREAD)
+    TemporaryDirectory directory("l2flow-outbox-cold-read-isolation");
+    DurableOutboxConfig config = Config(directory.path());
+    config.commit_batch_records = 1U;
+    config.read_cache_batches = 1U;
+    std::string error;
+    std::unique_ptr<DurableOutbox> outbox = DurableOutbox::Create(
+        config, &error);
+    CHECK(outbox != nullptr);
+    CHECK(outbox->Start(&error));
+
+    CHECK(outbox->Enqueue(Barrier(1U)));
+    CHECK(outbox->Flush(&error));
+    RecordView first{};
+    CHECK(outbox->TryRead(1U, &first));
+
+    CHECK(outbox->Enqueue(Barrier(2U)));
+    CHECK(outbox->Flush(&error));
+    RecordView second{};
+    CHECK(outbox->TryRead(2U, &second));
+
+    constexpr std::size_t kReaders = 8U;
+    std::array<std::thread, kReaders> readers;
+    std::array<std::atomic<bool>, kReaders> results{};
+    std::atomic<std::size_t> ready{0U};
+    std::atomic<bool> begin{false};
+    BlockWalReads();
+    for (std::size_t index = 0U; index < readers.size(); ++index) {
+        results[index].store(false, std::memory_order_relaxed);
+        readers[index] = std::thread([&, index] {
+            ready.fetch_add(1U, std::memory_order_release);
+            while (!begin.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            RecordView view{};
+            results[index].store(
+                outbox->TryRead(1U, &view) && view.position == first.position,
+                std::memory_order_release);
+        });
+    }
+    CHECK(WaitFor([&ready] {
+        return ready.load(std::memory_order_acquire) == kReaders;
+    }));
+    begin.store(true, std::memory_order_release);
+    CHECK(WaitFor([] {
+        return g_pread_entered.load(std::memory_order_acquire);
+    }));
+
+    auto completion = std::async(std::launch::async, [&] {
+        return outbox->CompleteOne(ConsumerKind::kEvent, first.position);
+    });
+    const bool completion_ready =
+        completion.wait_for(std::chrono::seconds(2)) ==
+        std::future_status::ready;
+    if (!completion_ready) {
+        ReleaseWalReads();
+    }
+    CHECK(completion_ready);
+    CHECK(completion.get());
+
+    CHECK(outbox->Enqueue(Barrier(3U)));
+    auto flush = std::async(std::launch::async, [&] {
+        std::string flush_error;
+        return outbox->Flush(&flush_error);
+    });
+    const bool flush_ready = flush.wait_for(std::chrono::seconds(2)) ==
+                             std::future_status::ready;
+    if (!flush_ready) {
+        ReleaseWalReads();
+    }
+    CHECK(flush_ready);
+    CHECK(flush.get());
+    CHECK(outbox->durable_tail().lsn == 3U);
+
+    auto cache_hit = std::async(std::launch::async, [&] {
+        RecordView view{};
+        return outbox->TryRead(2U, &view) && view.position == second.position;
+    });
+    const bool cache_hit_ready =
+        cache_hit.wait_for(std::chrono::seconds(2)) ==
+        std::future_status::ready;
+    if (!cache_hit_ready) {
+        ReleaseWalReads();
+    }
+    CHECK(cache_hit_ready);
+    CHECK(cache_hit.get());
+
+    ReleaseWalReads();
+    for (std::thread& reader : readers) {
+        reader.join();
+    }
+    StopInterceptingWalReads();
+    for (const std::atomic<bool>& result : results) {
+        CHECK(result.load(std::memory_order_acquire));
+    }
+    CHECK(g_intercepted_preads.load(std::memory_order_relaxed) == 1U);
+    CHECK(outbox->healthy());
+    CHECK(outbox->Stop(&error));
+#endif
+}
+
+void TestReclaimPreservesInFlightColdReadLease() {
+#if defined(L2FLOW_TEST_WRAP_PREAD)
+    TemporaryDirectory directory("l2flow-outbox-cold-read-reclaim");
+    DurableOutboxConfig config = Config(directory.path());
+    config.commit_batch_records = 1U;
+    config.read_cache_batches = 1U;
+    std::string error;
+    std::unique_ptr<DurableOutbox> outbox = DurableOutbox::Create(
+        config, &error);
+    CHECK(outbox != nullptr);
+    CHECK(outbox->Start(&error));
+
+    constexpr std::uint64_t kRecords = 128U;
+    for (std::uint64_t frontier = 1U; frontier <= kRecords; ++frontier) {
+        CHECK(outbox->Enqueue(Barrier(frontier)));
+    }
+    CHECK(outbox->Flush(&error));
+    CHECK(outbox->stats().segments_created > 1U);
+
+    const auto wal_segments = [&outbox] {
+        std::vector<std::filesystem::path> paths;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(outbox->run_directory())) {
+            if (entry.path().extension() == ".wal") {
+                paths.push_back(entry.path());
+            }
+        }
+        std::sort(paths.begin(), paths.end());
+        return paths;
+    };
+    const auto wal_bytes = [](const auto& paths) {
+        std::uint64_t bytes = 0U;
+        for (const std::filesystem::path& path : paths) {
+            bytes += static_cast<std::uint64_t>(
+                std::filesystem::file_size(path));
+        }
+        return bytes;
+    };
+    const std::vector<std::filesystem::path> initial_segments =
+        wal_segments();
+    CHECK(initial_segments.size() > 1U);
+    const std::uint64_t first_segment_bytes =
+        static_cast<std::uint64_t>(
+            std::filesystem::file_size(initial_segments.front()));
+    const auto before_reclaim = outbox->stats();
+    CHECK(before_reclaim.reservoir_bytes == wal_bytes(initial_segments));
+    const std::uint64_t expected_reclaimed =
+        before_reclaim.segments_created - 1U;
+
+    std::vector<WalPosition> positions;
+    positions.reserve(static_cast<std::size_t>(kRecords));
+    for (std::uint64_t lsn = 1U; lsn <= kRecords; ++lsn) {
+        RecordView view{};
+        CHECK(outbox->TryRead(lsn, &view));
+        positions.push_back(view.position);
+    }
+
+    BlockWalReads();
+    std::atomic<bool> read_succeeded{false};
+    std::thread reader([&] {
+        RecordView view{};
+        read_succeeded.store(
+            outbox->TryRead(1U, &view) && view.position == positions.front(),
+            std::memory_order_release);
+    });
+    CHECK(WaitFor([] {
+        return g_pread_entered.load(std::memory_order_acquire);
+    }));
+
+    auto complete = std::async(std::launch::async, [&] {
+        return outbox->Complete(ConsumerKind::kRaw, positions) &&
+               outbox->Complete(ConsumerKind::kEvent, positions) &&
+               outbox->Complete(ConsumerKind::kKLine, positions);
+    });
+    const bool complete_ready = complete.wait_for(std::chrono::seconds(2)) ==
+                                std::future_status::ready;
+    if (!complete_ready) {
+        ReleaseWalReads();
+    }
+    CHECK(complete_ready);
+    CHECK(complete.get());
+
+    auto reclaimed = std::async(std::launch::async, [&] {
+        return WaitFor([&] {
+            return outbox->stats().segments_reclaimed ==
+                   expected_reclaimed;
+        });
+    });
+    const bool reclaim_ready = reclaimed.wait_for(std::chrono::seconds(6)) ==
+                               std::future_status::ready;
+    if (!reclaim_ready) {
+        ReleaseWalReads();
+    }
+    CHECK(reclaim_ready);
+    CHECK(reclaimed.get());
+    const std::vector<std::filesystem::path> linked_segments =
+        wal_segments();
+    CHECK(linked_segments.size() == 1U);
+    CHECK(outbox->stats().reservoir_bytes ==
+          wal_bytes(linked_segments) + first_segment_bytes);
+
+    ReleaseWalReads();
+    reader.join();
+    StopInterceptingWalReads();
+    CHECK(read_succeeded.load(std::memory_order_acquire));
+    CHECK(g_intercepted_preads.load(std::memory_order_relaxed) == 1U);
+    CHECK(outbox->stats().reservoir_bytes == wal_bytes(linked_segments));
+    RecordView reclaimed_view{};
+    CHECK(!outbox->TryRead(1U, &reclaimed_view));
+    CHECK(outbox->healthy());
+    CHECK(outbox->Stop(&error));
+#endif
+}
+
 void TestDiskReadRejectsCorruptFrame() {
     TemporaryDirectory directory("l2flow-outbox-corrupt-frame");
     std::unique_ptr<DurableOutbox> outbox = StartedOutbox(directory.path());
@@ -1207,6 +1486,8 @@ int main(int argc, char** argv) {
     TestConcurrentProducerOrderDoesNotUseIngressMaximum();
     TestEveryCanonicalRecordKindRoundTripsFromDisk();
     TestDecodedReadCacheHasConfiguredHardBound();
+    TestColdReadDoesNotBlockWalState();
+    TestReclaimPreservesInFlightColdReadLease();
     TestDiskReadRejectsCorruptFrame();
     TestRequestSpoolPersistsBytesAndStateMachine();
     TestRequestSpoolRejectsIllegalLifecycleTransitions();

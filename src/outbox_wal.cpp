@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <semaphore>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -936,6 +937,11 @@ bool ValidateDurableOutboxConfig(const DurableOutboxConfig& config,
 
 class DurableOutbox::Impl final {
 public:
+    // Raw, Event, and KLine are the three independent durable WAL readers.
+    // Give each reader one cold-decode slot while bounding simultaneous frame
+    // allocation, checksum work, and deserialization.
+    static constexpr std::ptrdiff_t kColdReadConcurrency = 3;
+
     struct PendingRecord final {
         std::shared_ptr<const CanonicalRecord> record;
         std::vector<std::byte> payload;
@@ -977,14 +983,79 @@ public:
         }
     };
 
+    struct ReservoirAccounting final {
+        std::atomic<std::uint64_t> bytes{0U};
+    };
+
+    struct SegmentFile final {
+        explicit SegmentFile(
+            std::shared_ptr<ReservoirAccounting> accounting) noexcept
+            : reservoir(std::move(accounting)) {}
+
+        ~SegmentFile() {
+            static_cast<void>(CloseDescriptor(&descriptor, nullptr));
+            if (release_bytes_on_close != 0U) {
+                reservoir->bytes.fetch_sub(release_bytes_on_close,
+                                           std::memory_order_relaxed);
+            }
+        }
+
+        SegmentFile(const SegmentFile&) = delete;
+        SegmentFile& operator=(const SegmentFile&) = delete;
+
+        std::shared_ptr<ReservoirAccounting> reservoir;
+        // Reclaimed files are unlinked while an in-flight pread may still
+        // hold this object. Their blocks remain charged until the final lease
+        // closes the descriptor and the filesystem can release those blocks.
+        std::uint64_t release_bytes_on_close = 0U;
+        int descriptor = -1;
+    };
+
     struct Segment final {
         std::filesystem::path path;
         std::uint64_t sequence = 0U;
         std::uint64_t first_lsn = 0U;
         std::uint64_t last_lsn = 0U;
         std::uint64_t bytes = 0U;
-        int descriptor = -1;
+        std::shared_ptr<SegmentFile> file;
         bool closed = false;
+    };
+
+    struct RetiredSegment final {
+        std::filesystem::path path;
+        std::shared_ptr<SegmentFile> file;
+        std::uint64_t bytes = 0U;
+    };
+
+    struct BatchReadLease final {
+        // Both values are immutable after publication. The shared file handle
+        // keeps pread valid even if cursor progress concurrently reclaims and
+        // unlinks the segment.
+        BatchIndex index{};
+        std::shared_ptr<SegmentFile> file;
+    };
+
+    struct BatchLoadState final {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::shared_ptr<const CachedBatch> batch;
+        std::exception_ptr failure;
+        bool ready = false;
+    };
+
+    struct ColdReadPermit final {
+        explicit ColdReadPermit(
+            std::counting_semaphore<kColdReadConcurrency>* permits) noexcept
+            : slots(permits) {
+            slots->acquire();
+        }
+
+        ~ColdReadPermit() { slots->release(); }
+
+        ColdReadPermit(const ColdReadPermit&) = delete;
+        ColdReadPermit& operator=(const ColdReadPermit&) = delete;
+
+        std::counting_semaphore<kColdReadConcurrency>* slots;
     };
 
     struct Cursor final {
@@ -1001,6 +1072,7 @@ public:
                                   ? GenerateIdentifier()
                                   : config_.source_instance_id),
           run_id_(GenerateIdentifier()) {
+        read_cache_.reserve(config_.read_cache_batches);
         cursors_[ConsumerIndex(ConsumerKind::kRaw)].enabled =
             config_.raw_consumer_enabled;
         cursors_[ConsumerIndex(ConsumerKind::kEvent)].enabled =
@@ -1168,34 +1240,72 @@ public:
             return false;
         }
         try {
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            CachedBatch* cached = CachedBatchForLsnLocked(lsn);
-            if (cached == nullptr) {
-                const BatchIndex* batch = BatchForLsnLocked(lsn);
-                if (batch == nullptr || !LoadBatchLocked(*batch)) {
+            std::shared_ptr<const CachedBatch> cached;
+            std::shared_ptr<BatchLoadState> load;
+            BatchReadLease lease{};
+            bool load_owner = false;
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                const CachedBatch* const hot =
+                    CachedBatchForLsnLocked(lsn);
+                if (hot != nullptr) {
+                    CopyRecordView(*hot, lsn, output);
+                    return true;
+                }
+                const BatchIndex* const batch = BatchForLsnLocked(lsn);
+                if (batch == nullptr) {
                     return false;
                 }
-                cached = CachedBatchForLsnLocked(lsn);
+                const auto existing = inflight_loads_.find(batch->sequence);
+                if (existing != inflight_loads_.end()) {
+                    load = existing->second;
+                    coalesced_cold_read_waits_.fetch_add(
+                        1U, std::memory_order_relaxed);
+                } else {
+                    Segment* const segment = SegmentBySequenceLocked(
+                        batch->segment_sequence);
+                    if (segment == nullptr || segment->file == nullptr ||
+                        segment->file->descriptor < 0) {
+                        throw std::runtime_error(
+                            "WAL batch references an unavailable segment");
+                    }
+                    load = std::make_shared<BatchLoadState>();
+                    inflight_loads_.emplace(batch->sequence, load);
+                    lease.index = *batch;
+                    lease.file = segment->file;
+                    load_owner = true;
+                }
             }
-            if (cached == nullptr || lsn < cached->first_lsn) {
-                throw std::runtime_error(
-                    "WAL cache did not retain the decoded batch");
+
+            if (load_owner) {
+                try {
+                    ColdReadPermit permit(&cold_read_slots_);
+                    const std::uint64_t started_ns =
+                        ingest::MonotonicNowNs();
+                    cached = LoadBatch(lease);
+                    const std::uint64_t finished_ns =
+                        ingest::MonotonicNowNs();
+                    const std::uint64_t elapsed_ns =
+                        finished_ns >= started_ns
+                        ? finished_ns - started_ns
+                        : 0U;
+                    cold_read_batches_.fetch_add(
+                        1U, std::memory_order_relaxed);
+                    cold_read_bytes_.fetch_add(
+                        lease.index.frame_bytes, std::memory_order_relaxed);
+                    cold_read_ns_.fetch_add(
+                        elapsed_ns, std::memory_order_relaxed);
+                    UpdateMaximum(&maximum_cold_read_ns_, elapsed_ns);
+                    FinishBatchLoad(lease, load, cached);
+                } catch (...) {
+                    FailBatchLoad(lease.index.sequence, load,
+                                  std::current_exception());
+                    throw;
+                }
+            } else {
+                cached = WaitForBatchLoad(load);
             }
-            const std::uint64_t relative = lsn - cached->first_lsn;
-            if (relative >= cached->records.size()) {
-                throw std::runtime_error(
-                    "WAL cache row offset exceeded its batch");
-            }
-            const StoredRecord& stored =
-                cached->records[static_cast<std::size_t>(relative)];
-            if (stored.position.lsn != lsn) {
-                throw std::runtime_error(
-                    "WAL cache position lost contiguity");
-            }
-            output->position = stored.position;
-            output->batch_id = stored.batch_id;
-            output->payload_checksum = stored.payload_checksum;
-            output->record = stored.record;
+            CopyRecordView(*cached, lsn, output);
             return true;
         } catch (const std::exception& exception) {
             SetFatal(std::string("WAL read failed: ") + exception.what());
@@ -1311,14 +1421,26 @@ public:
             std::memory_order_relaxed);
         result.queued_records = queued_records_.load(
             std::memory_order_relaxed);
+        result.reservoir_bytes = reservoir_accounting_->bytes.load(
+            std::memory_order_relaxed);
+        result.cold_read_batches = cold_read_batches_.load(
+            std::memory_order_relaxed);
+        result.cold_read_bytes = cold_read_bytes_.load(
+            std::memory_order_relaxed);
+        result.coalesced_cold_read_waits = coalesced_cold_read_waits_.load(
+            std::memory_order_relaxed);
+        result.cold_read_ns = cold_read_ns_.load(std::memory_order_relaxed);
+        result.maximum_cold_read_ns = maximum_cold_read_ns_.load(
+            std::memory_order_relaxed);
+        result.maximum_durable_publish_wait_ns =
+            maximum_durable_publish_wait_ns_.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(data_mutex_);
-        result.reservoir_bytes = reservoir_bytes_;
         result.indexed_records = retained_records_;
         result.indexed_batches =
             static_cast<std::uint64_t>(batches_.size());
-        for (const CachedBatch& cached : read_cache_) {
+        for (const std::shared_ptr<const CachedBatch>& cached : read_cache_) {
             result.cached_records +=
-                static_cast<std::uint64_t>(cached.records.size());
+                static_cast<std::uint64_t>(cached->records.size());
         }
         result.durable_tail = durable_tail_;
         result.latest_barrier_position = latest_barrier_position_;
@@ -1407,28 +1529,207 @@ private:
         return segment.sequence == sequence ? &segment : nullptr;
     }
 
-    [[nodiscard]] CachedBatch* CachedBatchForLsnLocked(
+    [[nodiscard]] const CachedBatch*
+    PromoteCachedBatchLocked(std::size_t index) noexcept {
+        std::shared_ptr<const CachedBatch> promoted =
+            std::move(read_cache_[index]);
+        for (std::size_t current = index;
+             current + 1U < read_cache_.size(); ++current) {
+            read_cache_[current] = std::move(read_cache_[current + 1U]);
+        }
+        read_cache_.back() = std::move(promoted);
+        return read_cache_.back().get();
+    }
+
+    [[nodiscard]] const CachedBatch* CachedBatchForLsnLocked(
         std::uint64_t lsn) noexcept {
         for (std::size_t index = 0U; index < read_cache_.size(); ++index) {
-            CachedBatch& cached = read_cache_[index];
-            if (lsn < cached.first_lsn || lsn > cached.last_lsn()) {
+            const std::shared_ptr<const CachedBatch>& cached =
+                read_cache_[index];
+            if (lsn < cached->first_lsn || lsn > cached->last_lsn()) {
                 continue;
             }
-            if (index + 1U != read_cache_.size()) {
-                CachedBatch promoted = std::move(cached);
-                read_cache_.erase(
-                    read_cache_.begin() + static_cast<std::ptrdiff_t>(index));
-                read_cache_.push_back(std::move(promoted));
-            }
-            return std::addressof(read_cache_.back());
+            return index + 1U == read_cache_.size()
+                ? cached.get()
+                : PromoteCachedBatchLocked(index);
         }
         return nullptr;
     }
 
-    [[nodiscard]] bool LoadBatchLocked(const BatchIndex& index) {
-        Segment* const segment =
-            SegmentBySequenceLocked(index.segment_sequence);
-        if (segment == nullptr || segment->descriptor < 0) {
+    [[nodiscard]] bool CachedBatchBySequenceLocked(
+        std::uint64_t sequence) noexcept {
+        for (std::size_t index = 0U; index < read_cache_.size(); ++index) {
+            if (read_cache_[index]->sequence != sequence) {
+                continue;
+            }
+            if (index + 1U != read_cache_.size()) {
+                static_cast<void>(PromoteCachedBatchLocked(index));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::shared_ptr<const CachedBatch>
+    InsertCachedBatchLocked(
+        const std::shared_ptr<const CachedBatch>& decoded) noexcept {
+        if (CachedBatchBySequenceLocked(decoded->sequence)) {
+            return nullptr;
+        }
+        if (read_cache_.size() < config_.read_cache_batches) {
+            read_cache_.push_back(decoded);
+            return nullptr;
+        }
+        std::shared_ptr<const CachedBatch> retired =
+            std::move(read_cache_.front());
+        for (std::size_t index = 0U; index + 1U < read_cache_.size(); ++index) {
+            read_cache_[index] = std::move(read_cache_[index + 1U]);
+        }
+        read_cache_.back() = decoded;
+        return retired;
+    }
+
+    void RetireCachedBatchesThroughLocked(
+        std::uint64_t last_lsn,
+        std::vector<std::shared_ptr<const CachedBatch>>* retired) {
+        std::size_t retained = 0U;
+        for (std::size_t index = 0U; index < read_cache_.size(); ++index) {
+            if (read_cache_[index]->last_lsn() <= last_lsn) {
+                retired->push_back(std::move(read_cache_[index]));
+                continue;
+            }
+            if (retained != index) {
+                read_cache_[retained] = std::move(read_cache_[index]);
+            }
+            ++retained;
+        }
+        read_cache_.resize(retained);
+    }
+
+    static void UpdateMaximum(std::atomic<std::uint64_t>* maximum,
+                              std::uint64_t value) noexcept {
+        std::uint64_t observed = maximum->load(std::memory_order_relaxed);
+        while (observed < value &&
+               !maximum->compare_exchange_weak(
+                   observed, value, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    [[nodiscard]] static bool SameBatchIndex(
+        const BatchIndex& left,
+        const BatchIndex& right) noexcept {
+        return left.first_lsn == right.first_lsn &&
+               left.sequence == right.sequence &&
+               left.segment_sequence == right.segment_sequence &&
+               left.offset == right.offset &&
+               left.frame_bytes == right.frame_bytes &&
+               left.row_count == right.row_count &&
+               left.payload_checksum == right.payload_checksum &&
+               left.batch_id == right.batch_id;
+    }
+
+    [[nodiscard]] bool BatchReadLeaseStillResidentLocked(
+        const BatchReadLease& lease) noexcept {
+        const BatchIndex* const resident =
+            BatchBySequenceLocked(lease.index.sequence);
+        Segment* const segment = SegmentBySequenceLocked(
+            lease.index.segment_sequence);
+        return resident != nullptr && SameBatchIndex(*resident, lease.index) &&
+               segment != nullptr && segment->file == lease.file;
+    }
+
+    static void CopyRecordView(const CachedBatch& cached,
+                               std::uint64_t lsn,
+                               RecordView* output) {
+        if (lsn < cached.first_lsn) {
+            throw std::runtime_error("WAL cache position preceded its batch");
+        }
+        const std::uint64_t relative = lsn - cached.first_lsn;
+        if (relative >= cached.records.size()) {
+            throw std::runtime_error(
+                "WAL cache row offset exceeded its batch");
+        }
+        const StoredRecord& stored =
+            cached.records[static_cast<std::size_t>(relative)];
+        if (stored.position.lsn != lsn ||
+            stored.position.batch_sequence != cached.sequence ||
+            stored.position.row_index != relative) {
+            throw std::runtime_error("WAL cache position lost contiguity");
+        }
+        output->position = stored.position;
+        output->batch_id = stored.batch_id;
+        output->payload_checksum = stored.payload_checksum;
+        output->record = stored.record;
+    }
+
+    [[nodiscard]] static std::shared_ptr<const CachedBatch>
+    WaitForBatchLoad(const std::shared_ptr<BatchLoadState>& load) {
+        std::unique_lock<std::mutex> lock(load->mutex);
+        load->wake.wait(lock, [&load] { return load->ready; });
+        if (load->failure != nullptr) {
+            std::rethrow_exception(load->failure);
+        }
+        if (load->batch == nullptr) {
+            throw std::runtime_error(
+                "WAL batch load completed without a decoded batch");
+        }
+        return load->batch;
+    }
+
+    void FinishBatchLoad(
+        const BatchReadLease& lease,
+        const std::shared_ptr<BatchLoadState>& load,
+        const std::shared_ptr<const CachedBatch>& decoded) {
+        std::shared_ptr<const CachedBatch> retired;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            if (BatchReadLeaseStillResidentLocked(lease)) {
+                retired = InsertCachedBatchLocked(decoded);
+            }
+            {
+                std::lock_guard<std::mutex> state_lock(load->mutex);
+                load->batch = decoded;
+                load->ready = true;
+            }
+            const auto inflight = inflight_loads_.find(lease.index.sequence);
+            if (inflight != inflight_loads_.end() &&
+                inflight->second == load) {
+                inflight_loads_.erase(inflight);
+            }
+        }
+        load->wake.notify_all();
+    }
+
+    void FailBatchLoad(std::uint64_t sequence,
+                       const std::shared_ptr<BatchLoadState>& load,
+                       std::exception_ptr failure) noexcept {
+        try {
+            {
+                std::lock_guard<std::mutex> lock(data_mutex_);
+                {
+                    std::lock_guard<std::mutex> state_lock(load->mutex);
+                    if (!load->ready) {
+                        load->failure = std::move(failure);
+                        load->ready = true;
+                    }
+                }
+                const auto inflight = inflight_loads_.find(sequence);
+                if (inflight != inflight_loads_.end() &&
+                    inflight->second == load) {
+                    inflight_loads_.erase(inflight);
+                }
+            }
+            load->wake.notify_all();
+        } catch (...) {
+            load->wake.notify_all();
+        }
+    }
+
+    [[nodiscard]] std::shared_ptr<const CachedBatch> LoadBatch(
+        const BatchReadLease& lease) {
+        const BatchIndex& index = lease.index;
+        if (lease.file == nullptr || lease.file->descriptor < 0) {
             throw std::runtime_error(
                 "WAL batch references an unavailable segment");
         }
@@ -1441,7 +1742,7 @@ private:
         std::vector<std::byte> frame(
             static_cast<std::size_t>(index.frame_bytes));
         std::string error;
-        if (!ReadAllAt(segment->descriptor, frame, index.offset, &error)) {
+        if (!ReadAllAt(lease.file->descriptor, frame, index.offset, &error)) {
             throw std::runtime_error(error);
         }
 
@@ -1506,10 +1807,10 @@ private:
             throw std::runtime_error("WAL batch metadata mismatched");
         }
 
-        CachedBatch decoded{};
-        decoded.sequence = sequence;
-        decoded.first_lsn = first_lsn;
-        decoded.records.reserve(row_count);
+        auto decoded = std::make_shared<CachedBatch>();
+        decoded->sequence = sequence;
+        decoded->first_lsn = first_lsn;
+        decoded->records.reserve(row_count);
         LittleEndianReader payload_reader(payload);
         for (std::uint32_t row = 0U; row < row_count; ++row) {
             std::uint32_t record_bytes = 0U;
@@ -1528,18 +1829,14 @@ private:
                     *record, config_.feed_session_epoch)) {
                 throw std::runtime_error("WAL record payload is invalid");
             }
-            decoded.records.push_back(StoredRecord{
+            decoded->records.push_back(StoredRecord{
                 WalPosition{first_lsn + row, sequence, row}, batch_id,
                 record_checksum, std::move(record)});
         }
         if (!payload_reader.complete()) {
             throw std::runtime_error("WAL batch payload has trailing bytes");
         }
-        while (read_cache_.size() >= config_.read_cache_batches) {
-            read_cache_.pop_front();
-        }
-        read_cache_.push_back(std::move(decoded));
-        return true;
+        return decoded;
     }
 
     void SetFatal(std::string message) noexcept {
@@ -1657,6 +1954,8 @@ private:
         segment.path = run_directory_ / name.data();
         segment.sequence = next_segment_sequence_;
         segment.first_lsn = first_lsn;
+        std::shared_ptr<SegmentFile> file =
+            std::make_shared<SegmentFile>(reservoir_accounting_);
         const int descriptor = ::open(
             segment.path.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
             S_IRUSR | S_IWUSR | S_IRGRP);
@@ -1665,27 +1964,27 @@ private:
                 std::string("WAL segment creation failed: ") +
                 std::strerror(errno));
         }
+        file->descriptor = descriptor;
         const std::vector<std::byte> header = SegmentHeaderBytes(
             segment.sequence, first_lsn);
         std::string error;
         if (!WriteAllAt(descriptor, header, 0U, &error) ||
             !SyncDescriptor(descriptor, &error)) {
-            int failed_descriptor = descriptor;
-            static_cast<void>(CloseDescriptor(&failed_descriptor, nullptr));
             throw std::runtime_error(error);
         }
         segment.bytes = header.size();
-        segment.descriptor = descriptor;
+        segment.file = std::move(file);
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
-            if (reservoir_bytes_ >
+            const std::uint64_t reservoir_bytes =
+                reservoir_accounting_->bytes.load(std::memory_order_relaxed);
+            if (reservoir_bytes >
                 config_.maximum_reservoir_bytes - segment.bytes) {
-                static_cast<void>(CloseDescriptor(
-                    &segment.descriptor, nullptr));
                 throw std::runtime_error(
                     "outbox reservoir exhausted by a segment header");
             }
-            reservoir_bytes_ += segment.bytes;
+            reservoir_accounting_->bytes.fetch_add(
+                segment.bytes, std::memory_order_relaxed);
             segments_.push_back(std::move(segment));
             current_segment_descriptor_ = descriptor;
         }
@@ -1698,7 +1997,8 @@ private:
         }
         std::lock_guard<std::mutex> lock(data_mutex_);
         if (segments_.empty() ||
-            segments_.back().descriptor != current_segment_descriptor_) {
+            segments_.back().file == nullptr ||
+            segments_.back().file->descriptor != current_segment_descriptor_) {
             throw std::runtime_error(
                 "outbox active segment descriptor diverged");
         }
@@ -1721,7 +2021,10 @@ private:
     }
 
     void Reclaim() {
-        std::vector<std::filesystem::path> remove_paths;
+        std::vector<RetiredSegment> retired_segments;
+        retired_segments.reserve(segments_.size());
+        std::vector<std::shared_ptr<const CachedBatch>> retired_cache;
+        retired_cache.reserve(config_.read_cache_batches);
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             const std::uint64_t minimum = MinimumCursorLocked();
@@ -1729,13 +2032,10 @@ private:
                    segments_.front().last_lsn != 0U &&
                    segments_.front().last_lsn <= minimum) {
                 Segment& segment = segments_.front();
-                if (segment.bytes > reservoir_bytes_) {
+                if (segment.bytes > reservoir_accounting_->bytes.load(
+                                        std::memory_order_relaxed)) {
                     throw std::runtime_error(
                         "outbox segment byte accounting diverged");
-                }
-                std::string error;
-                if (!CloseDescriptor(&segment.descriptor, &error)) {
-                    throw std::runtime_error(error);
                 }
                 const std::uint64_t reclaimed_last_lsn = segment.last_lsn;
                 while (!batches_.empty() &&
@@ -1750,24 +2050,29 @@ private:
                     retained_records_ -= row_count;
                     batches_.pop_front();
                 }
-                std::erase_if(
-                    read_cache_,
-                    [reclaimed_last_lsn](const CachedBatch& cached) {
-                        return cached.last_lsn() <= reclaimed_last_lsn;
-                    });
-                reservoir_bytes_ -= segment.bytes;
-                remove_paths.push_back(segment.path);
+                RetireCachedBatchesThroughLocked(reclaimed_last_lsn,
+                                                 &retired_cache);
+                retired_segments.push_back(RetiredSegment{
+                    std::move(segment.path), std::move(segment.file),
+                    segment.bytes});
                 segments_.pop_front();
             }
         }
-        for (const auto& path : remove_paths) {
+        for (RetiredSegment& segment : retired_segments) {
             std::error_code error;
-            const bool removed = std::filesystem::remove(path, error);
+            const bool removed = std::filesystem::remove(segment.path, error);
             if (!removed || error) {
                 throw std::runtime_error(
                     "outbox could not reclaim completed WAL segment: " +
                     error.message());
             }
+            if (segment.file == nullptr ||
+                segment.file->release_bytes_on_close != 0U) {
+                throw std::runtime_error(
+                    "outbox reclaimed segment file accounting diverged");
+            }
+            segment.file->release_bytes_on_close = segment.bytes;
+            segment.file.reset();
             segments_reclaimed_.fetch_add(1U, std::memory_order_relaxed);
         }
     }
@@ -1854,8 +2159,10 @@ private:
         }
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
+            const std::uint64_t reservoir_bytes =
+                reservoir_accounting_->bytes.load(std::memory_order_relaxed);
             if (bytes.size() > config_.maximum_reservoir_bytes ||
-                reservoir_bytes_ >
+                reservoir_bytes >
                     config_.maximum_reservoir_bytes - bytes.size()) {
                 throw std::runtime_error(
                     "outbox durable reservoir capacity exhausted");
@@ -1875,8 +2182,17 @@ private:
             throw std::runtime_error(error);
         }
 
+        const std::uint64_t publish_wait_started_ns =
+            ingest::MonotonicNowNs();
+        std::uint64_t publish_wait_ns = 0U;
         {
-            std::lock_guard<std::mutex> lock(data_mutex_);
+            std::unique_lock<std::mutex> lock(data_mutex_);
+            const std::uint64_t publish_lock_acquired_ns =
+                ingest::MonotonicNowNs();
+            publish_wait_ns =
+                publish_lock_acquired_ns >= publish_wait_started_ns
+                ? publish_lock_acquired_ns - publish_wait_started_ns
+                : 0U;
             if (!batches_.empty() &&
                 (batches_.back().sequence + 1U != batch_sequence ||
                  batches_.back().last_lsn() + 1U != first_lsn)) {
@@ -1884,7 +2200,8 @@ private:
                     "outbox durable batch index lost contiguity");
             }
             if (segments_.empty() ||
-                segments_.back().descriptor !=
+                segments_.back().file == nullptr ||
+                segments_.back().file->descriptor !=
                     current_segment_descriptor_) {
                 throw std::runtime_error(
                     "outbox has no writable WAL segment");
@@ -1915,7 +2232,8 @@ private:
             }
             segment.last_lsn = durable_tail_.lsn;
             segment.bytes += bytes.size();
-            reservoir_bytes_ += bytes.size();
+            reservoir_accounting_->bytes.fetch_add(
+                bytes.size(), std::memory_order_relaxed);
             for (Cursor& cursor : cursors_) {
                 if (!cursor.enabled) {
                     cursor.contiguous = durable_tail_;
@@ -1923,6 +2241,7 @@ private:
                 }
             }
         }
+        UpdateMaximum(&maximum_durable_publish_wait_ns_, publish_wait_ns);
         next_lsn_ += batch.size();
         records_durable_.fetch_add(batch.size(), std::memory_order_relaxed);
         batches_durable_.fetch_add(1U, std::memory_order_relaxed);
@@ -2041,14 +2360,20 @@ private:
     }
 
     void CloseFiles() noexcept {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        current_segment_descriptor_ = -1;
-        for (Segment& segment : segments_) {
-            static_cast<void>(CloseDescriptor(
-                &segment.descriptor, nullptr));
+        std::deque<Segment> retired_segments;
+        std::array<int, 3U> cursor_descriptors{-1, -1, -1};
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            current_segment_descriptor_ = -1;
+            retired_segments.swap(segments_);
+            for (std::size_t index = 0U; index < cursors_.size(); ++index) {
+                cursor_descriptors[index] = cursors_[index].descriptor;
+                cursors_[index].descriptor = -1;
+            }
         }
-        for (Cursor& cursor : cursors_) {
-            static_cast<void>(CloseDescriptor(&cursor.descriptor, nullptr));
+        retired_segments.clear();
+        for (int& descriptor : cursor_descriptors) {
+            static_cast<void>(CloseDescriptor(&descriptor, nullptr));
         }
     }
 
@@ -2067,14 +2392,18 @@ private:
     std::condition_variable flush_wake_;
     std::mutex flush_mutex_;
     std::deque<BatchIndex> batches_;
-    std::deque<CachedBatch> read_cache_;
+    std::vector<std::shared_ptr<const CachedBatch>> read_cache_;
+    std::map<std::uint64_t, std::shared_ptr<BatchLoadState>> inflight_loads_;
+    std::counting_semaphore<kColdReadConcurrency> cold_read_slots_{
+        kColdReadConcurrency};
     std::uint64_t retained_records_ = 0U;
     WalPosition durable_tail_{};
     WalPosition latest_barrier_position_{};
     FreshnessBarrier latest_barrier_{};
     std::array<Cursor, 3U> cursors_{};
     std::deque<Segment> segments_;
-    std::uint64_t reservoir_bytes_ = 0U;
+    std::shared_ptr<ReservoirAccounting> reservoir_accounting_ =
+        std::make_shared<ReservoirAccounting>();
 
     std::thread writer_;
     int current_segment_descriptor_ = -1;
@@ -2092,6 +2421,12 @@ private:
     std::atomic<std::uint64_t> segments_created_{0U};
     std::atomic<std::uint64_t> segments_reclaimed_{0U};
     std::atomic<std::uint64_t> queued_records_{0U};
+    std::atomic<std::uint64_t> cold_read_batches_{0U};
+    std::atomic<std::uint64_t> cold_read_bytes_{0U};
+    std::atomic<std::uint64_t> coalesced_cold_read_waits_{0U};
+    std::atomic<std::uint64_t> cold_read_ns_{0U};
+    std::atomic<std::uint64_t> maximum_cold_read_ns_{0U};
+    std::atomic<std::uint64_t> maximum_durable_publish_wait_ns_{0U};
     std::atomic<bool> data_changed_{false};
     std::atomic<bool> started_{false};
     std::atomic<bool> accepting_{false};
