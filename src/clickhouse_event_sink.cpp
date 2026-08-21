@@ -479,8 +479,7 @@ constexpr std::string_view kRecoveryMarkerColumns =
     return "CREATE TABLE IF NOT EXISTS " + std::string(database) +
            ".event_revision_log (" + RevisionColumns() +
            ") ENGINE = MergeTree PARTITION BY trade_date ORDER BY "
-           "(market,instrument_id,channel,native_sequence,event_kind,"
-           "affected_order_id,occurrence,version) SETTINGS "
+           "(calculation_run_id,recovery_run_id,version,row_index) SETTINGS "
            "non_replicated_deduplication_window=10000";
 }
 
@@ -517,8 +516,7 @@ constexpr std::string_view kRecoveryMarkerColumns =
 
 [[nodiscard]] std::string EventTableProbe(std::string_view database) {
     constexpr std::string_view revision_sort =
-        "market, instrument_id, channel, native_sequence, event_kind, "
-        "affected_order_id, occurrence, version";
+        "calculation_run_id, recovery_run_id, version, row_index";
     constexpr std::string_view current_sort =
         "market, instrument_id, channel, native_sequence, event_kind, "
         "affected_order_id, occurrence";

@@ -820,6 +820,11 @@ void TestClickHouseIntegration(std::string endpoint) {
                     database +
                     "' AND table='event_revision_log' FORMAT TSV") ==
           "27");
+    CHECK(Query(config.endpoint,
+                "SELECT sorting_key FROM system.tables WHERE database='" +
+                    database +
+                    "' AND name='event_revision_log' FORMAT TSV") ==
+          "calculation_run_id, recovery_run_id, version, row_index");
 
     config.ensure_local_tables = false;
     std::unique_ptr<EventClickHouseSink> external =

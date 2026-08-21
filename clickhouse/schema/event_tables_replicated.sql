@@ -144,14 +144,10 @@ ENGINE = ReplicatedMergeTree(
 PARTITION BY trade_date
 ORDER BY
 (
-    market,
-    instrument_id,
-    channel,
-    native_sequence,
-    event_kind,
-    affected_order_id,
-    occurrence,
-    version
+    calculation_run_id,
+    recovery_run_id,
+    version,
+    row_index
 );
 
 CREATE TABLE IF NOT EXISTS l2flow.event

@@ -141,14 +141,10 @@ ENGINE = MergeTree
 PARTITION BY trade_date
 ORDER BY
 (
-    market,
-    instrument_id,
-    channel,
-    native_sequence,
-    event_kind,
-    affected_order_id,
-    occurrence,
-    version
+    calculation_run_id,
+    recovery_run_id,
+    version,
+    row_index
 )
 SETTINGS non_replicated_deduplication_window = 10000;
 

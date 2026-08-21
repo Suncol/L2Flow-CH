@@ -223,6 +223,10 @@ entire logical prefix and makes the sink unhealthy. Shutdown bypasses physical
 linger and attempts the final partial group; queue capacity exhaustion remains
 fail closed.
 
+`kline_revision_log` is clustered by calculation run, recovery run, version,
+and row index so committed recovery batches can be read without a duplicate
+projection.
+
 `kline` is a `ReplacingMergeTree(version)` current table populated by a
 materialized view. Its sort key excludes `version` and exactly matches the
 logical KLine key inside the `trade_date` partition. Correct direct reads must

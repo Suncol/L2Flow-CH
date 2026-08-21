@@ -54,11 +54,10 @@ ENGINE = MergeTree
 PARTITION BY trade_date
 ORDER BY
 (
-    market,
-    instrument_id,
-    interval_seconds,
-    bucket_start_ns_from_midnight,
-    version
+    calculation_run_id,
+    recovery_run_id,
+    version,
+    row_index
 )
 SETTINGS non_replicated_deduplication_window = 10000;
 

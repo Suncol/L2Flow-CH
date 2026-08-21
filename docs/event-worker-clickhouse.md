@@ -543,8 +543,8 @@ and operation. These IDs and the batch object are fixed before sink admission.
 
 The Event sink writes three data objects:
 
-- `event_revision_log`: append-only revision history, ordered by EventKey plus
-  version;
+- `event_revision_log`: append-only revision history, clustered by calculation
+  run, recovery run, version, and row index for committed-batch reads;
 - `event`: a `ReplacingMergeTree(version)` current table populated by a
   materialized view from the revision log;
 - `event_recovery_run`: one independent committed marker per logical recovery
