@@ -1842,35 +1842,24 @@ void PrintStats(const EngineStats& stats) {
               << " lane_full=" << stats.lane_full << '\n';
 }
 
-void PrintFreshness(const IngestEngine& engine,
-                    bool event_enabled,
-                    bool kline_enabled,
-                    bool event_healthy,
-                    bool kline_healthy,
-                    bool event_pending,
-                    bool kline_pending,
-                    bool fatal) {
-    const DispositionOutbox* const outbox = engine.tick_outbox();
-    if (outbox == nullptr) {
-        return;
-    }
-    ContinuityInputs inputs{};
-    inputs.fatal = fatal;
-    inputs.event_enabled = event_enabled;
-    inputs.kline_enabled = kline_enabled;
-    inputs.event_healthy = event_healthy;
-    inputs.kline_healthy = kline_healthy;
-    inputs.event_pending = event_pending;
-    inputs.kline_pending = kline_pending;
-    inputs.now_monotonic_ns = MonotonicNowNs();
-    const FreshnessFrontier frontier = outbox->EvaluateFreshness(inputs);
+void PrintFreshness(const FreshnessFrontier& frontier) {
     std::cout << "continuity_mode="
               << ContinuityModeName(frontier.mode)
               << " event_authoritative="
               << (frontier.event_authoritative ? 1 : 0)
               << " kline_authoritative="
               << (frontier.kline_authoritative ? 1 : 0)
+              << " event_consumed=" << frontier.event.consumed
+              << " event_calculated=" << frontier.event.calculated
+              << " event_submitted=" << frontier.event.submitted
+              << " event_acknowledged=" << frontier.event.acknowledged
+              << " kline_consumed=" << frontier.kline.consumed
+              << " kline_calculated=" << frontier.kline.calculated
+              << " kline_submitted=" << frontier.kline.submitted
+              << " kline_acknowledged=" << frontier.kline.acknowledged
               << " outbox_max_lag_lsn=" << frontier.max_lag_lsn
+              << " outbox_lag_warning_lsn=" << frontier.lag_warning_lsn
+              << " outbox_pressure=" << frontier.outbox_pressure
               << '\n';
 }
 
@@ -2654,6 +2643,18 @@ int main(int argc, char** argv) {
          owner < options.engine.instrument_workers; ++owner) {
         owner_drained[owner].store(false, std::memory_order_relaxed);
     }
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+    const auto publish_derived_progress = [&](std::size_t owner) {
+        DispositionOutbox* const outbox = engine->tick_outbox();
+        if (event_runtime != nullptr) {
+            outbox->PublishProgress(0U, owner, event_runtime->progress(owner));
+        }
+        if (kline_runtime != nullptr) {
+            outbox->PublishProgress(options.event_enabled ? 1U : 0U, owner,
+                                    kline_runtime->progress(owner));
+        }
+    };
+#endif
     std::unique_ptr<DispatchLatencySampler[]> latency_samplers;
     std::vector<std::uint64_t> latency_cursors;
     std::vector<std::uint64_t> latency_clock_error_cursors;
@@ -2891,6 +2892,7 @@ int main(int argc, char** argv) {
                     static_cast<void>(kline_runtime->FlushDue(
                         owner, l2flow::ingest::MonotonicNowNs()));
                 }
+                publish_derived_progress(owner);
 #endif
                 if (!progress) {
                     if (stopping) {
@@ -2988,6 +2990,10 @@ int main(int argc, char** argv) {
         if (kline_runtime != nullptr) {
             kline_drain_ok = kline_runtime->DrainAll();
         }
+        for (std::size_t owner = 0U;
+             owner < options.engine.instrument_workers; ++owner) {
+            publish_derived_progress(owner);
+        }
         if (fact_journal != nullptr) {
             fact_journal_flush_ok = fact_journal->Flush();
         }
@@ -3061,6 +3067,48 @@ int main(int argc, char** argv) {
         previous_event_sink_stats = clickhouse_event->stats();
     }
 #endif
+    const auto print_freshness = [&] {
+        ContinuityInputs inputs{};
+        inputs.now_monotonic_ns = MonotonicNowNs();
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        inputs.event.enabled = options.event_enabled;
+        inputs.kline.enabled = options.kline_enabled;
+#endif
+        // Capture owner progress before sink counters: otherwise an older
+        // empty sink snapshot could certify newly submitted work as durable.
+        const FreshnessFrontier snapshot =
+            engine->tick_outbox()->CaptureFreshness(inputs);
+#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
+        const auto read_plane = [](auto* plane, const auto* runtime,
+                                   const auto* sink, bool runtime_ok,
+                                   bool sink_ok) {
+            if (!plane->enabled) {
+                return;
+            }
+            if (sink != nullptr) {
+                const auto stats = sink->stats();
+                plane->revision_batches_acked = stats.revision_batches_acked;
+                plane->revision_batches_submitted =
+                    stats.revision_batches_queued;
+            }
+            plane->healthy =
+                runtime != nullptr && runtime->healthy() && runtime_ok;
+            plane->sink_healthy = sink != nullptr && sink->healthy() && sink_ok;
+        };
+        read_plane(&inputs.event, event_runtime.get(), clickhouse_event.get(),
+                   event_flush_ok && event_drain_ok, event_stop_ok);
+        read_plane(&inputs.kline, kline_runtime.get(), clickhouse_kline.get(),
+                   kline_flush_ok && kline_drain_ok, kline_stop_ok);
+        inputs.fatal = !clickhouse_stop_ok || !fact_journal_flush_ok ||
+            (clickhouse_raw != nullptr && !clickhouse_raw->healthy()) ||
+            (fact_journal != nullptr && !fact_journal->healthy());
+#endif
+        inputs.fatal = inputs.fatal || !engine->healthy() || handler.failed() ||
+            handler.connection_boundary_reason() !=
+                l2flow::ingest::MdlConnectionBoundaryReason::kNone ||
+            !arrow_healthy();
+        PrintFreshness(l2flow::ingest::EvaluateFreshness(snapshot, inputs));
+    };
     if (options.operation_mode == OperationMode::kLive) {
         while (g_stop_requested == 0 && engine->healthy() &&
                !handler.failed() &&
@@ -3069,22 +3117,7 @@ int main(int argc, char** argv) {
                arrow_healthy() && clickhouse_healthy()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             PrintStats(engine->stats());
-            PrintFreshness(
-                *engine,
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-                options.event_enabled, options.kline_enabled,
-                event_runtime == nullptr || event_runtime->healthy(),
-                kline_runtime == nullptr || kline_runtime->healthy(),
-                event_runtime != nullptr &&
-                    event_runtime->stats().workers.pending_revision_batches !=
-                        0U,
-                kline_runtime != nullptr &&
-                    kline_runtime->stats().workers.pending_revision_batches !=
-                        0U,
-#else
-                false, false, true, true, false, false,
-#endif
-                !engine->healthy());
+            print_freshness();
 #if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
             if (clickhouse_raw != nullptr) {
                 PrintClickHouseStats(clickhouse_raw->stats());
@@ -3280,20 +3313,7 @@ int main(int argc, char** argv) {
 #endif
     const EngineStats final_stats = engine->stats();
     PrintStats(final_stats);
-    PrintFreshness(
-        *engine,
-#if defined(L2FLOW_CH_HAS_CLICKHOUSE_RAW)
-        options.event_enabled, options.kline_enabled,
-        event_runtime == nullptr || event_runtime->healthy(),
-        kline_runtime == nullptr || kline_runtime->healthy(),
-        event_runtime != nullptr &&
-            event_runtime->stats().workers.pending_revision_batches != 0U,
-        kline_runtime != nullptr &&
-            kline_runtime->stats().workers.pending_revision_batches != 0U,
-#else
-        false, false, true, true, false, false,
-#endif
-        !engine->healthy());
+    print_freshness();
     if (options.operation_mode == OperationMode::kTest) {
         DispatchLatencyWindow final_latency_window =
             l2flow::ingest::CollectDispatchLatency(

@@ -243,6 +243,8 @@ public:
     // consults raw persistence state or waits for a raw ACK.
     [[nodiscard]] bool AdvanceDurableCommits() noexcept;
     [[nodiscard]] bool FlushDurableCommits() noexcept;
+    // Owner-thread inspection; includes persistence groups waiting for linger.
+    [[nodiscard]] bool revisions_pending() const noexcept;
     [[nodiscard]] bool repair_pending() const noexcept;
     [[nodiscard]] bool eviction_pending() const noexcept;
     // True while a journal cut is being phase-normalized or a sliced Shanghai

@@ -148,6 +148,11 @@ public:
                     // record has been copied. Publishing the cursor first
                     // would let the producer wrap and overwrite this slot.
                     *output = record;
+                    // Publish delivery before releasing the slot. A reporting
+                    // thread that observes the advanced cursor must also see
+                    // the dispatch awaiting the owner's calculation frontier.
+                    cursor_stats.records_read.fetch_add(
+                        1U, std::memory_order_relaxed);
                 }
                 ++next;
                 next_cell.store(next, std::memory_order_release);
@@ -155,8 +160,6 @@ public:
                     output->owner = static_cast<std::uint32_t>(owner);
                     poll = (lane + 1U) % lane_count_;
                     publish_skipped();
-                    cursor_stats.records_read.fetch_add(
-                        1U, std::memory_order_relaxed);
                     return true;
                 }
                 ++skipped;
@@ -192,51 +195,56 @@ public:
         }
         std::uint64_t max_lag = 0U;
         for (std::size_t owner = 0U; owner < owner_count_; ++owner) {
-            for (std::size_t lane = 0U; lane < lane_count_; ++lane) {
-                const std::uint64_t head =
-                    head_lsn_[lane].load(std::memory_order_acquire);
-                const std::uint64_t next = cursor_next_[CursorIndex(
-                                               consumer, owner, lane)]
-                                               .load(std::memory_order_acquire);
-                const std::uint64_t consumed = next == 0U ? 0U : next - 1U;
-                if (head > consumed) {
-                    max_lag = std::max(max_lag, head - consumed);
-                }
-            }
+            max_lag = std::max(max_lag, OwnerConsumeLag(consumer, owner));
         }
         return max_lag;
     }
 
-    [[nodiscard]] FreshnessFrontier EvaluateFreshness(
+    void PublishProgress(std::size_t consumer,
+                         std::size_t owner,
+                         DerivedProgress progress) noexcept {
+        if (consumer >= consumer_count_ || owner >= owner_count_ ||
+            progress == DerivedProgress::kConsumed) {
+            return;
+        }
+        CursorStats& cursor = cursor_stats_[PollIndex(consumer, owner)];
+        const std::uint64_t delivered =
+            cursor.records_read.load(std::memory_order_relaxed);
+        if (cursor.records_calculated.load(std::memory_order_relaxed) !=
+            delivered) {
+            cursor.records_calculated.store(delivered,
+                                            std::memory_order_release);
+        }
+        if (progress == DerivedProgress::kSubmitted &&
+            cursor.records_submitted.load(std::memory_order_relaxed) !=
+                delivered) {
+            cursor.records_submitted.store(delivered,
+                                           std::memory_order_release);
+        }
+    }
+
+    [[nodiscard]] FreshnessFrontier CaptureFreshness(
         const ContinuityInputs& inputs) const noexcept {
         FreshnessFrontier frontier{};
         frontier.feed_session_epoch = feed_session_epoch_;
         frontier.published_monotonic_ns = inputs.now_monotonic_ns;
-        if (inputs.fatal) {
-            frontier.mode = ContinuityMode::kFatalContinuity;
-            return frontier;
+        frontier.lag_warning_lsn = std::max<std::uint64_t>(
+            1U, std::min<std::uint64_t>(inputs.catchup_lsn_slack,
+                                       records_per_lane_ / 2U));
+        for (std::size_t consumer = 0U; consumer < consumer_count_;
+             ++consumer) {
+            const DerivedFreshness progress = CaptureConsumer(
+                consumer, &frontier.max_lag_lsn);
+            if (inputs.event.enabled && consumer == 0U) {
+                frontier.event = progress;
+            }
+            if (inputs.kline.enabled &&
+                consumer == (inputs.event.enabled ? 1U : 0U)) {
+                frontier.kline = progress;
+            }
         }
-        const std::uint64_t event_lag =
-            inputs.event_enabled ? max_consume_lag_lsn(0U) : 0U;
-        const std::uint64_t kline_lag = inputs.kline_enabled
-            ? max_consume_lag_lsn(inputs.event_enabled ? 1U : 0U)
-            : 0U;
-        frontier.max_lag_lsn = std::max(event_lag, kline_lag);
-        const bool event_behind = inputs.event_enabled &&
-            (!inputs.event_healthy || inputs.event_pending ||
-             event_lag > inputs.catchup_lsn_slack);
-        const bool kline_behind = inputs.kline_enabled &&
-            (!inputs.kline_healthy || inputs.kline_pending ||
-             kline_lag > inputs.catchup_lsn_slack);
-        if (event_behind || kline_behind) {
-            frontier.mode = ContinuityMode::kDerivedCatchup;
-        } else {
-            frontier.mode = ContinuityMode::kCaughtUp;
-        }
-        frontier.event_authoritative =
-            inputs.event_enabled && !event_behind;
-        frontier.kline_authoritative =
-            inputs.kline_enabled && !kline_behind;
+        frontier.outbox_pressure =
+            frontier.max_lag_lsn >= frontier.lag_warning_lsn;
         return frontier;
     }
 
@@ -284,7 +292,51 @@ private:
     struct alignas(64) CursorStats final {
         std::atomic<std::uint64_t> records_read{0U};
         std::atomic<std::uint64_t> records_skipped{0U};
+        std::atomic<std::uint64_t> records_calculated{0U};
+        std::atomic<std::uint64_t> records_submitted{0U};
     };
+
+    [[nodiscard]] std::uint64_t OwnerConsumeLag(
+        std::size_t consumer,
+        std::size_t owner) const noexcept {
+        std::uint64_t lag = 0U;
+        for (std::size_t lane = 0U; lane < lane_count_; ++lane) {
+            const auto head = head_lsn_[lane].load(std::memory_order_acquire);
+            const auto next = cursor_next_[CursorIndex(consumer, owner, lane)]
+                                  .load(std::memory_order_acquire);
+            const auto consumed = next == 0U ? 0U : next - 1U;
+            if (head > consumed) {
+                lag = std::max(lag, head - consumed);
+            }
+        }
+        return lag;
+    }
+
+    [[nodiscard]] DerivedFreshness CaptureConsumer(
+        std::size_t consumer,
+        std::uint64_t* max_lag) const noexcept {
+        DerivedFreshness result{true, true, true, false};
+        for (std::size_t owner = 0U; owner < owner_count_; ++owner) {
+            const CursorStats& cursor =
+                cursor_stats_[PollIndex(consumer, owner)];
+            // Read downstream progress first. New work between these reads
+            // may conservatively report catch-up, but cannot look completed.
+            const auto submitted =
+                cursor.records_submitted.load(std::memory_order_acquire);
+            const auto calculated =
+                cursor.records_calculated.load(std::memory_order_acquire);
+            const auto lag = OwnerConsumeLag(consumer, owner);
+            *max_lag = std::max(*max_lag, lag);
+            result.consumed = result.consumed && lag == 0U;
+            const auto delivered =
+                cursor.records_read.load(std::memory_order_relaxed);
+            result.calculated = result.calculated && calculated == delivered;
+            result.submitted = result.submitted && submitted == delivered;
+        }
+        result.calculated = result.calculated && result.consumed;
+        result.submitted = result.submitted && result.calculated;
+        return result;
+    }
 
     [[nodiscard]] std::size_t SlotOffset(
         std::size_t lane,
@@ -422,9 +474,15 @@ std::uint64_t DispositionOutbox::max_consume_lag_lsn(
     return impl_->max_consume_lag_lsn(consumer);
 }
 
-FreshnessFrontier DispositionOutbox::EvaluateFreshness(
+void DispositionOutbox::PublishProgress(std::size_t consumer,
+                                      std::size_t owner,
+                                      DerivedProgress progress) noexcept {
+    impl_->PublishProgress(consumer, owner, progress);
+}
+
+FreshnessFrontier DispositionOutbox::CaptureFreshness(
     const ContinuityInputs& inputs) const noexcept {
-    return impl_->EvaluateFreshness(inputs);
+    return impl_->CaptureFreshness(inputs);
 }
 
 std::size_t DispositionOutbox::lane_count() const noexcept {
@@ -449,6 +507,37 @@ std::uint64_t DispositionOutbox::feed_session_epoch() const noexcept {
 
 DispositionOutboxStats DispositionOutbox::stats() const noexcept {
     return impl_->stats();
+}
+
+FreshnessFrontier EvaluateFreshness(
+    FreshnessFrontier snapshot,
+    const ContinuityInputs& inputs) noexcept {
+    const auto complete = [&inputs](DerivedFreshness* progress,
+                                    const DerivedContinuityInputs& plane) {
+        if (!plane.enabled) {
+            *progress = {};
+            return false;
+        }
+        progress->calculated = progress->calculated && plane.healthy &&
+            !inputs.fatal;
+        progress->submitted = progress->submitted && progress->calculated &&
+            plane.sink_healthy;
+        progress->acknowledged = progress->submitted &&
+            plane.revision_batches_acked == plane.revision_batches_submitted;
+        return progress->calculated && plane.sink_healthy;
+    };
+    snapshot.event_authoritative = complete(&snapshot.event, inputs.event);
+    snapshot.kline_authoritative = complete(&snapshot.kline, inputs.kline);
+    if (inputs.fatal) {
+        snapshot.mode = ContinuityMode::kFatalContinuity;
+    } else if (snapshot.outbox_pressure ||
+               (inputs.event.enabled && !snapshot.event.acknowledged) ||
+               (inputs.kline.enabled && !snapshot.kline.acknowledged)) {
+        snapshot.mode = ContinuityMode::kDerivedCatchup;
+    } else {
+        snapshot.mode = ContinuityMode::kCaughtUp;
+    }
+    return snapshot;
 }
 
 const char* ContinuityModeName(ContinuityMode mode) noexcept {

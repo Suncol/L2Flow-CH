@@ -1,6 +1,7 @@
 #pragma once
 
 #include "l2flow/kline/worker.h"
+#include "l2flow/ingest/outbox.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,9 @@ public:
     [[nodiscard]] bool AppendDispatch(
         std::size_t owner,
         const ingest::TickDispatch& dispatch) noexcept;
+    // Owner-thread only, after dispatch/service returns. No aggregation or I/O.
+    [[nodiscard]] ingest::DerivedProgress progress(
+        std::size_t owner) const noexcept;
     [[nodiscard]] bool FlushDue(
         std::size_t owner,
         std::uint64_t monotonic_ns) noexcept;

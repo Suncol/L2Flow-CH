@@ -1296,11 +1296,12 @@ public:
                     std::lock_guard<std::mutex> lane_lock(lane.mutex);
                     lane.queue.push_back(QueuedSubmission{
                         std::move(batches), 0U, ingest::MonotonicNowNs()});
+                    // Count acceptance before the writer can ACK this group.
+                    stats_.revision_batches_queued.fetch_add(
+                        batch_count, std::memory_order_relaxed);
                 }
                 stats_.submission_groups_queued.fetch_add(
                     1U, std::memory_order_relaxed);
-                stats_.revision_batches_queued.fetch_add(
-                    batch_count, std::memory_order_relaxed);
                 stats_.revision_rows_queued.fetch_add(
                     static_cast<std::uint64_t>(rows),
                     std::memory_order_relaxed);
@@ -1335,10 +1336,11 @@ public:
         result.submission_groups_released =
             stats_.submission_groups_released.load(
                 std::memory_order_relaxed);
-        result.revision_batches_queued =
-            stats_.revision_batches_queued.load(std::memory_order_relaxed);
+        // Downstream first: equality must not hide concurrent new submissions.
         result.revision_batches_acked =
-            stats_.revision_batches_acked.load(std::memory_order_relaxed);
+            stats_.revision_batches_acked.load(std::memory_order_acquire);
+        result.revision_batches_queued =
+            stats_.revision_batches_queued.load(std::memory_order_acquire);
         result.revision_batches_released =
             stats_.revision_batches_released.load(std::memory_order_relaxed);
         result.revision_rows_queued =

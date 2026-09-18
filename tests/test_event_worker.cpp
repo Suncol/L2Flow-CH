@@ -2797,6 +2797,72 @@ void TestRuntimeDrainAllFlushesFinalPartialBatch() {
         FactKey{20260807U, Market::kShenzhen, 7U, 101U}, &bundle));
 }
 
+void TestRuntimeFreshnessDistinguishesCalculationFromSubmission() {
+    RecordingSink sink;
+    auto config = RuntimeConfig();
+    config.micro_batch_rows = 32U;
+    config.worker.persistence_group_max_batches = 8U;
+    config.worker.persistence_group_max_rows = 1'024U;
+    config.worker.persistence_group_max_delay_ns = UINT64_C(60'000'000'000);
+    std::string error;
+    auto runtime = EventRuntime::Create(config, &sink, &error);
+    auto outbox = DispositionOutbox::Create(
+        1U, 1U, 1U, 8U, kFeedSessionEpoch, &error);
+    CHECK(runtime != nullptr && outbox != nullptr);
+    ContinuityInputs inputs{};
+    inputs.event.enabled = true;
+    const auto observe = [&] {
+        outbox->PublishProgress(0U, 0U, runtime->progress(0U));
+        const auto snapshot = outbox->CaptureFreshness(inputs);
+        inputs.event.healthy = runtime->healthy();
+        inputs.event.revision_batches_submitted = sink.batches.size();
+        return EvaluateFreshness(snapshot, inputs);
+    };
+    CHECK(outbox->Append(0U, RuntimeOrdered(ShenzhenAdd(101U, 7'000U), 0U)));
+    TickDispatch dispatch{};
+    CHECK(outbox->TryRead(0U, 0U, &dispatch));
+    CHECK(runtime->AppendDispatch(0U, dispatch));
+    auto frontier = observe();
+    CHECK(frontier.event.consumed && !frontier.event.calculated);
+    CHECK(!frontier.event_authoritative);
+    CHECK(runtime->Flush(0U));
+    frontier = observe();
+    CHECK(frontier.event.calculated && frontier.event_authoritative);
+    CHECK(!frontier.event.submitted && !frontier.event.acknowledged);
+    CHECK(sink.batches.empty());
+    CHECK(runtime->DrainAll());
+    frontier = observe();
+    CHECK(frontier.event.submitted && !frontier.event.acknowledged);
+    CHECK(sink.batches.size() == 1U);
+    inputs.event.revision_batches_acked = 1U;
+    CHECK(observe().mode == ContinuityMode::kCaughtUp);
+}
+
+void TestRuntimeFreshnessWaitsForUnfencedRepair() {
+    RecordingSink sink;
+    auto config = RuntimeConfig();
+    config.micro_batch_rows = 1U;
+    config.worker.repair_slice_max_order_uses = 1U;
+    config.worker.repair_slice_max_cpu_ns = UINT64_C(1'000'000'000);
+    std::string error;
+    auto runtime = EventRuntime::Create(config, &sink, &error);
+    CHECK(runtime != nullptr);
+    const auto late_add = ShenzhenAdd(1U, 8'501U);
+    CHECK(runtime->AppendDispatch(
+        0U, RuntimeGapOpen(late_add, 0U, 1U, 1U, 1U)));
+    for (std::uint64_t sequence = 2U; sequence <= 16U; ++sequence) {
+        const auto trade = ShenzhenTrade(sequence, 8'500U + sequence, 1, 0, 1);
+        CHECK(runtime->AppendDispatch(0U, RuntimeOrdered(trade, 0U, 1U)));
+    }
+    CHECK(runtime->AppendDispatch(
+        0U, RuntimeHoleFill(late_add, 0U, 17U, 1U)));
+    CHECK(runtime->worker(0U)->repair_pending());
+    CHECK(runtime->CanPollDispatch(0U));
+    CHECK(runtime->progress(0U) == DerivedProgress::kConsumed);
+    CHECK(runtime->DrainAll());
+    CHECK(runtime->progress(0U) == DerivedProgress::kSubmitted);
+}
+
 void TestPersistenceGroupingIsIndependentFromControlFences() {
     RecordingSink sink;
     EventRuntimeConfig config = RuntimeConfig();
@@ -2959,6 +3025,7 @@ void TestRuntimeChannelSealMailboxCoalescesLatestWatermark() {
     CHECK(runtime->AppendDispatch(0U, first));
     CHECK(runtime->AppendDispatch(0U, second));
     CHECK(runtime->AppendDispatch(0U, latest));
+    CHECK(runtime->progress(0U) == DerivedProgress::kConsumed);
 
     const EventRuntimeStats staged = runtime->stats();
     CHECK(staged.gap_open_controls_received == 1U);
@@ -3127,6 +3194,8 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
     CHECK(runtime->AppendDispatch(0U, seal));
     CHECK(!runtime->CanPollDispatch(0U));
 
+    CHECK(runtime->progress(0U) == DerivedProgress::kConsumed);
+
     EventChannelState channel{};
     CHECK(runtime->worker(0U)->CopyChannelState(
         Market::kShanghai, 7U, &channel));
@@ -3134,6 +3203,7 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
 
     std::size_t service_calls = 0U;
     while (!runtime->CanPollDispatch(0U)) {
+        CHECK(runtime->progress(0U) == DerivedProgress::kConsumed);
         CHECK(runtime->FlushDue(0U, 0U));
         CHECK(++service_calls < 128U);
     }
@@ -3143,6 +3213,7 @@ void TestRuntimeDefersPoppedControlBehindPhaseFence() {
     CHECK(channel.applied_dispatch_fence == seal.dispatch_fence);
     CHECK(runtime->DrainAll());
     CHECK(runtime->stats().workers.phase_normalization_slices > 1U);
+    CHECK(runtime->progress(0U) == DerivedProgress::kSubmitted);
 
     CanonicalTick last{};
     for (std::uint64_t sequence = 12U; sequence <= 14U; ++sequence) {
@@ -3200,6 +3271,7 @@ void TestRuntimeDefersControlBehindEndExpansionFence() {
     CHECK(runtime->AppendDispatch(0U, seal));
     CHECK(!runtime->CanPollDispatch(0U));
     CHECK(runtime->worker(0U)->projection_input_fenced());
+    CHECK(runtime->progress(0U) == DerivedProgress::kConsumed);
     CHECK(runtime->stats().workers.end_candidates_processed == 2U);
 
     EventChannelState channel{};
@@ -3498,6 +3570,8 @@ int main() {
     TestEvictionByteSliceIncludesCarryOrderRetirement();
     TestRuntimeRoutesOwnersAndFlushesDerivedBatches();
     TestRuntimeDrainAllFlushesFinalPartialBatch();
+    TestRuntimeFreshnessDistinguishesCalculationFromSubmission();
+    TestRuntimeFreshnessWaitsForUnfencedRepair();
     TestPersistenceGroupingIsIndependentFromControlFences();
     TestOwnerPersistenceAggregatorClosesAtBatchBound();
     TestOwnerPersistenceAggregatorClosesAtPendingCapacity();

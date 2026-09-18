@@ -718,6 +718,10 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool revisions_pending() const noexcept {
+        return !pending_commits_.empty();
+    }
+
     [[nodiscard]] bool CopyBar(const KLineKey& key,
                                KLinePayload* output) const noexcept {
         if (output == nullptr) {
@@ -1003,6 +1007,10 @@ KLineApplyResult KLineWorker::ApplyBatch(
 
 bool KLineWorker::DrainDurableCommits() noexcept {
     return impl_->DrainDurableCommits();
+}
+
+bool KLineWorker::revisions_pending() const noexcept {
+    return impl_->revisions_pending();
 }
 
 bool KLineWorker::CopyBar(const KLineKey& key,

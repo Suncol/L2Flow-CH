@@ -117,6 +117,8 @@ public:
     // Submit every pending derived revision batch. This has no dependency on
     // raw persistence state or raw acknowledgements.
     [[nodiscard]] bool DrainDurableCommits() noexcept;
+    // Owner-thread inspection of revisions not yet accepted by the sink.
+    [[nodiscard]] bool revisions_pending() const noexcept;
 
     [[nodiscard]] bool CopyBar(const KLineKey& key,
                                KLinePayload* output) const noexcept;

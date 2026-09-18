@@ -1,4 +1,5 @@
 #include "l2flow/clickhouse/kline_sink.h"
+#include "l2flow/ingest/outbox.h"
 
 #include <curl/curl.h>
 
@@ -149,6 +150,7 @@ enum class ResponseAction : std::uint8_t {
     kDropConnection,
     kRetryable,
     kPermanent,
+    kBlockedSuccess,
 };
 
 class RetryHttpServer final {
@@ -207,10 +209,20 @@ public:
         return "http://127.0.0.1:" + std::to_string(port_);
     }
 
+    [[nodiscard]] bool response_waiting() const noexcept {
+        return response_waiting_.load(std::memory_order_acquire);
+    }
+
+    void ReleaseResponse() noexcept {
+        release_response_.store(true, std::memory_order_release);
+        release_response_.notify_all();
+    }
+
     void Stop() noexcept {
         if (stopped_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        ReleaseResponse();
         if (listener_ >= 0) {
             static_cast<void>(::shutdown(listener_, SHUT_RDWR));
             static_cast<void>(::close(listener_));
@@ -355,6 +367,11 @@ private:
                        drop_first_insert_) {
                 action = ResponseAction::kDropConnection;
             }
+            if (action == ResponseAction::kBlockedSuccess) {
+                response_waiting_.store(true, std::memory_order_release);
+                release_response_.wait(false, std::memory_order_acquire);
+                action = ResponseAction::kSuccess;
+            }
             if (action != ResponseAction::kDropConnection) {
                 SendResponse(connection, action);
             }
@@ -370,6 +387,8 @@ private:
     std::uint16_t port_ = 0U;
     bool valid_ = false;
     std::atomic<bool> stopped_{false};
+    std::atomic<bool> response_waiting_{false};
+    std::atomic<bool> release_response_{false};
     std::thread thread_;
     mutable std::mutex mutex_;
     std::vector<CapturedRequest> requests_;
@@ -607,6 +626,53 @@ void TestUnknownMarkerOutcomeRetriesOnlyMarker() {
     CHECK(stats.unknown_outcomes == 1U);
     CHECK(stats.revision_batches_acked == 1U);
     CHECK(stats.revision_batches_released == 1U);
+}
+
+void TestFreshnessWaitsForMarkerResponse() {
+    RetryHttpServer server(
+        std::chrono::milliseconds{0}, false,
+        {ResponseAction::kSuccess, ResponseAction::kBlockedSuccess});
+    if (!server.valid()) {
+        std::cout << "KLine freshness fixture skipped; loopback sockets are unavailable\n";
+        return;
+    }
+    auto config = HttpConfig(server);
+    config.request_timeout_ms = 5'000U;
+    config.shutdown_timeout_ms = 5'000U;
+    std::string error;
+    auto sink = KLineClickHouseSink::Create(config, &error);
+    CHECK(sink != nullptr && sink->Start(&error));
+    const auto recovery = Identifier(31U);
+    CHECK(sink->AppendRevisionBatch(Batch(
+        1U, recovery,
+        {Revision(601U, 601U, RevisionOperation::kInsert, 1, recovery)})));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!server.response_waiting() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    CHECK(server.response_waiting());
+    const auto observe = [&] {
+        FreshnessFrontier snapshot{};
+        snapshot.kline = {true, true, true, false};
+        const auto stats = sink->stats();
+        ContinuityInputs inputs{};
+        inputs.kline.enabled = true;
+        inputs.kline.sink_healthy = sink->healthy();
+        inputs.kline.revision_batches_acked = stats.revision_batches_acked;
+        inputs.kline.revision_batches_submitted = stats.revision_batches_queued;
+        CHECK(stats.revision_batches_acked <= stats.revision_batches_queued);
+        return EvaluateFreshness(snapshot, inputs);
+    };
+    CHECK(sink->stats().revision_insert_requests_acked == 1U);
+    const auto pending = observe();
+    CHECK(pending.kline_authoritative && pending.kline.submitted);
+    CHECK(!pending.kline.acknowledged);
+    CHECK(pending.mode == ContinuityMode::kDerivedCatchup);
+    server.ReleaseResponse();
+    CHECK(sink->Stop(&error));
+    CHECK(observe().kline.acknowledged);
+    CHECK(observe().mode == ContinuityMode::kCaughtUp);
+    server.Stop();
 }
 
 void TestPermanentMarkerFailureRetainsLogicalQueue() {
@@ -1041,6 +1107,7 @@ int main() {
     TestUnknownOutcomeRetriesExactRevisionChunkBeforeCommit();
     TestPhysicalGroupingPreservesLogicalRowsAndMarkers();
     TestUnknownMarkerOutcomeRetriesOnlyMarker();
+    TestFreshnessWaitsForMarkerResponse();
     TestPermanentMarkerFailureRetainsLogicalQueue();
     TestByteBoundSplitsOneLogicalBatch();
     TestPhysicalGroupRowByteAndBatchBounds();

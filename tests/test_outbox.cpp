@@ -145,11 +145,14 @@ void TestFreshnessModes() {
     auto outbox = MakeOutbox(1U, 1U, 2U, 8U);
     CHECK(outbox->Append(0U, Occurrence(0U, 1U)));
     ContinuityInputs inputs{};
-    inputs.event_enabled = true;
-    inputs.kline_enabled = true;
+    inputs.event.enabled = true;
+    inputs.kline.enabled = true;
     inputs.now_monotonic_ns = 10U;
     inputs.catchup_lsn_slack = 0U;
-    FreshnessFrontier frontier = outbox->EvaluateFreshness(inputs);
+    const auto observe = [&] {
+        return EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+    };
+    FreshnessFrontier frontier = observe();
     CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
     CHECK(!frontier.event_authoritative);
     CHECK(!frontier.kline_authoritative);
@@ -157,32 +160,156 @@ void TestFreshnessModes() {
     TickDispatch dispatch{};
     CHECK(outbox->TryRead(0U, 0U, &dispatch));
     CHECK(outbox->TryRead(1U, 0U, &dispatch));
+    // Polling releases the slot before either runtime has processed the record.
+    frontier = observe();
+    CHECK(frontier.event.consumed && frontier.kline.consumed);
+    CHECK(!frontier.event.calculated && !frontier.kline.calculated);
+    CHECK(!frontier.event_authoritative && !frontier.kline_authoritative);
+    outbox->PublishProgress(0U, 0U, DerivedProgress::kCalculated);
+    outbox->PublishProgress(1U, 0U, DerivedProgress::kSubmitted);
+    frontier = observe();
+    CHECK(frontier.event_authoritative && frontier.kline_authoritative);
+    CHECK(!frontier.event.submitted && !frontier.event.acknowledged);
+    CHECK(frontier.kline.acknowledged);
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+
+    outbox->PublishProgress(0U, 0U, DerivedProgress::kSubmitted);
+    inputs.event.revision_batches_submitted = 1U;
+    frontier = observe();
+    CHECK(frontier.event.submitted && !frontier.event.acknowledged);
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+    inputs.event.revision_batches_acked = 1U;
     inputs.catchup_lsn_slack = 8U;
-    frontier = outbox->EvaluateFreshness(inputs);
+    frontier = observe();
     CHECK(frontier.mode == ContinuityMode::kCaughtUp);
     CHECK(frontier.event_authoritative);
     CHECK(frontier.kline_authoritative);
 
-    inputs.event_healthy = false;
-    frontier = outbox->EvaluateFreshness(inputs);
+    inputs.event.sink_healthy = false;
+    frontier = observe();
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+    CHECK(!frontier.event_authoritative && !frontier.event.acknowledged);
+    CHECK(frontier.kline_authoritative);
+
+    inputs.event.sink_healthy = true;
+    inputs.event.healthy = false;
+    frontier = observe();
     CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
     CHECK(!frontier.event_authoritative);
     CHECK(frontier.kline_authoritative);
     CHECK(std::string(ContinuityModeName(frontier.mode)) ==
           "DERIVED_CATCHUP");
 
-    inputs.event_healthy = true;
-    inputs.kline_healthy = false;
-    frontier = outbox->EvaluateFreshness(inputs);
+    inputs.event.healthy = true;
+    inputs.kline.healthy = false;
+    frontier = observe();
     CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
     CHECK(frontier.event_authoritative);
     CHECK(!frontier.kline_authoritative);
 
     inputs.fatal = true;
-    frontier = outbox->EvaluateFreshness(inputs);
+    frontier = observe();
     CHECK(frontier.mode == ContinuityMode::kFatalContinuity);
+    CHECK(!frontier.event_authoritative && !frontier.kline_authoritative);
+    CHECK(!frontier.event.acknowledged && !frontier.kline.acknowledged);
     CHECK(std::string(ContinuityModeName(frontier.mode)) ==
           "FATAL_CONTINUITY");
+}
+
+void TestFreshnessWarnsBeforeCapacityAndNeverAllowsCalculationSlack() {
+    for (const std::size_t capacity : {2U, 8U, 32'768U}) {
+        auto outbox = MakeOutbox(1U, 1U, 1U, capacity);
+        ContinuityInputs inputs{};
+        inputs.kline.enabled = true;  // KLine-only uses consumer zero.
+        CHECK(outbox->Append(0U, Occurrence(0U, 1U)));
+        auto frontier = EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+        CHECK(frontier.lag_warning_lsn == capacity / 2U);
+        CHECK(!frontier.kline_authoritative);
+        CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+        for (std::size_t row = 1U; row < capacity / 2U; ++row) {
+            CHECK(outbox->Append(0U, Occurrence(0U, 1U)));
+        }
+        frontier = EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+        CHECK(frontier.outbox_pressure);
+        CHECK(frontier.max_lag_lsn < capacity);
+        CHECK(outbox->Append(0U, Occurrence(0U, 1U)));
+    }
+}
+
+void TestFreshnessCoversBroadcastOwnersAndArrowPressure() {
+    auto outbox = MakeOutbox(2U, 2U, 3U, 8U);
+    ContinuityInputs inputs{};
+    inputs.event.enabled = true;
+    inputs.kline.enabled = true;
+    CHECK(outbox->Append(1U, Control(TickDispatchKind::kGapOpen, 7U)));
+    TickDispatch dispatch{};
+    for (std::size_t consumer = 0U; consumer < 2U; ++consumer) {
+        for (std::size_t owner = 0U; owner < 2U; ++owner) {
+            CHECK(outbox->TryRead(consumer, owner, &dispatch));
+            if (consumer != 0U || owner != 1U) {
+                outbox->PublishProgress(consumer, owner, DerivedProgress::kSubmitted);
+            }
+        }
+    }
+    const auto before = outbox->CaptureFreshness(inputs);
+    CHECK(!EvaluateFreshness(before, inputs).event_authoritative);
+    CHECK(EvaluateFreshness(before, inputs).kline_authoritative);
+    outbox->PublishProgress(0U, 1U, DerivedProgress::kSubmitted);
+    // Finishing work later must not upgrade an earlier snapshot.
+    CHECK(!EvaluateFreshness(before, inputs).event_authoritative);
+    CHECK(EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs).event_authoritative);
+    for (int row = 0; row < 3; ++row) {
+        CHECK(outbox->Append(1U, Occurrence(0U, 7U)));
+        for (std::size_t consumer = 0U; consumer < 2U; ++consumer) {
+            CHECK(outbox->TryRead(consumer, 0U, &dispatch));
+            CHECK(!outbox->TryRead(consumer, 1U, &dispatch));
+            outbox->PublishProgress(consumer, 0U, DerivedProgress::kSubmitted);
+        }
+    }
+    const auto frontier = EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+    CHECK(frontier.event_authoritative && frontier.kline_authoritative);
+    CHECK(frontier.outbox_pressure);  // The Arrow cursor still pins this lane.
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+}
+
+void TestConcurrentFreshnessWaitsForOwnerPublication() {
+    auto outbox = MakeOutbox(1U, 1U, 1U, 2U);
+    constexpr std::uint64_t kRounds = 2'000U;
+    std::atomic<std::uint64_t> delivered{0U};
+    std::atomic<std::uint64_t> may_publish{0U};
+    std::atomic<std::uint64_t> published{0U};
+    std::thread consumer([&] {
+        TickDispatch dispatch{};
+        for (std::uint64_t round = 1U; round <= kRounds; ++round) {
+            while (!outbox->TryRead(0U, 0U, &dispatch)) {
+                std::this_thread::yield();
+            }
+            delivered.store(round, std::memory_order_release);
+            while (may_publish.load(std::memory_order_acquire) != round) {
+                std::this_thread::yield();
+            }
+            outbox->PublishProgress(0U, 0U, DerivedProgress::kSubmitted);
+            published.store(round, std::memory_order_release);
+        }
+    });
+    ContinuityInputs inputs{};
+    inputs.event.enabled = true;
+    for (std::uint64_t round = 1U; round <= kRounds; ++round) {
+        CHECK(outbox->Append(0U, Occurrence(0U, 1U)));
+        while (delivered.load(std::memory_order_acquire) != round) {
+            std::this_thread::yield();
+        }
+        auto frontier = EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+        CHECK(frontier.event.consumed);
+        CHECK(!frontier.event.calculated && !frontier.event.acknowledged);
+        may_publish.store(round, std::memory_order_release);
+        while (published.load(std::memory_order_acquire) != round) {
+            std::this_thread::yield();
+        }
+        frontier = EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs);
+        CHECK(frontier.mode == ContinuityMode::kCaughtUp);
+    }
+    consumer.join();
 }
 
 void TestRejectsInvalidCreate() {
@@ -248,6 +375,9 @@ int main() {
     TestBroadcastReachesEveryOwnerAndOccurrenceIsFiltered();
     TestLanesHaveIndependentLsns();
     TestFreshnessModes();
+    TestFreshnessWarnsBeforeCapacityAndNeverAllowsCalculationSlack();
+    TestFreshnessCoversBroadcastOwnersAndArrowPressure();
+    TestConcurrentFreshnessWaitsForOwnerPublication();
     TestRejectsInvalidCreate();
     TestConcurrentWrapPreservesWholeRecords();
     std::cout << "test_outbox: ok\n";

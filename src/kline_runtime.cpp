@@ -123,6 +123,20 @@ public:
         return false;
     }
 
+    [[nodiscard]] ingest::DerivedProgress progress(
+        std::size_t owner) const noexcept {
+        if (!ValidOwner(owner) || !healthy_.load(std::memory_order_acquire)) {
+            return ingest::DerivedProgress::kConsumed;
+        }
+        const OwnerState& state = *owners_[owner];
+        if (!state.worker->healthy() || !state.active.empty()) {
+            return ingest::DerivedProgress::kConsumed;
+        }
+        return state.worker->revisions_pending()
+            ? ingest::DerivedProgress::kCalculated
+            : ingest::DerivedProgress::kSubmitted;
+    }
+
     [[nodiscard]] bool FlushDue(std::size_t owner,
                                 std::uint64_t monotonic_ns) noexcept {
         if (!ValidOwner(owner) || !healthy()) {
@@ -525,6 +539,10 @@ bool KLineRuntime::AppendDispatch(
     std::size_t owner,
     const ingest::TickDispatch& dispatch) noexcept {
     return impl_->AppendDispatch(owner, dispatch);
+}
+
+ingest::DerivedProgress KLineRuntime::progress(std::size_t owner) const noexcept {
+    return impl_->progress(owner);
 }
 
 bool KLineRuntime::FlushDue(std::size_t owner,

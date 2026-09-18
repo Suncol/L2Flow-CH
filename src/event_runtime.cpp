@@ -197,6 +197,22 @@ public:
         return false;
     }
 
+    [[nodiscard]] ingest::DerivedProgress progress(
+        std::size_t owner) const noexcept {
+        if (!ValidOwner(owner) || !healthy_.load(std::memory_order_acquire)) {
+            return ingest::DerivedProgress::kConsumed;
+        }
+        const OwnerState& state = *owners_[owner];
+        if (!state.worker->healthy() || !state.active.empty() ||
+            state.deferred_control.has_value() || !state.pending_seals.empty() ||
+            state.worker->repair_pending() || state.worker->eviction_pending()) {
+            return ingest::DerivedProgress::kConsumed;
+        }
+        return state.worker->revisions_pending()
+            ? ingest::DerivedProgress::kCalculated
+            : ingest::DerivedProgress::kSubmitted;
+    }
+
     [[nodiscard]] bool CanPollDispatch(std::size_t owner) const noexcept {
         if (!ValidOwner(owner) || !healthy()) {
             return false;
@@ -911,6 +927,10 @@ bool EventRuntime::AppendDispatch(
 
 bool EventRuntime::CanPollDispatch(std::size_t owner) const noexcept {
     return impl_->CanPollDispatch(owner);
+}
+
+ingest::DerivedProgress EventRuntime::progress(std::size_t owner) const noexcept {
+    return impl_->progress(owner);
 }
 
 bool EventRuntime::FlushDue(std::size_t owner,

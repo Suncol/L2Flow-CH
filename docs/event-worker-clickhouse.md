@@ -483,9 +483,43 @@ After classification, each decoder lane appends one sequenced `TickDispatch`
 to a process-lifetime outbox and stamps `dispatch_fence = outbox_lsn`.
 Controls occupy one LSN and are broadcast to every owner cursor. Event, KLine,
 and Arrow consume with independent cursors, so one plane can lag without
-blocking another cursor. Outbox exhaustion is `FATAL_CONTINUITY`. A lagging or
-unhealthy derived plane publishes `DERIVED_CATCHUP` and clears only that
-plane's authoritative flag. There is no elapsed-time transition to a separate
+blocking another cursor. Outbox exhaustion is `FATAL_CONTINUITY`. Each derived
+plane reports four distinct catch-up flags relative to the sampled outbox:
+
+- `consumed`: every owner cursor has reached the sampled lane heads.
+- `calculated`: all consumed dispatches have finished calculation, including
+  active micro-batches, deferred controls, seal mailboxes, phase/END work,
+  order repairs, and eviction work.
+- `submitted`: calculation is caught up and all resulting logical revision
+  batches have been accepted by the volatile sink queue.
+- `acknowledged`: submission is caught up, runtime and sink are healthy, and
+  every submitted logical batch has received its revision and marker ACKs.
+
+The existing `event_authoritative` / `kline_authoritative` flags describe
+calculation freshness with a healthy sink, not persistence. A calculation can
+be authoritative while its revisions are awaiting submission or ACK. These
+flags do not certify full trading-day coverage, clear source quality flags,
+or finalize provisional KLines. `CAUGHT_UP` requires every enabled derived
+plane to be acknowledged; otherwise the mode is `DERIVED_CATCHUP`. A failing
+plane clears its own authoritative flag. An ingest/SDK/raw/journal fatal
+boundary clears both flags and reports `FATAL_CONTINUITY`.
+
+Strict catch-up always requires zero unread lag. Separately,
+`outbox_pressure` warns at `max(1, min(catchup_lsn_slack, capacity / 2))`,
+including Arrow cursors that can pin storage. The production profile therefore
+warns at 16,384 records per lane, before the 32,768-record ring is exhausted.
+This is a sampled warning; it does not replace the existing fail-closed
+capacity checks or guarantee warning delivery before a burst fills the ring.
+
+Owners publish calculation/submission progress after each drain/service burst
+and after the final quiescent drain. Progress reuses the existing delivered
+record count and cache-line-aligned cursor statistics; publication needs no
+new per-record atomic counter, lock, or allocation. The reporter captures this
+progress before reading sink ACK/submission counters (ACKs first), then
+health. Concurrent updates can conservatively delay a catch-up report; this
+is an observation of a sampled frontier, not a globally atomic snapshot.
+
+There is no elapsed-time transition to a separate
 raw-only state. The live executable still treats failure of any enabled
 persistence plane as a session-ending health failure.
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "l2flow/event/worker.h"
+#include "l2flow/ingest/outbox.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -75,6 +76,9 @@ public:
     // already removed from the decoder-to-owner FIFO. The owner drain thread
     // must not poll another TickDispatch until this returns true.
     [[nodiscard]] bool CanPollDispatch(std::size_t owner) const noexcept;
+    // Owner-thread only, after dispatch/service returns. No aggregation or I/O.
+    [[nodiscard]] ingest::DerivedProgress progress(
+        std::size_t owner) const noexcept;
     [[nodiscard]] bool FlushDue(
         std::size_t owner,
         std::uint64_t monotonic_ns) noexcept;

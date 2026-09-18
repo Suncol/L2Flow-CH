@@ -2930,6 +2930,10 @@ public:
         return ServiceDurableCommits(true);
     }
 
+    [[nodiscard]] bool revisions_pending() const noexcept {
+        return !pending_commits_.empty();
+    }
+
     [[nodiscard]] bool CopyBundle(
         const FactKey& key,
         std::vector<std::pair<EventKey, EventPayload>>* output) const {
@@ -6943,6 +6947,10 @@ bool EventWorker::AdvanceDurableCommits() noexcept {
 
 bool EventWorker::FlushDurableCommits() noexcept {
     return impl_->FlushDurableCommits();
+}
+
+bool EventWorker::revisions_pending() const noexcept {
+    return impl_->revisions_pending();
 }
 
 bool EventWorker::repair_pending() const noexcept {

@@ -661,6 +661,49 @@ void TestPendingRevisionRowsAndOwnedBytesAccounting() {
     CHECK(sink.batches.size() == 1U);
 }
 
+void TestRuntimeFreshnessWaitsForComputationAndAck() {
+    RecordingSink sink;
+    auto config = RuntimeConfig();
+    config.micro_batch_rows = 256U;
+    config.micro_batch_max_delay_ns = 50'000'000U;
+    std::string error;
+    auto runtime = KLineRuntime::Create(config, &sink, &error);
+    auto outbox = DispositionOutbox::Create(
+        1U, 1U, 1U, 8U, kFeedSessionEpoch, &error);
+    CHECK(runtime != nullptr && outbox != nullptr);
+    ContinuityInputs inputs{};
+    inputs.kline.enabled = true;
+    const auto observe = [&] {
+        outbox->PublishProgress(0U, 0U, runtime->progress(0U));
+        const auto snapshot = outbox->CaptureFreshness(inputs);
+        inputs.kline.healthy = runtime->healthy();
+        inputs.kline.revision_batches_submitted = sink.batches.size();
+        return EvaluateFreshness(snapshot, inputs);
+    };
+    const auto tick = Trade(1U, 1U, UINT64_C(34'200'000'000'000),
+                            MonotonicNowNs(), 10'000'000, 10);
+    CHECK(outbox->Append(0U, OrderedDispatch(tick)));
+    TickDispatch dispatch{};
+    CHECK(outbox->TryRead(0U, 0U, &dispatch));
+    // There is deliberately no publication between TryRead and delivery.
+    CHECK(!EvaluateFreshness(outbox->CaptureFreshness(inputs), inputs)
+               .kline_authoritative);
+    CHECK(runtime->AppendDispatch(0U, dispatch));
+    auto frontier = observe();
+    CHECK(frontier.kline.consumed && !frontier.kline.calculated);
+    CHECK(!frontier.kline_authoritative && !frontier.kline.acknowledged);
+    CHECK(runtime->stats().workers.trades_projected == 0U);
+    CHECK(runtime->FlushDue(0U, tick.common.receive_monotonic_ns +
+                                   config.micro_batch_max_delay_ns));
+    frontier = observe();
+    CHECK(frontier.kline.calculated && frontier.kline.submitted);
+    CHECK(frontier.kline_authoritative && !frontier.kline.acknowledged);
+    CHECK(frontier.mode == ContinuityMode::kDerivedCatchup);
+    CHECK(sink.batches.size() == 1U);
+    inputs.kline.revision_batches_acked = 1U;
+    CHECK(observe().mode == ContinuityMode::kCaughtUp);
+}
+
 void TestRuntimeMicroBatchFlushMetrics() {
     RecordingSink sink;
     KLineRuntimeConfig config = RuntimeConfig();
@@ -726,6 +769,7 @@ int main() {
     TestWorkerRejectsUnhealthyFactJournal();
     TestPendingRevisionRowsAndOwnedBytesAccounting();
     TestRuntimeMicroBatchFlushMetrics();
+    TestRuntimeFreshnessWaitsForComputationAndAck();
     std::cout << "all KLine worker tests passed\n";
     return 0;
 }
